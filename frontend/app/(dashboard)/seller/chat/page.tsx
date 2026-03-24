@@ -1,0 +1,184 @@
+'use client';
+
+import { useState, useRef, useEffect } from 'react';
+import { Send, Sparkles } from 'lucide-react';
+import PageHeader from '@/components/common/PageHeader';
+import Modal from '@/components/common/Modal';
+import { useChatRooms, useMessages, useSendMessage, useMarkAsRead, useSummarizeChat } from '@/hooks/useChat';
+import { useAuthStore } from '@/store/authStore';
+import { cn } from '@/lib/utils';
+
+export default function SellerChatPage() {
+  const { user } = useAuthStore();
+  const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
+  const [message, setMessage] = useState('');
+  const [showSummary, setShowSummary] = useState(false);
+  const [summary, setSummary] = useState('');
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const { data: roomsData } = useChatRooms();
+  const { data: messagesData } = useMessages(selectedRoomId || '');
+  const sendMessage = useSendMessage();
+  const markAsRead = useMarkAsRead();
+  const summarize = useSummarizeChat();
+
+  const rooms = roomsData?.data ?? [];
+  const messages = messagesData?.data ?? [];
+
+  const selectedRoom = rooms.find((r) => r.id === selectedRoomId);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  useEffect(() => {
+    if (selectedRoomId) markAsRead.mutate(selectedRoomId);
+  }, [selectedRoomId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleSend = async () => {
+    if (!message.trim() || !selectedRoomId) return;
+    await sendMessage.mutateAsync({ roomId: selectedRoomId, content: message });
+    setMessage('');
+  };
+
+  const handleSummarize = async () => {
+    if (messages.length === 0) return;
+    const recentMessages = messages
+      .slice(-20)
+      .map((m) => `${m.sender_id === user?.id ? '나' : selectedRoom?.partner_name || '상대방'}: ${m.content}`)
+      .join('\n');
+
+    const result = await summarize.mutateAsync(recentMessages);
+    setSummary(result.data.summary);
+    setShowSummary(true);
+  };
+
+  return (
+    <div>
+      <PageHeader title="채팅" description="바이어와 실시간으로 대화하세요" />
+
+      <div className="flex h-[calc(100vh-220px)] rounded-xl bg-white shadow-sm overflow-hidden">
+        {/* 채팅방 목록 */}
+        <div className="w-72 border-r border-gray-200 overflow-y-auto">
+          {rooms.length === 0 ? (
+            <p className="p-4 text-sm text-gray-400">채팅방이 없습니다.</p>
+          ) : (
+            rooms.map((room) => (
+              <button
+                key={room.id}
+                onClick={() => setSelectedRoomId(room.id)}
+                className={cn(
+                  'w-full border-b border-gray-100 p-4 text-left hover:bg-gray-50',
+                  selectedRoomId === room.id && 'bg-primary-50'
+                )}
+              >
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium text-gray-900">
+                    {room.partner_name || '상대방'}
+                  </p>
+                  {room.unread_count > 0 && (
+                    <span className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-primary-600 px-1.5 text-[10px] font-bold text-white">
+                      {room.unread_count}
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-500">{room.partner_company}</p>
+                {room.last_message && (
+                  <p className="mt-1 truncate text-xs text-gray-400">
+                    {room.last_message}
+                  </p>
+                )}
+              </button>
+            ))
+          )}
+        </div>
+
+        {/* 메시지 영역 */}
+        <div className="flex flex-1 flex-col">
+          {!selectedRoomId ? (
+            <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
+              채팅방을 선택하세요
+            </div>
+          ) : (
+            <>
+              {/* 채팅방 헤더 */}
+              <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                <div>
+                  <p className="text-sm font-semibold text-gray-900">
+                    {selectedRoom?.partner_name || '상대방'}
+                  </p>
+                  <p className="text-xs text-gray-500">{selectedRoom?.partner_company}</p>
+                </div>
+                <button
+                  onClick={handleSummarize}
+                  disabled={summarize.isPending || messages.length === 0}
+                  className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                >
+                  <Sparkles className="h-3.5 w-3.5 text-purple-500" />
+                  {summarize.isPending ? 'AI 요약 중...' : 'AI 요약'}
+                </button>
+              </div>
+
+              {/* 메시지 목록 */}
+              <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                {messages.map((msg) => {
+                  const isMine = msg.sender_id === user?.id;
+                  return (
+                    <div
+                      key={msg.id}
+                      className={cn('flex', isMine ? 'justify-end' : 'justify-start')}
+                    >
+                      <div
+                        className={cn(
+                          'max-w-[70%] rounded-2xl px-4 py-2 text-sm',
+                          isMine
+                            ? 'bg-primary-600 text-white'
+                            : 'bg-gray-100 text-gray-900'
+                        )}
+                      >
+                        {msg.content}
+                      </div>
+                    </div>
+                  );
+                })}
+                <div ref={messagesEndRef} />
+              </div>
+
+              {/* 입력창 */}
+              <div className="border-t border-gray-200 p-4">
+                <div className="flex gap-2">
+                  <input
+                    value={message}
+                    onChange={(e) => setMessage(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSend();
+                      }
+                    }}
+                    placeholder="메시지를 입력하세요..."
+                    className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
+                  />
+                  <button
+                    onClick={handleSend}
+                    disabled={!message.trim() || sendMessage.isPending}
+                    className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50"
+                  >
+                    <Send className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* AI 요약 모달 */}
+      <Modal isOpen={showSummary} onClose={() => setShowSummary(false)} title="AI 대화 요약" size="md">
+        <div className="prose prose-sm max-w-none whitespace-pre-wrap text-gray-800">
+          {summary}
+        </div>
+      </Modal>
+    </div>
+  );
+}

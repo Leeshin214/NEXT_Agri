@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+!.env.example
+tests/
+.pytest_cache/
+nextagri/
+*.egg-info
+.git
+.gitignore

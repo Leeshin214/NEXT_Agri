@@ -1,0 +1,91 @@
+# =============================================================================
+# AgriFlow — .gitignore
+# =============================================================================
+
+# =============================================================================
+# 공통
+# =============================================================================
+
+# 환경 변수 (example 파일은 커밋 대상)
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 로그
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =============================================================================
+# Frontend (Next.js 14)
+# =============================================================================
+
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+
+# 빌드 캐시
+frontend/.cache/
+frontend/coverage/
+
+# =============================================================================
+# Backend (FastAPI / Python)
+# =============================================================================
+
+# 환경 변수
+backend/.env
+
+# Python 캐시
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+*.py[cod]
+
+# 가상환경 (nextagri 폴더가 실제 venv)
+backend/nextagri/
+backend/.venv/
+backend/venv/
+
+# 테스트 커버리지
+backend/.coverage
+backend/coverage/
+backend/htmlcov/
+backend/.pytest_cache/
+
+# Celery
+backend/celerybeat-schedule
+backend/celerybeat.pid
+
+# mypy / ruff
+backend/.mypy_cache/
+backend/.ruff_cache/
+
+# =============================================================================
+# Supabase
+# =============================================================================
+
+supabase/.branches/
+supabase/.temp/
+
+# =============================================================================
+# Claude Code (로컬 전용)
+# =============================================================================
+
+# 로컬 설정만 제외 (settings.json, agents/ 는 커밋 대상)
+.claude/settings.local.json

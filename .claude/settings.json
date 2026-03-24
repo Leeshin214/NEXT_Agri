@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null); echo \"$f\" | grep -qE '/(frontend|backend)/' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"[SKILL SYNC] frontend/ 또는 backend/ 코드를 수정했습니다. 작업 완료 후 관련 SKILL_*.md 파일을 업데이트하세요.\"}}' || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
