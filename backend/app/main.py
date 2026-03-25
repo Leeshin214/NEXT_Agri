@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 from app.core.exceptions import http_exception_handler, validation_exception_handler
+from app.websocket.chat_ws import router as ws_router
 
 app = FastAPI(title=settings.PROJECT_NAME, version="1.0.0")
 
@@ -31,6 +32,9 @@ app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
 # 라우터
 app.include_router(api_router)
+
+# WebSocket (APIRouter prefix 없이 app에 직접 등록)
+app.include_router(ws_router)
 
 
 @app.get("/health")

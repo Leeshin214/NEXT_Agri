@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 from typing import Optional
 from uuid import UUID
 
@@ -23,51 +24,61 @@ class ChatService:
     def messages(self):
         return self.client.table("messages")
 
-    @property
-    def users(self):
-        return self.client.table("users")
-
     async def list_rooms(self, user_id: UUID, role: str) -> list[dict]:
+        # 임베디드 조인으로 seller/buyer 정보를 한 번에 조회 (N+1 제거)
         if role == "SELLER":
             result = await asyncio.to_thread(
-                lambda: self.rooms.select("*")
+                lambda: self.rooms.select(
+                    "*, seller:users!seller_id(name, company_name),"
+                    " buyer:users!buyer_id(name, company_name)"
+                )
                 .eq("seller_id", str(user_id))
                 .order("last_message_at", desc=True, nullsfirst=False)
                 .execute()
             )
         else:
             result = await asyncio.to_thread(
-                lambda: self.rooms.select("*")
+                lambda: self.rooms.select(
+                    "*, seller:users!seller_id(name, company_name),"
+                    " buyer:users!buyer_id(name, company_name)"
+                )
                 .eq("buyer_id", str(user_id))
                 .order("last_message_at", desc=True, nullsfirst=False)
                 .execute()
             )
 
         rooms = result.data
-        for room in rooms:
-            # 상대방 정보
-            partner_id = (
-                room["buyer_id"] if role == "SELLER" else room["seller_id"]
-            )
-            user_result = await asyncio.to_thread(
-                lambda pid=partner_id: self.users.select("name, company_name")
-                .eq("id", pid)
-                .single()
-                .execute()
-            )
-            if user_result.data:
-                room["partner_name"] = user_result.data["name"]
-                room["partner_company"] = user_result.data["company_name"]
+        if not rooms:
+            return []
 
-            # 안 읽은 메시지 수
-            unread = await asyncio.to_thread(
-                lambda rid=room["id"]: self.messages.select("*", count="exact")
-                .eq("room_id", rid)
-                .neq("sender_id", str(user_id))
-                .eq("is_read", False)
-                .execute()
-            )
-            room["unread_count"] = unread.count or 0
+        # 조인된 seller/buyer 데이터를 partner_name/partner_company 로 flatten
+        for room in rooms:
+            seller = room.pop("seller", None) or {}
+            buyer = room.pop("buyer", None) or {}
+            if role == "SELLER":
+                room["partner_name"] = buyer.get("name")
+                room["partner_company"] = buyer.get("company_name")
+            else:
+                room["partner_name"] = seller.get("name")
+                room["partner_company"] = seller.get("company_name")
+
+        # 모든 방의 미읽음 수를 한 번에 조회 (N+1 제거)
+        room_ids = [room["id"] for room in rooms]
+        unread_result = await asyncio.to_thread(
+            lambda: self.messages.select("room_id")
+            .eq("is_read", False)
+            .neq("sender_id", str(user_id))
+            .in_("room_id", room_ids)
+            .execute()
+        )
+
+        # Python에서 room_id별 count 집계
+        unread_counts: Counter = Counter(
+            msg["room_id"] for msg in (unread_result.data or [])
+        )
+
+        for room in rooms:
+            room["unread_count"] = unread_counts.get(room["id"], 0)
 
         return rooms
 

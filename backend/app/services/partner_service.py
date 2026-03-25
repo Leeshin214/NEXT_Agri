@@ -22,10 +22,6 @@ class PartnerService:
     def table(self):
         return self.client.table("partners")
 
-    @property
-    def users(self):
-        return self.client.table("users")
-
     async def list_partners(
         self,
         *,
@@ -35,8 +31,12 @@ class PartnerService:
         page: int = 1,
         limit: int = 20,
     ) -> tuple[list[dict], PaginationMeta]:
+        # 임베디드 조인으로 partner_user 정보를 한 번에 조회 (N+1 제거)
         query = (
-            self.table.select("*", count="exact")
+            self.table.select(
+                "*, partner_user:users!partner_user_id(name, company_name, role, phone)",
+                count="exact",
+            )
             .eq("user_id", str(user_id))
             .is_("deleted_at", "null")
         )
@@ -44,38 +44,31 @@ class PartnerService:
         if status:
             query = query.eq("status", status)
 
-        # 검색은 조인된 사용자 정보로 필터링해야 하므로 결과 후처리로 처리
+        # 검색을 DB 쿼리 레벨에서 처리 (클라이언트 사이드 필터링 제거)
+        # nickname 또는 거래처 이름/업체명으로 검색
+        if search:
+            query = query.or_(
+                f"nickname.ilike.%{search}%,"
+                f"partner_user.name.ilike.%{search}%,"
+                f"partner_user.company_name.ilike.%{search}%"
+            )
+
+        # 페이지네이션을 DB 쿼리에서 처리
         offset = (page - 1) * limit
         query = query.order("created_at", desc=True).range(offset, offset + limit - 1)
 
         result = await asyncio.to_thread(lambda: query.execute())
         total = result.count or 0
 
-        # 거래처 사용자 정보 조인
-        partners = result.data
-        for p in partners:
-            user_result = await asyncio.to_thread(
-                lambda pid=p["partner_user_id"]: self.users.select(
-                    "name, company_name, role, phone"
-                )
-                .eq("id", pid)
-                .single()
-                .execute()
-            )
-            if user_result.data:
-                p["partner_name"] = user_result.data["name"]
-                p["partner_company"] = user_result.data["company_name"]
-                p["partner_role"] = user_result.data["role"]
-                p["partner_phone"] = user_result.data.get("phone")
-
-        # 검색 필터링 (이름/업체명 기반)
-        if search:
-            search_lower = search.lower()
-            partners = [
-                p for p in partners
-                if (p.get("partner_name") or "").lower().find(search_lower) >= 0
-                or (p.get("partner_company") or "").lower().find(search_lower) >= 0
-            ]
+        # 조인된 partner_user 데이터를 PartnerResponse 호환 형식으로 flatten
+        partners = []
+        for p in result.data:
+            partner_user = p.pop("partner_user", None) or {}
+            p["partner_name"] = partner_user.get("name")
+            p["partner_company"] = partner_user.get("company_name")
+            p["partner_role"] = partner_user.get("role")
+            p["partner_phone"] = partner_user.get("phone")
+            partners.append(p)
 
         meta = PaginationMeta(
             total=total,

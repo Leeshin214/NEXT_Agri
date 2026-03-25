@@ -6,18 +6,26 @@ Supabase Realtime을 1차로 사용하고, 복잡한 요구사항이 생기면 F
 
 ---
 
-## 아키텍처 선택: Supabase Realtime
+## 아키텍처: WebSocket (송신) + Supabase Realtime (수신 fallback)
 
-Supabase의 `postgres_changes` 이벤트를 활용한다.  
-메시지 INSERT 이벤트를 구독하여 실시간으로 UI에 반영한다.
+**현재 구현 방식 (검증됨)**:
+- 메시지 **전송**: WebSocket (`useWebSocketChat` → `sendMessage`)
+- 메시지 **수신**: WebSocket `lastMessage` → React Query 캐시 즉시 반영
+- 초기 메시지 **로드**: REST API (`GET /chat/rooms/{room_id}/messages`)
+- 채팅방 목록 갱신: Supabase Realtime (`chat_rooms` UPDATE/INSERT)
 
 ```
-[메시지 전송 플로우]
+[메시지 전송 플로우 — WebSocket]
 1. 사용자가 메시지 입력 후 전송
-2. Frontend → FastAPI POST /chat/messages
-3. FastAPI → Supabase DB INSERT (messages 테이블)
-4. Supabase Realtime → 해당 room을 구독 중인 상대방에게 이벤트 발송
-5. 상대방 Frontend → 메시지 UI에 실시간 추가
+2. useWebSocketChat.sendMessage() → WS send {"type":"message","content":"..."}
+3. 서버 → WS broadcast {"type":"message", id, room_id, sender_id, content, ...}
+4. useMessagesWithWebSocket의 useEffect → React Query 캐시 즉시 업데이트
+5. 메시지 목록 UI 즉시 반영
+
+[초기 로드 플로우]
+1. 채팅방 선택
+2. REST GET /chat/rooms/{room_id}/messages → React Query 캐시 저장
+3. 이후 WS 수신 메시지가 캐시에 append됨
 ```
 
 ---
@@ -129,154 +137,58 @@ async def mark_as_read(
 
 ## Frontend 구현
 
-### Supabase Realtime 구독 훅
+### useWebSocketChat 훅 (신규 — 검증됨)
 ```typescript
-// src/hooks/useChat.ts
-import { useEffect, useRef, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
-import { api } from '@/lib/api';
-import type { Message, ChatRoom } from '@/types/chat';
+// frontend/hooks/useWebSocketChat.ts
+// WS URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000'
+// 연결: ws://…/ws/chat/{roomId}?token={jwt}
+// roomId null → 연결 안 함
+// 재연결: 3초 후 최대 3회
+// 반환값: { isConnected, sendMessage, lastMessage, error }
 
-export function useChatMessages(roomId: string | null) {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const supabase = createClient();
-
-  // 초기 메시지 로드
-  useEffect(() => {
-    if (!roomId) return;
-    setIsLoading(true);
-    api.get(`/chat/rooms/${roomId}/messages`)
-      .then((res) => setMessages(res.data))
-      .finally(() => setIsLoading(false));
-  }, [roomId]);
-
-  // Realtime 구독
-  useEffect(() => {
-    if (!roomId) return;
-
-    const channel = supabase
-      .channel(`room:${roomId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'messages',
-          filter: `room_id=eq.${roomId}`,
-        },
-        (payload) => {
-          setMessages((prev) => [...prev, payload.new as Message]);
-        }
-      )
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
-  }, [roomId]);
-
-  const sendMessage = async (content: string) => {
-    if (!roomId || !content.trim()) return;
-    await api.post(`/chat/rooms/${roomId}/messages`, { content });
-    // Realtime이 처리하므로 낙관적 업데이트 필요 없음
-    // 단, 자신의 메시지는 즉시 표시하고 싶으면 낙관적 업데이트 추가
-  };
-
-  return { messages, isLoading, sendMessage };
-}
-
-export function useChatRooms() {
-  const [rooms, setRooms] = useState<ChatRoom[]>([]);
-  const supabase = createClient();
-
-  useEffect(() => {
-    api.get('/chat/rooms').then((res) => setRooms(res.data));
-
-    // 채팅방 목록도 실시간 갱신 (last_message 업데이트)
-    const channel = supabase
-      .channel('chat-rooms')
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'chat_rooms' },
-        () => {
-          api.get('/chat/rooms').then((res) => setRooms(res.data));
-        }
-      )
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
-  }, []);
-
-  return { rooms };
-}
+import { useWebSocketChat } from '@/hooks/useWebSocketChat';
+const { isConnected, sendMessage, lastMessage, error } = useWebSocketChat(roomId);
+// sendMessage(content) → WS send {"type":"message","content":"..."}
+// lastMessage: WebSocketMessage | null — 수신 시마다 갱신
 ```
 
-### ChatWindow 컴포넌트 핵심 로직
+### useMessagesWithWebSocket 훅 (신규 — 검증됨)
+```typescript
+// frontend/hooks/useChat.ts — 채팅 페이지에서 사용하는 통합 훅
+import { useMessagesWithWebSocket } from '@/hooks/useChat';
+
+const { messageQuery, isConnected, sendMessage, wsError } =
+  useMessagesWithWebSocket(roomId); // roomId: string | null
+
+// messageQuery.data?.data → Message[] (초기 REST 로드 + WS 수신 메시지 포함)
+// sendMessage(content) → WS 전송
+// isConnected → 헤더 연결 상태 인디케이터에 사용
+// wsError → 헤더 아래 에러 텍스트 표시
+```
+
+### 채팅 페이지 패턴 (seller/buyer 공통 — 검증됨)
 ```tsx
-// src/components/chat/ChatWindow.tsx
-'use client';
-import { useRef, useEffect } from 'react';
-import { useChatMessages } from '@/hooks/useChat';
-import { useAuthStore } from '@/store/authStore';
+// useSendMessage (REST mutation) 대신 useMessagesWithWebSocket 사용
+// 전송 버튼 disabled: !message.trim() || !isConnected
+// 헤더 연결 인디케이터: isConnected ? 'bg-green-500' : 'bg-gray-300'
 
-export default function ChatWindow({ roomId }: { roomId: string }) {
-  const { user } = useAuthStore();
-  const { messages, sendMessage } = useChatMessages(roomId);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const [input, setInput] = useState('');
+const { messageQuery, isConnected, sendMessage: wsSendMessage, wsError } =
+  useMessagesWithWebSocket(selectedRoomId);
+const messages = messageQuery.data?.data ?? [];
 
-  // 새 메시지 올 때 스크롤 아래로
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  const handleSend = () => {
-    if (!input.trim()) return;
-    sendMessage(input);
-    setInput('');
-  };
-
-  return (
-    <div className="flex flex-col h-full">
-      {/* 메시지 목록 */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`flex ${msg.sender_id === user?.id ? 'justify-end' : 'justify-start'}`}
-          >
-            <div
-              className={`max-w-xs px-4 py-2 rounded-2xl text-sm ${
-                msg.sender_id === user?.id
-                  ? 'bg-primary-600 text-white'
-                  : 'bg-gray-100 text-gray-900'
-              }`}
-            >
-              {msg.content}
-            </div>
-          </div>
-        ))}
-        <div ref={bottomRef} />
-      </div>
-      {/* 입력창 */}
-      <div className="border-t p-4 flex gap-2">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
-          placeholder="메시지를 입력하세요..."
-          className="flex-1 border rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
-        />
-        <button
-          onClick={handleSend}
-          className="bg-primary-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-primary-700"
-        >
-          전송
-        </button>
-      </div>
-    </div>
-  );
-}
+const handleSend = () => {
+  if (!message.trim() || !selectedRoomId) return;
+  wsSendMessage(message);
+  setMessage('');
+};
 ```
+
+### useChat.ts 현재 export 목록
+- `useChatRooms` — 채팅방 목록 + Supabase Realtime 구독
+- `useMessages` — 메시지 목록 + Supabase Realtime 구독 (레거시, 직접 사용 안 함)
+- `useMessagesWithWebSocket` — 초기 로드(REST) + WS 실시간 송수신 통합 (채팅 페이지용)
+- `useSendMessage` — REST 전송 mutation (레거시, 직접 사용 안 함)
+- `useCreateChatRoom`, `useMarkAsRead`, `useSummarizeChat`
 
 ---
 
@@ -310,15 +222,29 @@ ALTER PUBLICATION supabase_realtime ADD TABLE chat_rooms;
 
 ---
 
+## 환경변수
+
+```
+NEXT_PUBLIC_WS_URL=ws://localhost:8000   # 미설정 시 이 값이 기본값으로 사용됨
+# 프로덕션: wss://your-backend.railway.app
+```
+
+## 주의사항 & 함정
+
+- `useWebSocketChat`의 `connect` 함수는 `roomIdRef`를 사용하므로 deps 배열이 비어있다. roomId 변경은 useEffect에서 `retryCountRef.current = 0` 후 `connect()` 재호출로 처리.
+- WS 언마운트 시 `ws.onclose = null` 먼저 설정 후 `ws.close()` — 그렇지 않으면 onclose가 재연결 타이머를 등록해 메모리 누수 발생.
+- `useMessagesWithWebSocket`에서 WS 수신 메시지를 캐시에 추가할 때 `id` 중복 체크 필수 — 서버가 동일 메시지를 두 번 보낼 경우 대비.
+- 전송 버튼 disabled를 `!isConnected`로 설정 — WS 미연결 상태에서 전송 시도 방지.
+
 ## 작업 체크리스트
 
 - [ ] FastAPI chat 라우터 (rooms, messages CRUD)
 - [ ] SQLAlchemy ChatRoom, Message 모델
 - [ ] Supabase Realtime publication 설정
-- [ ] useChat 훅 (메시지 목록 + 실시간 구독)
-- [ ] useChatRooms 훅 (채팅방 목록 + 실시간)
+- [x] useWebSocketChat 훅 (WS 연결, 재연결, 송수신)
+- [x] useChat 훅 (useChatRooms, useMessagesWithWebSocket 등)
 - [ ] ChatRoomList 컴포넌트
-- [ ] ChatWindow 컴포넌트 (스크롤, 전송)
-- [ ] 읽음 처리 (채팅방 진입 시 자동)
-- [ ] 안읽은 메시지 수 뱃지
-- [ ] AI 요약 버튼 연동
+- [x] seller/buyer 채팅 페이지 (WebSocket 통합, 연결 인디케이터)
+- [x] 읽음 처리 (채팅방 진입 시 자동)
+- [x] 안읽은 메시지 수 뱃지
+- [x] AI 요약 버튼 연동
