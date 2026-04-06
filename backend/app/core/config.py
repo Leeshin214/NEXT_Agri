@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
 
+    # Groq (LLaMA 모델 사용 — tool_use는 OpenAI 호환 스타일)
+    GROQ_API_KEY: str = ""
+
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:3001"]
     # 프로덕션 프론트엔드 URL (Vercel 배포 후 설정)
