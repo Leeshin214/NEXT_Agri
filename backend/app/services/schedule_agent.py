@@ -238,7 +238,7 @@ class ScheduleAgentService:
             user_message = self._build_user_message(context, year, month)
 
             response = await client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o-mini",
                 response_format={"type": "json_object"},
                 temperature=0.3,
                 max_tokens=1024,

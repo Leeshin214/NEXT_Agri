@@ -216,7 +216,7 @@ router = APIRouter(prefix="/schedule-agent", tags=["schedule-agent"])
 #   - recommendations: list[ScheduleRecommendation]  (최대 3개)
 #   - message: str
 # 인증 필요 (get_current_user), 역할 무관 (SELLER/BUYER 모두 사용)
-# 내부적으로 calendar_events, products, orders를 조회해 GPT-4o에게 전달
+# 내부적으로 calendar_events, products, orders를 조회해 GPT-4o-mini에게 전달
 # OPENAI_API_KEY 환경변수 필요
 ```
 
