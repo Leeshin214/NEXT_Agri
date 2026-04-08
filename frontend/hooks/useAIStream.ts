@@ -22,7 +22,7 @@ export function useAIStream() {
       const { data } = await supabase.auth.getSession();
       const token = data.session?.access_token;
 
-      const res = await fetch(`${apiUrl}/api/v1/ai/chat`, {
+      const res = await fetch(`${apiUrl}/api/v1/ai/agent/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -32,27 +32,24 @@ export function useAIStream() {
         signal: abortRef.current.signal,
       });
 
-      const reader = res.body?.getReader();
-      if (!reader) return;
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
 
-      const decoder = new TextDecoder();
-      let accumulated = '';
+      const json: unknown = await res.json();
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const text = line.slice(6);
-            if (text === '[DONE]') break;
-            accumulated += text;
-            setResponse(accumulated);
-          }
-        }
+      if (
+        json !== null &&
+        typeof json === 'object' &&
+        'data' in json &&
+        json.data !== null &&
+        typeof json.data === 'object' &&
+        'response' in json.data &&
+        typeof (json.data as Record<string, unknown>).response === 'string'
+      ) {
+        setResponse((json.data as Record<string, unknown>).response as string);
+      } else {
+        setResponse('AI 응답 형식이 올바르지 않습니다.');
       }
     } catch (err) {
       if ((err as Error).name !== 'AbortError') {
