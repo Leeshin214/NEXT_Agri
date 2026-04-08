@@ -12,6 +12,7 @@ from app.schemas.ai import (
 )
 from app.schemas.common import SuccessResponse
 from app.services.ai_context import ai_context_builder
+from app.services.orchestrator import agent_orchestrator
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
@@ -82,7 +83,7 @@ async def ai_chat(
 
     async def generate():
         async with client.messages.stream(
-            model="claude-sonnet-4-5",
+            model="claude-3-5-sonnet-20241022",
             max_tokens=1024,
             system=system_prompt,
             messages=[{"role": "user", "content": request.prompt}],
@@ -127,7 +128,7 @@ async def summarize_chat(
     context_info = request.context or "농산물 유통 거래 채팅"
 
     response = await client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-3-5-sonnet-20241022",
         max_tokens=512,
         system=(
             "당신은 농산물 유통업 B2B 플랫폼의 대화 요약 도우미입니다.\n"
@@ -167,7 +168,7 @@ async def daily_summary(
         context = await ai_context_builder.build_buyer_context(user_id)
 
     response = await client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-3-5-sonnet-20241022",
         max_tokens=512,
         system="농산물 유통 플랫폼의 업무 요약 도우미입니다. 한국어로 간결하게 요약하세요.",
         messages=[
@@ -181,6 +182,75 @@ async def daily_summary(
     )
 
     return {"data": {"summary": response.content[0].text}}
+
+
+@router.post(
+    "/agent/chat",
+    response_model=SuccessResponse[dict],
+)
+async def agent_chat(
+    request: AIChatRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    tool_use 오케스트레이터 기반 AI 에이전트 채팅.
+
+    기존 /chat과 달리 Claude가 DB를 직접 조회/수정하는 tool을 선택해서
+    실시간 데이터를 바탕으로 답변한다.
+
+    응답에 response(최종 텍스트)와 tools_used(사용한 tool 목록)를 포함한다.
+    """
+    user_id = current_user["id"]
+    role = current_user.get("role", "BUYER")
+
+    # ---------------------------
+    # DB 조회해서 LLM이 대화 이력 확인하도록 하는 부분 
+
+    # DB에서 최근 대화 10개 조회 (최신순)
+    supabase = get_supabase_client()
+    history_result = (
+        supabase.table("ai_conversations")
+        .select("prompt, response")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+
+    # 최신순 → 오래된순으로 변환 후 user/assistant 쌍으로 변환
+    history = []
+    for row in reversed(history_result.data or []):
+        history.append({"role": "user", "content": row["prompt"]})
+        history.append({"role": "assistant", "content": row["response"]})
+
+    # ---------------------------
+
+    # 오케스트레이터 실행 — tool 루프 포함, 최종 응답 반환
+    result = await agent_orchestrator.run(
+        user_message=request.prompt,
+        user_id=user_id,
+        role=role,
+        user_info={
+            "name": current_user.get("name", "사용자"),
+            "company_name": current_user.get("company_name", "미설정"),
+        },
+        history=history,
+    )
+
+    # 대화 기록 저장
+    supabase = get_supabase_client()
+    supabase.table("ai_conversations").insert(
+        {
+            "user_id": user_id,
+            "prompt": request.prompt,
+            "response": result["response"],
+            "prompt_type": (
+                ",".join(result["tools_used"]) if result["tools_used"] else request.prompt_type
+            ),
+        }
+    ).execute()
+
+    return {"data": result}
 
 
 @router.get(

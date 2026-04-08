@@ -41,7 +41,7 @@ class ProductResponse(BaseModel):
     unit: str
     price_per_unit: int
     stock_quantity: int
-    min_order_qty: int
+    min_order_qty: Optional[int] = None
     status: str
     description: Optional[str] = None
     image_url: Optional[str] = None
