@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     # Anthropic
     ANTHROPIC_API_KEY: str = ""
 
-    # Groq (LLaMA 모델 사용 — tool_use는 OpenAI 호환 스타일)
+    # OpenAI (gpt-4o-mini — orchestrator tool_use)
+    OPENAI_API_KEY: str = ""
+
+    # Groq (레거시, 필요 시 유지)
     GROQ_API_KEY: str = ""
 
     # CORS

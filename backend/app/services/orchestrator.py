@@ -18,7 +18,7 @@ import json
 import operator
 from typing import Any, Annotated
 
-from groq import AsyncGroq
+from openai import AsyncOpenAI
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional
 
@@ -615,8 +615,8 @@ async def orchestrator_node(state: AgentState) -> dict:
     - tool_calls가 있으면 intent를 INVENTORY 또는 ORDER로 설정
     - tool_calls가 없으면 intent를 GENERAL로 설정하고 응답 텍스트를 final_response에 저장
     """
-    client = AsyncGroq(api_key=settings.GROQ_API_KEY)
-    model = "meta-llama/llama-4-scout-17b-16e-instruct"
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    model = "gpt-4o-mini"
 
     # 시스템 프롬프트가 messages에 아직 없으면 초기화
     # (첫 번째 호출 시에만 시스템 + 유저 메시지를 구성)
@@ -748,8 +748,8 @@ async def response_node(state: AgentState) -> dict:
     if state.get("final_response"):
         return {}
 
-    client = AsyncGroq(api_key=settings.GROQ_API_KEY)
-    model = "meta-llama/llama-4-scout-17b-16e-instruct"
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    model = "gpt-4o-mini"
 
     import json as _json
 
