@@ -791,7 +791,6 @@ async def response_node(state: AgentState) -> dict:
     response = await client.chat.completions.create(
         model=model,
         messages=summary_messages,
-        tool_choice="none",
     )
 
     final_text = response.choices[0].message.content or "처리 결과를 정리하는 중 오류가 발생했습니다."

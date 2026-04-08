@@ -393,6 +393,22 @@ pytest-cov==6.0.0
 
 - **verify_supabase_jwt async 전환**: JWKS 공개 키를 가져오는 `httpx.AsyncClient` 호출이 포함되므로 `verify_supabase_jwt`는 반드시 `async def`로 선언해야 한다. 이를 호출하는 `get_current_user`에서도 `await verify_supabase_jwt(...)`로 호출해야 한다.
 
+- **OpenAI `tool_choice` — `tools` 없이 단독 사용 금지**: `tool_choice` 파라미터는 반드시 `tools` 파라미터와 함께 전달해야 한다. `tools` 없이 `tool_choice="none"` 또는 다른 값을 보내면 OpenAI API가 400 에러를 반환한다. 요약/정리 단계처럼 도구 호출이 필요 없는 단순 completion 요청에서는 `tool_choice` 파라미터 자체를 생략한다.
+  ```python
+  # 잘못된 패턴 — tools 없이 tool_choice 전달 → OpenAI 400
+  response = await client.chat.completions.create(
+      model=model,
+      messages=messages,
+      tool_choice="none",  # tools 파라미터가 없으므로 400 에러
+  )
+
+  # 올바른 패턴 — tool_choice 생략
+  response = await client.chat.completions.create(
+      model=model,
+      messages=messages,
+  )
+  ```
+
 ### 주의사항 & 함정
 
 - `security = HTTPBearer()` (기본값)로 두면 브라우저 CORS preflight가 전부 실패한다.
