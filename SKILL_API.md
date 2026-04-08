@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_JWT_SECRET: str
     ANTHROPIC_API_KEY: str
+    OPENAI_API_KEY: str = ""   # GPT 스케줄 에이전트용
     DATABASE_URL: str
     REDIS_URL: str = "redis://localhost:6379"
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
@@ -204,6 +205,21 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 # POST /orders/{id}/items - 아이템 추가
 ```
 
+### schedule_agent.py (GPT 스케줄 조율 에이전트 API)
+```python
+router = APIRouter(prefix="/schedule-agent", tags=["schedule-agent"])
+
+# POST /schedule-agent/recommend
+# Request:  { year: int, month: int }
+# Response: SuccessResponse[ScheduleRecommendResponse]
+#   - has_recommendation: bool
+#   - recommendations: list[ScheduleRecommendation]  (최대 3개)
+#   - message: str
+# 인증 필요 (get_current_user), 역할 무관 (SELLER/BUYER 모두 사용)
+# 내부적으로 calendar_events, products, orders를 조회해 GPT-4o에게 전달
+# OPENAI_API_KEY 환경변수 필요
+```
+
 ### ai_assistant.py (AI 도우미 API)
 ```python
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -304,22 +320,24 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 ## requirements.txt
 
 ```
-fastapi==0.115.0
-uvicorn[standard]==0.30.0
-pydantic==2.8.0
-pydantic-settings==2.4.0
-sqlalchemy==2.0.35
-asyncpg==0.29.0
-alembic==1.13.0
-supabase==2.7.0
-anthropic==0.34.0
-pyjwt[crypto]==2.10.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-dotenv==1.0.1
 python-multipart==0.0.9
-httpx==0.27.0
-redis==5.0.0
+pyjwt[crypto]==2.10.1
+httpx==0.28.1
+supabase==2.11.0
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
 celery==5.4.0
-pytest==8.3.0
-pytest-asyncio==0.23.0
+redis==5.2.1
+anthropic==0.42.0
+openai>=1.58.0
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
 ```
 
 ---

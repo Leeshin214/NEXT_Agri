@@ -312,8 +312,10 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 
 ### 검증된 패턴
 
-_작업을 진행하면서 채워진다._
+- **calendar_events에는 deleted_at 없음**: `calendar_events` 테이블 스키마에는 `deleted_at` 컬럼이 정의되어 있지 않다. `.is_("deleted_at", "null")` 필터를 적용하면 쿼리 오류가 발생한다. 이 테이블은 soft delete를 지원하지 않으므로 해당 필터를 생략한다.
+
+- **BUYER의 주문 상품 조회 패턴**: 구매자가 최근 주문한 상품 목록을 가져올 때 직접 JOIN이 없으므로 3단계로 나눠 조회한다. orders(buyer_id) → order_items(order_id) → products(id). 각 단계를 별도 `asyncio.to_thread` 호출로 처리하고 product_ids는 set으로 중복 제거 후 `.in_()` 필터를 사용한다.
 
 ### 주의사항 & 함정
 
-_작업을 진행하면서 채워진다._
+- **calendar_events soft delete 없음**: 다른 테이블과 달리 `calendar_events`는 `deleted_at` 컬럼이 없다. 일관성을 위해 추가하려면 마이그레이션이 필요하다. 현재는 해당 필터 없이 조회한다.

@@ -8,6 +8,7 @@ import { useCalendarEvents, useCreateCalendarEvent } from '@/hooks/useCalendar';
 import { EVENT_TYPE_OPTIONS } from '@/constants/options';
 import type { CalendarEvent, CalendarEventCreate, EventType } from '@/types';
 import { cn } from '@/lib/utils';
+import ScheduleAgentPanel from '@/components/calendar/ScheduleAgentPanel';
 
 const eventTypeColors: Record<string, string> = {
   SHIPMENT: 'bg-blue-500',
@@ -148,7 +149,8 @@ export default function SellerCalendarPage() {
           </div>
         </div>
 
-        {/* 선택된 날짜 상세 */}
+        {/* 선택된 날짜 상세 + AI 추천 */}
+        <div className="space-y-6">
         <div className="rounded-xl bg-white p-6 shadow-sm">
           <div className="mb-4 flex items-center justify-between">
             <h3 className="font-semibold text-gray-900">
@@ -196,6 +198,8 @@ export default function SellerCalendarPage() {
               ))}
             </div>
           )}
+        </div>
+        <ScheduleAgentPanel year={year} month={month} />
         </div>
       </div>
 

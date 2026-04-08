@@ -5,3 +5,4 @@ export type { Partner, PartnerStatus, PartnerCreate } from './partner';
 export type { CalendarEvent, EventType, CalendarEventCreate } from './calendar';
 export type { ChatRoom, Message } from './chat';
 export type { SuccessResponse, PaginationMeta, ErrorResponse } from './api';
+export type { ScheduleRecommendation, ScheduleRecommendResponse } from './scheduleAgent';
