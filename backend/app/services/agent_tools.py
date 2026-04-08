@@ -15,6 +15,53 @@ from app.core.supabase import get_supabase_client
 
 
 # ─────────────────────────────────────────────
+# 헬퍼: 이름 기반 상품 검색 (fuzzy fallback 포함)
+# ─────────────────────────────────────────────
+
+def _find_product_by_name(supabase, product_name: str, seller_id: str = "") -> Optional[dict]:
+    """
+    product_name으로 상품을 검색한다.
+    1차: 전체 문자열 ilike 검색
+    2차: 실패 시 각 글자를 한 개씩 포함하는 검색으로 fallback (LLM 철자 오류 대응)
+    반환: {"id": ..., "name": ...} 또는 None
+    """
+    def _query(pattern):
+        q = (
+            supabase.table("products")
+            .select("id, name")
+            .ilike("name", pattern)
+            .is_("deleted_at", None)
+        )
+        if seller_id:
+            q = q.eq("seller_id", seller_id)
+        return q.execute()
+
+    # 1차: 그대로 검색
+    result = _query(f"%{product_name}%")
+    if result.data:
+        return result.data[0]
+
+    # 2차 fallback: 각 글자를 개별 검색해서 결과 합산 후 가장 많이 매칭된 것 선택
+    match_counts: dict[str, dict] = {}
+    for char in product_name:
+        if len(char.strip()) == 0:
+            continue
+        r = _query(f"%{char}%")
+        for row in (r.data or []):
+            pid = row["id"]
+            if pid not in match_counts:
+                match_counts[pid] = {"id": pid, "name": row["name"], "count": 0}
+            match_counts[pid]["count"] += 1
+
+    if not match_counts:
+        return None
+
+    # 가장 많이 매칭된 상품 반환
+    best = max(match_counts.values(), key=lambda x: x["count"])
+    return {"id": best["id"], "name": best["name"]}
+
+
+# ─────────────────────────────────────────────
 # 상품 / 재고 관련 도구
 # ─────────────────────────────────────────────
 
@@ -47,31 +94,57 @@ def get_products(seller_id: str, category: Optional[str] = None) -> dict:
         return {"success": False, "error": str(e), "products": [], "count": 0}
 
 
-def check_stock(product_id: str) -> dict:
-    """특정 상품의 재고 현황을 상세 조회한다."""
+def check_stock(product_id: str, seller_id: str = "", product_name: Optional[str] = None) -> dict:
+    """특정 상품의 재고 현황을 상세 조회한다. product_id가 없으면 seller_id + product_name으로 검색."""
     try:
         supabase = get_supabase_client()
 
+        if not product_id or len(product_id) < 10:
+            if not product_name:
+                return {"success": False, "error": "상품 ID 또는 상품명을 알려주세요.", "product": None}
+            found = _find_product_by_name(supabase, product_name, seller_id)
+            if not found:
+                return {"success": False, "error": f"'{product_name}' 상품을 찾을 수 없습니다.", "product": None}
+            # 상세 정보 추가 조회
+            detail = (
+                supabase.table("products")
+                .select("id, name, category, stock_quantity, unit, status, min_order_qty, price_per_unit")
+                .eq("id", found["id"])
+                .execute()
+            )
+            return {"success": True, "product": detail.data[0] if detail.data else found}
+
         result = (
             supabase.table("products")
-            .select("id, name, category, stock_quantity, unit, status, min_order, price_per_unit")
+            .select("id, name, category, stock_quantity, unit, status, min_order_qty, price_per_unit")
             .eq("id", product_id)
-            .single()
             .execute()
         )
 
         if not result.data:
             return {"success": False, "error": "해당 상품을 찾을 수 없습니다.", "product": None}
 
-        return {"success": True, "product": result.data}
+        return {"success": True, "product": result.data[0]}
     except Exception as e:
         return {"success": False, "error": str(e), "product": None}
 
 
-def update_stock(product_id: str, new_quantity: int) -> dict:
-    """특정 상품의 재고 수량을 업데이트한다. 수량에 따라 status도 자동 변경."""
+def update_stock(product_id: str = "", new_quantity: int = 0, seller_id: str = "", product_name: Optional[str] = None) -> dict:
+    """특정 상품의 재고 수량을 업데이트한다. 수량에 따라 status도 자동 변경. product_id가 없으면 seller_id + product_name으로 검색."""
     try:
         supabase = get_supabase_client()
+
+        # product_id가 없으면 이름으로 검색
+        if not product_id or len(product_id) < 10:
+            if not product_name:
+                return {"success": False, "error": "상품 ID 또는 상품명을 알려주세요."}
+            found = _find_product_by_name(supabase, product_name, seller_id)
+            if not found:
+                return {"success": False, "error": f"'{product_name}' 상품을 찾을 수 없습니다."}
+            product_id = found["id"]
+            resolved_name = found["name"]
+        else:
+            resolved_name = ""
 
         # 재고 수량에 따라 상태 자동 결정
         # 0이면 품절, 10 미만이면 부족, 그 이상이면 정상
@@ -82,23 +155,14 @@ def update_stock(product_id: str, new_quantity: int) -> dict:
         else:
             new_status = "NORMAL"
 
-        result = (
-            supabase.table("products")
-            .update({"stock_quantity": new_quantity, "status": new_status})
-            .eq("id", product_id)
-            .execute()
-        )
+        supabase.table("products").update({"stock_quantity": new_quantity, "status": new_status}).eq("id", product_id).execute()
 
-        if not result.data:
-            return {"success": False, "error": "상품을 찾을 수 없거나 업데이트에 실패했습니다."}
-
-        updated = result.data[0]
         return {
             "success": True,
             "product_id": product_id,
             "new_quantity": new_quantity,
             "new_status": new_status,
-            "product_name": updated.get("name", ""),
+            "product_name": resolved_name,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -117,6 +181,9 @@ def create_product(
     description: Optional[str] = None,
 ) -> dict:
     """새 상품을 등록한다. 같은 판매자 + 같은 상품명이 이미 존재하면 재고를 합산한다."""
+    # 필수값 검증
+    if not name or not category or price_per_unit is None or stock_quantity is None or not unit:
+        return {"success": False, "error": "필수 정보가 부족합니다. 상품명, 카테고리, 단가, 재고 수량, 단위를 모두 입력해주세요."}
     try:
         supabase = get_supabase_client()
 
@@ -143,16 +210,11 @@ def create_product(
             else:
                 new_status = "NORMAL"
 
-            result = (
-                supabase.table("products")
-                .update({"stock_quantity": new_qty, "status": new_status})
-                .eq("id", existing_product["id"])
-                .execute()
-            )
+            supabase.table("products").update({"stock_quantity": new_qty, "status": new_status}).eq("id", existing_product["id"]).execute()
 
             return {
                 "success": True,
-                "product": result.data[0] if result.data else existing_product,
+                "product": existing_product,
                 "message": f"{name} 상품이 이미 존재하여 재고를 {stock_quantity} 추가했습니다. 현재 재고: {new_qty}",
                 "action": "stock_merged",
             }
@@ -184,12 +246,9 @@ def create_product(
             .execute()
         )
 
-        if not result.data:
-            return {"success": False, "error": "상품 등록에 실패했습니다."}
-
         return {
             "success": True,
-            "product": result.data[0],
+            "product": result.data[0] if result.data else {"name": name, "category": category},
             "message": f"{name} 상품이 등록되었습니다.",
             "action": "created",
         }
@@ -197,43 +256,57 @@ def create_product(
         return {"success": False, "error": str(e)}
 
 
-def delete_product(product_id: str, seller_id: str) -> dict:
-    """상품을 삭제한다. 실제 삭제가 아닌 deleted_at을 현재 시간으로 설정한다."""
+def delete_product(product_id: str, seller_id: str, name: Optional[str] = None) -> dict:
+    """상품을 삭제한다. product_id 또는 name으로 찾아서 soft delete."""
     try:
         supabase = get_supabase_client()
 
-        # seller_id 일치 확인
-        check = (
-            supabase.table("products")
-            .select("id, name, seller_id")
-            .eq("id", product_id)
-            .is_("deleted_at", None)
-            .single()
-            .execute()
-        )
-
-        if not check.data:
-            return {"success": False, "error": "해당 상품을 찾을 수 없습니다."}
-
-        if check.data["seller_id"] != seller_id:
-            return {"success": False, "error": "권한 없음: 본인 상품만 삭제할 수 있습니다."}
+        # product_id가 없거나 비어있으면 이름으로 검색
+        if not product_id or len(product_id) < 10:
+            if not name:
+                return {"success": False, "error": "삭제할 상품명을 알려주세요."}
+            check = (
+                supabase.table("products")
+                .select("id, name, seller_id")
+                .eq("seller_id", seller_id)
+                .ilike("name", f"%{name}%")
+                .is_("deleted_at", None)
+                .execute()
+            )
+            if not check.data:
+                return {"success": False, "error": f"'{name}' 상품을 찾을 수 없습니다."}
+            if len(check.data) > 1:
+                names = ", ".join([p["name"] for p in check.data])
+                return {"success": False, "error": f"'{name}'과 일치하는 상품이 여러 개입니다: {names}. 더 정확한 이름을 알려주세요."}
+            product_id = check.data[0]["id"]
+            product_name = check.data[0]["name"]
+        else:
+            check = (
+                supabase.table("products")
+                .select("id, name, seller_id")
+                .eq("id", product_id)
+                .is_("deleted_at", None)
+                .execute()
+            )
+            if not check.data:
+                return {"success": False, "error": "해당 상품을 찾을 수 없습니다."}
+            if check.data[0]["seller_id"] != seller_id:
+                return {"success": False, "error": "권한 없음: 본인 상품만 삭제할 수 있습니다."}
+            product_name = check.data[0]["name"]
 
         now_utc = datetime.now(timezone.utc).isoformat()
-        result = (
-            supabase.table("products")
-            .update({"deleted_at": now_utc})
-            .eq("id", product_id)
-            .execute()
-        )
+        supabase.table("products").update({"deleted_at": now_utc}).eq("id", product_id).execute()
 
-        if not result.data:
+        # 실제로 삭제됐는지 검증
+        verify = supabase.table("products").select("id, deleted_at").eq("id", product_id).execute()
+        if not verify.data or verify.data[0].get("deleted_at") is None:
             return {"success": False, "error": "상품 삭제에 실패했습니다."}
 
         return {
             "success": True,
             "product_id": product_id,
-            "product_name": check.data.get("name", ""),
-            "message": f"{check.data.get('name', '')} 상품이 삭제되었습니다.",
+            "product_name": product_name,
+            "message": f"{product_name} 상품이 삭제되었습니다.",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -248,26 +321,40 @@ def update_product(
     origin: Optional[str] = None,
     spec: Optional[str] = None,
     description: Optional[str] = None,
+    product_name: Optional[str] = None,
 ) -> dict:
-    """상품 정보를 수정한다. 전달된 필드만 업데이트한다."""
+    """상품 정보를 수정한다. product_id 또는 product_name으로 상품을 찾아 수정한다."""
     try:
         supabase = get_supabase_client()
 
-        # seller_id 권한 확인
-        check = (
-            supabase.table("products")
-            .select("id, name, seller_id")
-            .eq("id", product_id)
-            .is_("deleted_at", None)
-            .single()
-            .execute()
-        )
-
-        if not check.data:
-            return {"success": False, "error": "해당 상품을 찾을 수 없습니다."}
-
-        if check.data["seller_id"] != seller_id:
-            return {"success": False, "error": "권한 없음: 본인 상품만 수정할 수 있습니다."}
+        # product_id가 없으면 이름으로 검색
+        if not product_id or len(product_id) < 10:
+            search_name = product_name or name
+            if not search_name:
+                return {"success": False, "error": "수정할 상품명을 알려주세요."}
+            check = (
+                supabase.table("products")
+                .select("id, name, seller_id")
+                .eq("seller_id", seller_id)
+                .ilike("name", f"%{search_name}%")
+                .is_("deleted_at", None)
+                .execute()
+            )
+            if not check.data:
+                return {"success": False, "error": f"'{search_name}' 상품을 찾을 수 없습니다."}
+            product_id = check.data[0]["id"]
+        else:
+            check = (
+                supabase.table("products")
+                .select("id, name, seller_id")
+                .eq("id", product_id)
+                .is_("deleted_at", None)
+                .execute()
+            )
+            if not check.data:
+                return {"success": False, "error": "해당 상품을 찾을 수 없습니다."}
+            if check.data[0]["seller_id"] != seller_id:
+                return {"success": False, "error": "권한 없음: 본인 상품만 수정할 수 있습니다."}
 
         # None이 아닌 필드만 update dict에 포함
         update_data: dict = {}
@@ -287,19 +374,10 @@ def update_product(
         if not update_data:
             return {"success": False, "error": "수정할 필드가 없습니다."}
 
-        result = (
-            supabase.table("products")
-            .update(update_data)
-            .eq("id", product_id)
-            .execute()
-        )
-
-        if not result.data:
-            return {"success": False, "error": "상품 수정에 실패했습니다."}
+        supabase.table("products").update(update_data).eq("id", product_id).execute()
 
         return {
             "success": True,
-            "product": result.data[0],
             "message": f"상품 정보가 업데이트되었습니다.",
         }
     except Exception as e:
@@ -359,7 +437,6 @@ def get_order_detail(order_id: str) -> dict:
                 "delivery_address, notes, created_at, buyer_id, seller_id"
             )
             .eq("id", order_id)
-            .single()
             .execute()
         )
 
@@ -375,7 +452,7 @@ def get_order_detail(order_id: str) -> dict:
         )
 
         # 주문 정보에 항목 리스트를 합쳐서 반환
-        order_data = order_result.data
+        order_data = order_result.data[0]
         order_data["items"] = items_result.data or []
         order_data["items_count"] = len(items_result.data or [])
 
@@ -407,21 +484,11 @@ def update_order_status(order_id: str, new_status: str) -> dict:
 
         supabase = get_supabase_client()
 
-        result = (
-            supabase.table("orders")
-            .update({"status": new_status})
-            .eq("id", order_id)
-            .execute()
-        )
+        supabase.table("orders").update({"status": new_status}).eq("id", order_id).execute()
 
-        if not result.data:
-            return {"success": False, "error": "주문을 찾을 수 없거나 업데이트에 실패했습니다."}
-
-        updated = result.data[0]
         return {
             "success": True,
             "order_id": order_id,
-            "order_number": updated.get("order_number", ""),
             "new_status": new_status,
         }
     except Exception as e:
@@ -506,27 +573,18 @@ def delete_order(order_id: str, user_id: str) -> dict:
             .select("id, order_number, buyer_id, seller_id")
             .eq("id", order_id)
             .is_("deleted_at", None)
-            .single()
             .execute()
         )
 
         if not check.data:
             return {"success": False, "error": "해당 주문을 찾을 수 없습니다."}
 
-        order_data = check.data
+        order_data = check.data[0]
         if order_data["buyer_id"] != user_id and order_data["seller_id"] != user_id:
             return {"success": False, "error": "권한 없음: 해당 주문에 접근할 수 없습니다."}
 
         now_utc = datetime.now(timezone.utc).isoformat()
-        result = (
-            supabase.table("orders")
-            .update({"deleted_at": now_utc})
-            .eq("id", order_id)
-            .execute()
-        )
-
-        if not result.data:
-            return {"success": False, "error": "주문 삭제에 실패했습니다."}
+        supabase.table("orders").update({"deleted_at": now_utc}).eq("id", order_id).execute()
 
         return {
             "success": True,
@@ -542,10 +600,8 @@ def delete_order(order_id: str, user_id: str) -> dict:
 # 거래처 찾기 도구
 # ─────────────────────────────────────────────
 
-def find_sellers_by_product(category: str) -> dict:
+def find_sellers_by_product(category: str, product_name: Optional[str] = None) -> dict:
     """특정 카테고리를 판매 중인 판매자 목록을 넓게 조회한다. 세부 필터링은 LLM이 담당."""
-    import logging
-    logger = logging.getLogger(__name__)
     try:
         supabase = get_supabase_client()
 
@@ -558,6 +614,10 @@ def find_sellers_by_product(category: str) -> dict:
         # 'ALL'이 아니면 해당 카테고리로만 필터링
         if category and category.upper() != "ALL":
             query = query.eq("category", category.upper())
+
+        # 상품명으로 추가 필터링
+        if product_name:
+            query = query.ilike("name", f"%{product_name}%")
             
         # 재고가 있고 삭제되지 않은 상품만 조회
         result = (
@@ -566,8 +626,6 @@ def find_sellers_by_product(category: str) -> dict:
             .is_("deleted_at", None)
             .execute()
         )
-        
-        logger.warning(f"[DEBUG] 스마트 필터링 용 데이터 로드 완료: {len(result.data or [])}건")
         
         return {
             "success": True,
@@ -582,22 +640,29 @@ def find_buyers_by_product(category: str) -> dict:
     """특정 카테고리 상품을 구매한 바이어 목록을 넓게 조회한다. 세부 필터링은 LLM이 담당."""
     try:
         supabase = get_supabase_client()
-        
-        # 기본 쿼리 세팅 (products 테이블과 조인하여 카테고리 정보 확인)
-        query = (
-            supabase.table("order_items")
-            .select("order_id, quantity, orders!inner(buyer_id, status), products!inner(name, category)")
-        )
 
-        # 'ALL'이 아니면 해당 카테고리로만 필터링
+        # products 테이블에서 해당 카테고리 상품 ID 먼저 조회
+        prod_query = supabase.table("products").select("id, name, category")
         if category and category.upper() != "ALL":
-            query = query.eq("products.category", category.upper())
-            
-        result = query.execute()
+            prod_query = prod_query.eq("category", category.upper())
+        prod_result = prod_query.execute()
+
+        if not prod_result.data:
+            return {"success": True, "buyers": [], "count": 0}
+
+        product_ids = [p["id"] for p in prod_result.data]
+
+        # 해당 상품들의 order_items 조회
+        items_result = (
+            supabase.table("order_items")
+            .select("order_id, quantity, product_id, orders!inner(buyer_id, status)")
+            .in_("product_id", product_ids)
+            .execute()
+        )
 
         # buyer_id별로 집계
         buyer_stats: dict = {}
-        for item in result.data or []:
+        for item in items_result.data or []:
             buyer_id = item["orders"]["buyer_id"]
             if buyer_id not in buyer_stats:
                 buyer_stats[buyer_id] = {"buyer_id": buyer_id, "order_count": 0, "total_quantity": 0}
@@ -606,11 +671,7 @@ def find_buyers_by_product(category: str) -> dict:
 
         buyers = sorted(buyer_stats.values(), key=lambda x: x["total_quantity"], reverse=True)
 
-        return {
-            "success": True,
-            "buyers": buyers,
-            "count": len(buyers),
-        }
+        return {"success": True, "buyers": buyers, "count": len(buyers)}
     except Exception as e:
         return {"success": False, "error": str(e), "buyers": [], "count": 0}
 
