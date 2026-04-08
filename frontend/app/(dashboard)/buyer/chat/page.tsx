@@ -4,7 +4,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Send, Sparkles } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import Modal from '@/components/common/Modal';
-import { useChatRooms, useMessages, useSendMessage, useMarkAsRead, useSummarizeChat } from '@/hooks/useChat';
+import { useChatRooms, useMessagesWithWebSocket, useMarkAsRead, useSummarizeChat } from '@/hooks/useChat';
 import { useAuthStore } from '@/store/authStore';
 import { cn } from '@/lib/utils';
 
@@ -17,13 +17,13 @@ export default function BuyerChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const { data: roomsData } = useChatRooms();
-  const { data: messagesData } = useMessages(selectedRoomId || '');
-  const sendMessage = useSendMessage();
+  const { messageQuery, isConnected, sendMessage: wsSendMessage, wsError } =
+    useMessagesWithWebSocket(selectedRoomId);
   const markAsRead = useMarkAsRead();
   const summarize = useSummarizeChat();
 
   const rooms = roomsData?.data ?? [];
-  const messages = messagesData?.data ?? [];
+  const messages = messageQuery.data?.data ?? [];
 
   const selectedRoom = rooms.find((r) => r.id === selectedRoomId);
 
@@ -35,9 +35,9 @@ export default function BuyerChatPage() {
     if (selectedRoomId) markAsRead.mutate(selectedRoomId);
   }, [selectedRoomId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleSend = async () => {
+  const handleSend = () => {
     if (!message.trim() || !selectedRoomId) return;
-    await sendMessage.mutateAsync({ roomId: selectedRoomId, content: message });
+    wsSendMessage(message);
     setMessage('');
   };
 
@@ -104,10 +104,22 @@ export default function BuyerChatPage() {
               {/* 채팅방 헤더 */}
               <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
                 <div>
-                  <p className="text-sm font-semibold text-gray-900">
-                    {selectedRoom?.partner_name || '상대방'}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-semibold text-gray-900">
+                      {selectedRoom?.partner_name || '상대방'}
+                    </p>
+                    <span
+                      className={cn(
+                        'h-2 w-2 rounded-full',
+                        isConnected ? 'bg-green-500' : 'bg-gray-300'
+                      )}
+                      title={isConnected ? '연결됨' : '연결 중...'}
+                    />
+                  </div>
                   <p className="text-xs text-gray-500">{selectedRoom?.partner_company}</p>
+                  {wsError && (
+                    <p className="mt-0.5 text-xs text-red-500">{wsError}</p>
+                  )}
                 </div>
                 <button
                   onClick={handleSummarize}
@@ -161,7 +173,7 @@ export default function BuyerChatPage() {
                   />
                   <button
                     onClick={handleSend}
-                    disabled={!message.trim() || sendMessage.isPending}
+                    disabled={!message.trim() || !isConnected}
                     className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50"
                   >
                     <Send className="h-4 w-4" />

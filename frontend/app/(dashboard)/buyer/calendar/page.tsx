@@ -8,6 +8,7 @@ import { useCalendarEvents, useCreateCalendarEvent } from '@/hooks/useCalendar';
 import { EVENT_TYPE_OPTIONS } from '@/constants/options';
 import type { CalendarEvent, CalendarEventCreate, EventType } from '@/types';
 import { cn } from '@/lib/utils';
+import ScheduleAgentPanel from '@/components/calendar/ScheduleAgentPanel';
 
 const eventTypeColors: Record<string, string> = {
   SHIPMENT: 'bg-blue-500',
@@ -87,24 +88,27 @@ export default function BuyerCalendarPage() {
             })}
           </div>
         </div>
-        <div className="rounded-xl bg-white p-6 shadow-sm">
-          <div className="mb-4 flex items-center justify-between">
-            <h3 className="font-semibold text-gray-900">{selectedDate || '날짜를 선택하세요'}</h3>
-            {selectedDate && <button onClick={() => setShowModal(true)} className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-600 text-white hover:bg-primary-700"><Plus className="h-4 w-4" /></button>}
-          </div>
-          {selectedEvents.length === 0 ? <p className="text-sm text-gray-400">일정이 없습니다.</p> : (
-            <div className="space-y-3">
-              {selectedEvents.map((ev) => (
-                <div key={ev.id} className="rounded-lg border border-gray-100 p-3">
-                  <div className="flex items-center gap-2">
-                    <div className={cn('h-2 w-2 rounded-full', eventTypeColors[ev.event_type])} />
-                    <span className="text-sm font-medium text-gray-900">{ev.title}</span>
-                  </div>
-                  {ev.description && <p className="mt-1 text-xs text-gray-500">{ev.description}</p>}
-                </div>
-              ))}
+        <div className="space-y-6">
+          <div className="rounded-xl bg-white p-6 shadow-sm">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="font-semibold text-gray-900">{selectedDate || '날짜를 선택하세요'}</h3>
+              {selectedDate && <button onClick={() => setShowModal(true)} className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-600 text-white hover:bg-primary-700"><Plus className="h-4 w-4" /></button>}
             </div>
-          )}
+            {selectedEvents.length === 0 ? <p className="text-sm text-gray-400">일정이 없습니다.</p> : (
+              <div className="space-y-3">
+                {selectedEvents.map((ev) => (
+                  <div key={ev.id} className="rounded-lg border border-gray-100 p-3">
+                    <div className="flex items-center gap-2">
+                      <div className={cn('h-2 w-2 rounded-full', eventTypeColors[ev.event_type])} />
+                      <span className="text-sm font-medium text-gray-900">{ev.title}</span>
+                    </div>
+                    {ev.description && <p className="mt-1 text-xs text-gray-500">{ev.description}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <ScheduleAgentPanel year={year} month={month} />
         </div>
       </div>
       <Modal isOpen={showModal} onClose={() => setShowModal(false)} title="일정 추가" size="sm">

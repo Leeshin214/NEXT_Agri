@@ -280,6 +280,50 @@ setAll(cookiesToSet: { name: string; value: string; options: CookieOptions }[]) 
 }
 ```
 
+#### useMutation 온디맨드 호출 패턴 (검증됨)
+
+자동 fetch가 아닌 버튼 클릭 시에만 호출하는 AI/에이전트 훅은 `useQuery` 대신 `useMutation`을 사용한다.
+`isIdle` → `isPending` → `data` / `isError` 순서로 상태를 분기 렌더링한다.
+
+```typescript
+// hooks/useScheduleAgent.ts
+export function useScheduleRecommend() {
+  return useMutation({
+    mutationFn: async (params: { year: number; month: number }) => {
+      const res = await api.post<SuccessResponse<ScheduleRecommendResponse>>(
+        '/schedule-agent/recommend',
+        params
+      );
+      return res;
+    },
+  });
+}
+
+// 컴포넌트에서 사용
+const { mutate, data, isPending, isError, isIdle } = useScheduleRecommend();
+const result = data?.data;  // SuccessResponse 래퍼 안의 data 필드
+
+// 상태 분기: isIdle → 초기 안내 + 버튼 / isPending → 스피너 / result → 결과 / isError → 에러
+```
+
+#### 캘린더 사이드바에 AI 패널 추가 시 래퍼 패턴 (검증됨)
+
+캘린더 페이지의 사이드 컬럼(기존 단일 카드)에 AI 패널을 추가할 때는 `space-y-6` 래퍼 div로 묶는다.
+`lg:grid-cols-4` 레이아웃에서 컬럼 수 변경 없이 수직 스택으로 패널을 추가할 수 있다.
+
+```tsx
+<div className="space-y-6">          {/* 새 래퍼 — 기존 col 설정 제거 */}
+  <div className="rounded-xl bg-white p-6 shadow-sm">  {/* 기존 날짜 상세 카드 */}
+    ...
+  </div>
+  <ScheduleAgentPanel year={year} month={month} />
+</div>
+```
+
+#### AI 패널 컴포넌트 디렉토리 위치
+
+`components/calendar/` 디렉토리는 기본 생성 안 됨 — `mkdir -p`로 먼저 생성 후 파일 작성.
+
 ### 도메인 타입 → `Record` 키 타입 패턴 (검증됨)
 
 상태 전이 맵처럼 값이 도메인 타입인 경우 `Record<string, DomainType>` 형태로 선언한다. 키는 런타임에 동적으로 조회되므로 `string`으로 유지한다.
