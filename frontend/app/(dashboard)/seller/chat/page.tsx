@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Send, Sparkles } from 'lucide-react';
+import { Send, Sparkles, ArrowLeft } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import Modal from '@/components/common/Modal';
 import { useChatRooms, useMessagesWithWebSocket, useMarkAsRead, useSummarizeChat } from '@/hooks/useChat';
@@ -14,9 +14,11 @@ export default function SellerChatPage() {
   const [message, setMessage] = useState('');
   const [showSummary, setShowSummary] = useState(false);
   const [summary, setSummary] = useState('');
+  // 모바일에서 채팅방 선택 시 메시지 뷰로 전환하는 상태
+  const [mobileView, setMobileView] = useState<'list' | 'messages'>('list');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const { data: roomsData } = useChatRooms();
+  const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: refetchRooms } = useChatRooms();
   const { messageQuery, isConnected, sendMessage: wsSendMessage, wsError } =
     useMessagesWithWebSocket(selectedRoomId);
   const markAsRead = useMarkAsRead();
@@ -34,6 +36,15 @@ export default function SellerChatPage() {
   useEffect(() => {
     if (selectedRoomId) markAsRead.mutate(selectedRoomId);
   }, [selectedRoomId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleRoomSelect = (roomId: string) => {
+    setSelectedRoomId(roomId);
+    setMobileView('messages');
+  };
+
+  const handleBackToList = () => {
+    setMobileView('list');
+  };
 
   const handleSend = () => {
     if (!message.trim() || !selectedRoomId) return;
@@ -57,16 +68,34 @@ export default function SellerChatPage() {
     <div>
       <PageHeader title="채팅" description="바이어와 실시간으로 대화하세요" />
 
-      <div className="flex h-[calc(100vh-220px)] rounded-xl bg-white shadow-sm overflow-hidden">
-        {/* 채팅방 목록 */}
-        <div className="w-72 border-r border-gray-200 overflow-y-auto">
-          {rooms.length === 0 ? (
+      <div className="flex h-[calc(100vh-200px)] rounded-xl bg-white shadow-sm overflow-hidden">
+        {/* 채팅방 목록 — 모바일: mobileView==='list'일 때만 표시, md 이상: 항상 표시 */}
+        <div
+          className={cn(
+            'border-r border-gray-200 overflow-y-auto',
+            // 모바일: 전체 너비, mobileView에 따라 표시/숨김
+            'w-full md:w-72 md:flex-shrink-0',
+            mobileView === 'list' ? 'flex flex-col' : 'hidden md:flex md:flex-col'
+          )}
+        >
+          {roomsLoading ? (
+            <div className="flex items-center justify-center p-8">
+              <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary-600 border-t-transparent" />
+            </div>
+          ) : roomsError ? (
+            <div className="p-4 text-sm text-red-500">
+              채팅방을 불러오지 못했습니다.
+              <button onClick={() => refetchRooms()} className="ml-2 text-primary-600 underline">
+                다시 시도
+              </button>
+            </div>
+          ) : rooms.length === 0 ? (
             <p className="p-4 text-sm text-gray-400">채팅방이 없습니다.</p>
           ) : (
             rooms.map((room) => (
               <button
                 key={room.id}
-                onClick={() => setSelectedRoomId(room.id)}
+                onClick={() => handleRoomSelect(room.id)}
                 className={cn(
                   'w-full border-b border-gray-100 p-4 text-left hover:bg-gray-50',
                   selectedRoomId === room.id && 'bg-primary-50'
@@ -93,8 +122,13 @@ export default function SellerChatPage() {
           )}
         </div>
 
-        {/* 메시지 영역 */}
-        <div className="flex flex-1 flex-col">
+        {/* 메시지 영역 — 모바일: mobileView==='messages'일 때만 표시, md 이상: 항상 표시 */}
+        <div
+          className={cn(
+            'flex flex-1 flex-col',
+            mobileView === 'messages' ? 'flex' : 'hidden md:flex'
+          )}
+        >
           {!selectedRoomId ? (
             <div className="flex flex-1 items-center justify-center text-sm text-gray-400">
               채팅방을 선택하세요
@@ -103,23 +137,33 @@ export default function SellerChatPage() {
             <>
               {/* 채팅방 헤더 */}
               <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <p className="text-sm font-semibold text-gray-900">
-                      {selectedRoom?.partner_name || '상대방'}
-                    </p>
-                    <span
-                      className={cn(
-                        'h-2 w-2 rounded-full',
-                        isConnected ? 'bg-green-500' : 'bg-gray-300'
-                      )}
-                      title={isConnected ? '연결됨' : '연결 중...'}
-                    />
+                <div className="flex items-center gap-2">
+                  {/* 모바일 뒤로가기 버튼 */}
+                  <button
+                    onClick={handleBackToList}
+                    className="flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 md:hidden"
+                    aria-label="목록으로"
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                  </button>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold text-gray-900">
+                        {selectedRoom?.partner_name || '상대방'}
+                      </p>
+                      <span
+                        className={cn(
+                          'h-2 w-2 rounded-full',
+                          isConnected ? 'bg-green-500' : 'bg-gray-300'
+                        )}
+                        title={isConnected ? '연결됨' : '연결 중...'}
+                      />
+                    </div>
+                    <p className="text-xs text-gray-500">{selectedRoom?.partner_company}</p>
+                    {wsError && (
+                      <p className="mt-0.5 text-xs text-red-500">{wsError}</p>
+                    )}
                   </div>
-                  <p className="text-xs text-gray-500">{selectedRoom?.partner_company}</p>
-                  {wsError && (
-                    <p className="mt-0.5 text-xs text-red-500">{wsError}</p>
-                  )}
                 </div>
                 <button
                   onClick={handleSummarize}
@@ -127,7 +171,8 @@ export default function SellerChatPage() {
                   className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
                 >
                   <Sparkles className="h-3.5 w-3.5 text-purple-500" />
-                  {summarize.isPending ? 'AI 요약 중...' : 'AI 요약'}
+                  <span className="hidden sm:inline">{summarize.isPending ? 'AI 요약 중...' : 'AI 요약'}</span>
+                  <span className="sm:hidden">요약</span>
                 </button>
               </div>
 
@@ -142,7 +187,7 @@ export default function SellerChatPage() {
                     >
                       <div
                         className={cn(
-                          'max-w-[70%] rounded-2xl px-4 py-2 text-sm',
+                          'max-w-[75%] rounded-2xl px-4 py-2 text-sm',
                           isMine
                             ? 'bg-primary-600 text-white'
                             : 'bg-gray-100 text-gray-900'
@@ -163,6 +208,7 @@ export default function SellerChatPage() {
                     value={message}
                     onChange={(e) => setMessage(e.target.value)}
                     onKeyDown={(e) => {
+                      if (e.nativeEvent.isComposing) return;
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
                         handleSend();

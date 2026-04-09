@@ -11,6 +11,7 @@ export interface WebSocketMessage {
   content?: string;
   is_read?: boolean;
   created_at?: string;
+  deleted_at?: string | null;
   message?: string; // error type일 때
 }
 
@@ -62,9 +63,13 @@ export function useWebSocketChat(roomId: string | null): {
       return;
     }
 
-    const url = token
-      ? `${WS_BASE_URL}/ws/chat/${roomIdRef.current}?token=${token}`
-      : `${WS_BASE_URL}/ws/chat/${roomIdRef.current}`;
+    // 토큰 없으면 연결하지 않음 (백엔드 code 4001 즉시 종료 방지)
+    if (!token) {
+      setError('인증 토큰이 없어 WebSocket에 연결할 수 없습니다.');
+      return;
+    }
+
+    const url = `${WS_BASE_URL}/ws/chat/${roomIdRef.current}?token=${token}`;
 
     let ws: WebSocket;
     try {
@@ -113,9 +118,15 @@ export function useWebSocketChat(roomId: string | null): {
       setIsConnected(false);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       setIsConnected(false);
       wsRef.current = null;
+
+      // 인증 실패(4001)이면 재시도하지 않음
+      if (event.code === 4001) {
+        setError('인증에 실패하여 채팅 연결이 종료되었습니다.');
+        return;
+      }
 
       // roomId가 여전히 유효하고 최대 재시도 횟수 미만이면 재연결
       if (roomIdRef.current && retryCountRef.current < MAX_RETRY) {
@@ -123,6 +134,8 @@ export function useWebSocketChat(roomId: string | null): {
         retryTimerRef.current = setTimeout(() => {
           connect();
         }, RETRY_DELAY_MS);
+      } else if (retryCountRef.current >= MAX_RETRY) {
+        setError('서버 연결에 실패했습니다. 페이지를 새로고침해주세요.');
       }
     };
   }, []); // connect 자체는 roomIdRef를 사용하므로 deps 없음

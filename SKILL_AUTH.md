@@ -368,6 +368,21 @@ async def create_order(
 
 ### 주의사항 & 함정
 
+- **로그인 직후 setUser 즉시 호출 필수 (함정)**: `login/page.tsx`에서 로그인 성공 후 `router.push()`만 하면 안 된다. redirect 후 `useAuth` 훅이 TopBar에서 비동기로 프로필을 가져오는 동안 Zustand persist에서 복원된 stale 데이터나 null이 사용된다. 특히 채팅 페이지에서 `msg.sender_id === user?.id` 비교 시 `user.id`가 `''`이면 모든 메시지가 상대방 메시지로 보이는 버그가 발생한다. 반드시 로그인 시 `select('*')`로 전체 프로필을 가져와 `useAuthStore.getState().setUser(profile)`로 즉시 저장한다.
+  ```typescript
+  // login/page.tsx — 올바른 패턴
+  const { data: profile } = await supabase
+    .from('users')
+    .select('*')           // role만 가져오면 안 됨
+    .eq('supabase_uid', user.id)
+    .single();
+
+  if (profile) {
+    useAuthStore.getState().setUser(profile);  // redirect 전에 즉시 저장
+  }
+  router.push(redirectPath);
+  ```
+
 - **useAuth — users 테이블 null 폴백 필수**: Supabase Auth trigger가 아직 실행되지 않았거나 실패한 경우 `users` 테이블에 레코드가 없을 수 있다. `setUser(profile)` 전에 `if (profile)` 분기를 두고, null이면 `data.user.user_metadata`(회원가입 시 전달한 name, role, company_name)로 폴백 User 객체를 구성해 `setUser`해야 한다. 그렇지 않으면 store가 null이 돼 마이페이지/TopBar 등 모든 user 의존 UI가 깨진다.
 
 - **Supabase JWT secret — base64 decode 금지**: Supabase GoTrue는 `jwt.SignedString([]byte(jwtSecret))`로 서명한다. 즉 secret 문자열을 UTF-8 bytes로 그대로 사용한다. PyJWT도 string 키를 UTF-8로 변환하므로 둘이 일치한다. `base64.b64decode(settings.SUPABASE_JWT_SECRET)`를 하면 secret이 달라져서 서명 검증이 항상 실패한다. `jwt.decode(token, settings.SUPABASE_JWT_SECRET, ...)` 형태로 string을 그대로 전달해야 한다.

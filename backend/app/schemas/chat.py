@@ -37,5 +37,6 @@ class MessageResponse(BaseModel):
     content: str
     is_read: bool
     created_at: datetime
+    deleted_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}

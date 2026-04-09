@@ -134,7 +134,7 @@ export default function SellerProductsPage() {
       {/* 상품 등록 모달 */}
       <Modal isOpen={showModal} onClose={() => setShowModal(false)} title="상품 등록" size="lg">
         <form onSubmit={handleCreate} className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label className="mb-1 block text-sm font-medium text-gray-700">품목명 *</label>
               <input name="name" required className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />

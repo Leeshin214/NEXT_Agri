@@ -71,7 +71,7 @@ export default function BuyerCalendarPage() {
             {['일', '월', '화', '수', '목', '금', '토'].map((d) => <div key={d} className="py-2">{d}</div>)}
           </div>
           <div className="grid grid-cols-7 gap-px">
-            {Array.from({ length: firstDayOfWeek }).map((_, i) => <div key={`e-${i}`} className="min-h-[80px]" />)}
+            {Array.from({ length: firstDayOfWeek }).map((_, i) => <div key={`e-${i}`} className="min-h-[60px] md:min-h-[80px]" />)}
             {days.map((day) => {
               const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
               const dayEvents = getEventsForDay(day);

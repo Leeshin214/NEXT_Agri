@@ -6,16 +6,21 @@ import { createClient } from '@/lib/supabase/client';
 import { api } from '@/lib/api';
 import type { ChatRoom, Message, SuccessResponse } from '@/types';
 import { useWebSocketChat } from './useWebSocketChat';
+import { useAuthStore } from '@/store/authStore';
 
 // ─── 채팅방 목록 (Realtime 구독으로 자동 갱신) ───
 
 export function useChatRooms() {
   const queryClient = useQueryClient();
   const supabase = createClient();
+  const { user } = useAuthStore();
 
   const query = useQuery({
     queryKey: ['chatRooms'],
     queryFn: () => api.get<SuccessResponse<ChatRoom[]>>('/chat/rooms'),
+    enabled: !!user,
+    retry: 2,
+    retryDelay: 1000,
   });
 
   useEffect(() => {
@@ -134,6 +139,7 @@ export function useMessagesWithWebSocket(roomId: string | null) {
       content: lastMessage.content,
       is_read: lastMessage.is_read,
       created_at: lastMessage.created_at,
+      deleted_at: lastMessage.deleted_at ?? null,
     };
 
     queryClient.setQueryData(

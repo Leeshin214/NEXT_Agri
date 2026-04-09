@@ -135,7 +135,7 @@ export default function SellerOrdersPage() {
 
       {/* 주문 상세 슬라이드 패널 */}
       {selectedOrder && (
-        <div className="fixed inset-y-0 right-0 z-40 w-96 bg-white shadow-xl">
+        <div className="fixed inset-y-0 right-0 z-40 w-full sm:w-96 bg-white shadow-xl">
           <div className="flex h-full flex-col">
             <div className="flex items-center justify-between border-b border-gray-200 px-6 py-4">
               <h2 className="text-lg font-semibold text-gray-900">
