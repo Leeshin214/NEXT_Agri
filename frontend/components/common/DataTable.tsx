@@ -32,6 +32,7 @@ export default function DataTable<T extends { id: string }>({
 
   return (
     <div className="overflow-hidden rounded-xl bg-white shadow-sm">
+      <div className="overflow-x-auto">
       <table className="w-full">
         <thead>
           <tr className="border-b border-gray-200 bg-gray-50">
@@ -69,6 +70,7 @@ export default function DataTable<T extends { id: string }>({
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

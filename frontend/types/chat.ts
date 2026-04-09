@@ -18,4 +18,5 @@ export interface Message {
   content: string;
   is_read: boolean;
   created_at: string;
+  deleted_at?: string | null;
 }

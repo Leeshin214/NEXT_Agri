@@ -1,4 +1,4 @@
-export type { User, UserRole } from './user';
+export type { User, UserRole, UserPublicProfile } from './user';
 export type { Product, ProductCategory, ProductStatus, ProductUnit, ProductCreate, ProductUpdate } from './product';
 export type { Order, OrderItem, OrderStatus, OrderCreate, OrderItemCreate } from './order';
 export type { Partner, PartnerStatus, PartnerCreate } from './partner';

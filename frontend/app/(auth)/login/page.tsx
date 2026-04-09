@@ -4,6 +4,9 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/client';
+import { useAuthStore } from '@/store/authStore';
+import { api } from '@/lib/api';
+import type { SuccessResponse, User } from '@/types';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -40,15 +43,27 @@ export default function LoginPage() {
     } = await supabase.auth.getUser();
 
     if (user) {
-      const { data: profile } = await supabase
-        .from('users')
-        .select('role')
-        .eq('supabase_uid', user.id)
-        .single();
+      // 백엔드 API로 프로필 조회 (service_role → RLS 우회, 올바른 users.id 보장)
+      try {
+        const result = await api.get<SuccessResponse<User>>('/users/me');
+        useAuthStore.getState().setUser(result.data);
+        const redirectPath =
+          result.data.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
+        router.push(redirectPath);
+      } catch (e) {
+        console.error('[Login] 백엔드 API 프로필 조회 실패, Supabase fallback 시도:', e);
 
-      const redirectPath =
-        profile?.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
-      router.push(redirectPath);
+        // fallback: Supabase 직접 조회
+        const { data: profile } = await supabase
+          .from('users')
+          .select('role')
+          .eq('supabase_uid', user.id)
+          .single();
+
+        const redirectPath =
+          profile?.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
+        router.push(redirectPath);
+      }
     }
   };
 

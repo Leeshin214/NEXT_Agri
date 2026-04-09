@@ -180,7 +180,8 @@ CREATE TABLE messages (
   sender_id    UUID NOT NULL REFERENCES users(id),
   content      TEXT NOT NULL,
   is_read      BOOLEAN DEFAULT false,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at   TIMESTAMPTZ DEFAULT NULL
 );
 ```
 

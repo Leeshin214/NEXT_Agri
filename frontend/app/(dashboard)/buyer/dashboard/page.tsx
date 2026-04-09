@@ -87,7 +87,7 @@ export default function BuyerDashboardPage() {
                       {order.delivery_date ? `납품일: ${order.delivery_date}` : '납품일 미정'}
                     </p>
                   </div>
-                  <div className="flex items-center gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium text-gray-900">
                       {order.total_amount ? `${order.total_amount.toLocaleString()}원` : '-'}
                     </span>

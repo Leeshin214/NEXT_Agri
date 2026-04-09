@@ -150,6 +150,19 @@ import { useWebSocketChat } from '@/hooks/useWebSocketChat';
 const { isConnected, sendMessage, lastMessage, error } = useWebSocketChat(roomId);
 // sendMessage(content) → WS send {"type":"message","content":"..."}
 // lastMessage: WebSocketMessage | null — 수신 시마다 갱신
+
+// WebSocketMessage 인터페이스 (Message 타입과 필드 동기화 필수)
+export interface WebSocketMessage {
+  type: 'message' | 'error';
+  id?: string;
+  room_id?: string;
+  sender_id?: string;
+  content?: string;
+  is_read?: boolean;
+  created_at?: string;
+  deleted_at?: string | null;
+  message?: string; // error type일 때
+}
 ```
 
 ### useMessagesWithWebSocket 훅 (신규 — 검증됨)
@@ -229,12 +242,135 @@ NEXT_PUBLIC_WS_URL=ws://localhost:8000   # 미설정 시 이 값이 기본값으
 # 프로덕션: wss://your-backend.railway.app
 ```
 
+## WebSocket 핸들러 디버그 로깅 패턴 (검증됨)
+
+`websocket.close()`를 `websocket.accept()` 전에 호출하면 클라이언트에 403이 반환된다.
+어느 단계에서 close되는지 알 수 없으므로, `_get_user_from_token` / `_get_room` / `websocket_chat` 세 곳 모두에 print 로그를 추가한다.
+
+```python
+# _get_user_from_token
+except Exception as e:
+    print(f"[WS AUTH] 인증 실패: {type(e).__name__}: {e}")
+    return None
+
+# _get_room
+except Exception as e:
+    print(f"[WS ROOM] 조회 실패: {type(e).__name__}: {e}")
+    return None
+
+# websocket_chat — 각 조기 종료 분기
+print(f"[WS] 토큰 없음 → close(4001)")
+print(f"[WS] 사용자 인증 실패 → close(4001)")
+print(f"[WS] 채팅방 없음: room_id={room_id} → close(4004)")
+print(f"[WS] 참여자 아님: user_id={user_id}, seller={room['seller_id']}, buyer={room['buyer_id']} → close(4003)")
+print(f"[WS] 연결 수락: user_id={user_id}, room_id={room_id}")
+```
+
+REST API는 정상(200)인데 WebSocket만 403인 경우 유력한 원인:
+1. `verify_supabase_jwt`가 HTTPException을 raise → `except Exception`에 잡혀 None 반환 → close(4001) → 403
+2. `chat_rooms` 테이블에 해당 room_id 없음 → close(4004) → 403
+3. user_id가 seller_id/buyer_id 어느 쪽에도 없음 → close(4003) → 403
+
+로그에서 `[WS AUTH] 인증 실패: HTTPException: ...` 패턴이 보이면 `verify_supabase_jwt` 내부 문제다.
+WebSocket 핸들러는 FastAPI의 예외 처리 미들웨어를 거치지 않으므로 HTTPException도 일반 예외로 전파된다.
+
+---
+
 ## 주의사항 & 함정
+
+- **한글 IME 조합 중 Enter 중복 전송 버그**: `onKeyDown`에 `e.nativeEvent.isComposing` 체크를 반드시 추가한다. 없으면 한글 마지막 글자가 조합 완료 전에 handleSend가 호출되어 중복 전송된다.
+  ```tsx
+  onKeyDown={(e) => {
+    if (e.nativeEvent.isComposing) return;  // 한글 IME 조합 중 전송 방지
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  }}
+  ```
 
 - `useWebSocketChat`의 `connect` 함수는 `roomIdRef`를 사용하므로 deps 배열이 비어있다. roomId 변경은 useEffect에서 `retryCountRef.current = 0` 후 `connect()` 재호출로 처리.
 - WS 언마운트 시 `ws.onclose = null` 먼저 설정 후 `ws.close()` — 그렇지 않으면 onclose가 재연결 타이머를 등록해 메모리 누수 발생.
+- `WebSocketMessage` 인터페이스는 `types/chat.ts`의 `Message` 인터페이스와 필드가 동기화되어야 한다. 백엔드에서 `Message` 모델에 컬럼이 추가되면 양쪽 모두 수정 필요: `types/chat.ts`의 `Message`, `hooks/useWebSocketChat.ts`의 `WebSocketMessage`, 그리고 `hooks/useChat.ts`의 `incomingMessage` 객체 생성부.
 - `useMessagesWithWebSocket`에서 WS 수신 메시지를 캐시에 추가할 때 `id` 중복 체크 필수 — 서버가 동일 메시지를 두 번 보낼 경우 대비.
 - 전송 버튼 disabled를 `!isConnected`로 설정 — WS 미연결 상태에서 전송 시도 방지.
+
+### 새로고침 후 채팅방 목록 빈 배열 고정 버그 (검증됨)
+
+`useChatRooms`에 `enabled` 조건이 없으면 Supabase auth 세션 복구 전에 쿼리가 실행돼 401 → 빈 배열로 고정된다.
+반드시 `useAuthStore`의 `user`를 가져와 `enabled: !!user`를 추가한다. `retry: 2`, `retryDelay: 1000`도 함께 설정해 인증 복구 시간을 확보한다.
+
+```typescript
+// hooks/useChat.ts
+import { useAuthStore } from '@/store/authStore';
+
+export function useChatRooms() {
+  const { user } = useAuthStore();
+
+  const query = useQuery({
+    queryKey: ['chatRooms'],
+    queryFn: () => api.get<SuccessResponse<ChatRoom[]>>('/chat/rooms'),
+    enabled: !!user,   // user가 null→object로 변경 시 자동으로 쿼리 실행
+    retry: 2,
+    retryDelay: 1000,
+  });
+  // ...
+}
+```
+
+### WebSocket 토큰 없을 때 조기 차단 패턴 (검증됨)
+
+토큰이 null이면 연결을 시도하지 않는다. 시도하면 백엔드가 code 4001로 즉시 종료하고 재시도 3회 낭비 발생.
+또한 `onclose`에서 code 4001 수신 시 재시도하지 않고 즉시 에러 메시지를 세팅한다.
+재시도 횟수 초과 시에도 에러 메시지를 세팅해 사용자에게 피드백을 제공한다.
+
+```typescript
+// connect() 내부 — 토큰 획득 후
+if (!token) {
+  setError('인증 토큰이 없어 WebSocket에 연결할 수 없습니다.');
+  return;
+}
+
+// onclose 핸들러
+ws.onclose = (event) => {
+  setIsConnected(false);
+  wsRef.current = null;
+  if (event.code === 4001) {
+    setError('인증에 실패하여 채팅 연결이 종료되었습니다.');
+    return;
+  }
+  if (roomIdRef.current && retryCountRef.current < MAX_RETRY) {
+    retryCountRef.current += 1;
+    retryTimerRef.current = setTimeout(() => connect(), RETRY_DELAY_MS);
+  } else if (retryCountRef.current >= MAX_RETRY) {
+    setError('서버 연결에 실패했습니다. 페이지를 새로고침해주세요.');
+  }
+};
+```
+
+### 채팅 페이지 채팅방 목록 로딩/에러 상태 표시 패턴 (검증됨)
+
+`useChatRooms()`에서 `isLoading`, `error`, `refetch`를 함께 destructure해 로딩 스피너와 에러+재시도 버튼을 표시한다.
+
+```typescript
+const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: refetchRooms } = useChatRooms();
+
+// JSX
+{roomsLoading ? (
+  <div className="flex items-center justify-center p-8">
+    <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary-600 border-t-transparent" />
+  </div>
+) : roomsError ? (
+  <div className="p-4 text-sm text-red-500">
+    채팅방을 불러오지 못했습니다.
+    <button onClick={() => refetchRooms()} className="ml-2 text-primary-600 underline">다시 시도</button>
+  </div>
+) : rooms.length === 0 ? (
+  <p className="p-4 text-sm text-gray-400">채팅방이 없습니다.</p>
+) : (
+  rooms.map(...)
+)}
+```
 
 ## 작업 체크리스트
 

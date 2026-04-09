@@ -16,6 +16,7 @@ async def _get_user_from_token(token: str) -> dict | None:
         payload = await verify_supabase_jwt(token)
         supabase_uid = payload.get("sub")
         if not supabase_uid:
+            print(f"[WS AUTH] sub 없음 in payload")
             return None
 
         client = get_supabase_client()
@@ -26,8 +27,11 @@ async def _get_user_from_token(token: str) -> dict | None:
             .single()
             .execute()
         )
+        if not result.data:
+            print(f"[WS AUTH] 사용자 없음: supabase_uid={supabase_uid}")
         return result.data or None
-    except Exception:
+    except Exception as e:
+        print(f"[WS AUTH] 인증 실패: {type(e).__name__}: {e}")
         return None
 
 
@@ -42,8 +46,11 @@ async def _get_room(room_id: str) -> dict | None:
             .single()
             .execute()
         )
+        if not result.data:
+            print(f"[WS ROOM] 채팅방 없음: room_id={room_id}")
         return result.data or None
-    except Exception:
+    except Exception as e:
+        print(f"[WS ROOM] 조회 실패: {type(e).__name__}: {e}")
         return None
 
 
@@ -62,27 +69,32 @@ async def websocket_chat(websocket: WebSocket, room_id: str):
     # 1. query param에서 token 추출
     token = websocket.query_params.get("token")
     if not token:
+        print(f"[WS] 토큰 없음 → close(4001)")
         await websocket.close(code=4001)
         return
 
     # 2. JWT 검증 및 사용자 조회
     user = await _get_user_from_token(token)
     if not user:
+        print(f"[WS] 사용자 인증 실패 → close(4001)")
         await websocket.close(code=4001)
         return
 
     # 3. 채팅방 존재 여부 + 참여자 확인
     room = await _get_room(room_id)
     if not room:
+        print(f"[WS] 채팅방 없음: room_id={room_id} → close(4004)")
         await websocket.close(code=4004)
         return
 
     user_id = str(user["id"])
     if user_id not in (str(room["seller_id"]), str(room["buyer_id"])):
+        print(f"[WS] 참여자 아님: user_id={user_id}, seller={room['seller_id']}, buyer={room['buyer_id']} → close(4003)")
         await websocket.close(code=4003)
         return
 
     # 4. 연결 수락
+    print(f"[WS] 연결 수락: user_id={user_id}, room_id={room_id}")
     await manager.connect(room_id, websocket)
 
     try:

@@ -169,6 +169,28 @@ class PaginationMeta(BaseModel):
 
 ## 각 API 엔드포인트 설계
 
+### users.py (회원 API)
+```python
+router = APIRouter(prefix="/users", tags=["users"])
+
+# GET /users/me          - 내 정보 조회
+# PATCH /users/me        - 내 프로필 수정
+# GET /users/search      - 회원 검색 (role 파라미터 Optional)
+# GET /users/{id}/profile - 개별 공개 프로필 조회 (인증된 사용자라면 역할 무관하게 조회 가능)
+
+# GET /users/search 파라미터
+# - search: Optional[str]  — 이름·업체명·이메일 OR ilike
+# - role: Optional[str]    — SELLER 또는 BUYER만 허용; 없으면 요청자 반대 역할로 fallback
+# - page, limit: 페이지네이션
+#
+# role 유효성 검증은 라우터에서 수행, 서비스는 target_role을 직접 받음
+_OPPOSITE_ROLE = {"SELLER": "BUYER", "BUYER": "SELLER"}  # 라우터 레벨 상수
+_ALLOWED_SEARCH_ROLES = {"SELLER", "BUYER"}               # ADMIN 등 거부용
+
+# role이 ADMIN 등 허용 외 값이면 400 반환:
+# raise HTTPException(400, f"허용된 role 값은 SELLER 또는 BUYER입니다. 전달된 값: {role}")
+```
+
 ### products.py (상품 API)
 ```python
 router = APIRouter(prefix="/products", tags=["products"])

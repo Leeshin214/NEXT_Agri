@@ -96,7 +96,7 @@ export default function SellerCalendarPage() {
           <div className="grid grid-cols-7 gap-px">
             {/* 빈 셀 */}
             {Array.from({ length: firstDayOfWeek }).map((_, i) => (
-              <div key={`empty-${i}`} className="min-h-[80px]" />
+              <div key={`empty-${i}`} className="min-h-[60px] md:min-h-[80px]" />
             ))}
             {days.map((day) => {
               const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
