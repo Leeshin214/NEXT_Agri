@@ -44,7 +44,7 @@ class OrderService:
         page: int = 1,
         limit: int = 20,
     ) -> tuple[list[dict], PaginationMeta]:
-        query = self.orders.select("*", count="exact").is_("deleted_at", "null")
+        query = self.orders.select("*", count="exact").is_("deleted_at", None)
 
         # 역할에 따라 필터
         if role == "BUYER":
@@ -81,14 +81,13 @@ class OrderService:
         result = await asyncio.to_thread(
             lambda: self.orders.select("*")
             .eq("id", str(order_id))
-            .is_("deleted_at", "null")
-            .single()
+            .is_("deleted_at", None)
             .execute()
         )
         if not result.data:
             return None
 
-        order = result.data
+        order = result.data[0]
         items_result = await asyncio.to_thread(
             lambda: self.items.select("*").eq("order_id", str(order_id)).execute()
         )

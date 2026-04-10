@@ -28,7 +28,7 @@ class CalendarService:
         result = await asyncio.to_thread(
             lambda: self.table.select("*")
             .eq("user_id", str(user_id))
-            .is_("deleted_at", "null")
+            .is_("deleted_at", None)
             .gte("event_date", start_date)
             .lt("event_date", end_date)
             .order("event_date")

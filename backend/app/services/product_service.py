@@ -32,7 +32,7 @@ class ProductService:
         page: int = 1,
         limit: int = 20,
     ) -> tuple[list[dict], PaginationMeta]:
-        query = self.table.select("*", count="exact").is_("deleted_at", "null")
+        query = self.table.select("*", count="exact").is_("deleted_at", None)
 
         if seller_id:
             query = query.eq("seller_id", str(seller_id))
@@ -61,11 +61,10 @@ class ProductService:
         result = await asyncio.to_thread(
             lambda: self.table.select("*")
             .eq("id", str(product_id))
-            .is_("deleted_at", "null")
-            .single()
+            .is_("deleted_at", None)
             .execute()
         )
-        return result.data
+        return result.data[0] if result.data else None
 
     async def create_product(self, seller_id: UUID, data: dict) -> dict:
         payload = {**data, "seller_id": str(seller_id)}
