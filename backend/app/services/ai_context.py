@@ -35,7 +35,7 @@ class AIContextBuilder:
             .select("name, stock_quantity, unit, status")
             .eq("seller_id", user_id)
             .in_("status", ["LOW_STOCK", "OUT_OF_STOCK"])
-            .is_("deleted_at", "null")
+            .is_("deleted_at", None)
             .execute()
         )
         low_items = low_stock.data or []

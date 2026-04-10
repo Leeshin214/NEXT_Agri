@@ -1,6 +1,5 @@
 import asyncio
 import math
-from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -38,7 +37,6 @@ class PartnerService:
                 count="exact",
             )
             .eq("user_id", str(user_id))
-            .is_("deleted_at", "null")
         )
 
         if status:
@@ -104,9 +102,8 @@ class PartnerService:
         return result.data[0] if result.data else None
 
     async def delete_partner(self, partner_id: UUID, user_id: UUID) -> bool:
-        deleted_at = datetime.now(timezone.utc).isoformat()
         result = await asyncio.to_thread(
-            lambda: self.table.update({"deleted_at": deleted_at})
+            lambda: self.table.delete()
             .eq("id", str(partner_id))
             .eq("user_id", str(user_id))
             .execute()

@@ -626,11 +626,37 @@ def find_sellers_by_product(category: str, product_name: Optional[str] = None) -
             .is_("deleted_at", None)
             .execute()
         )
-        
+
+        products = result.data or []
+
+        # seller_id 목록으로 users 테이블 조회
+        seller_ids = list({p["seller_id"] for p in products if p.get("seller_id")})
+        seller_map = {}
+        if seller_ids:
+            users_result = (
+                supabase.table("users")
+                .select("id, name, company_name, phone")
+                .in_("id", seller_ids)
+                .execute()
+            )
+            for u in (users_result.data or []):
+                seller_map[u["id"]] = u
+
+        # 상품 데이터에 판매자 정보 합치기
+        enriched = []
+        for p in products:
+            seller_info = seller_map.get(p.get("seller_id"), {})
+            enriched.append({
+                **p,
+                "seller_name": seller_info.get("name", "알 수 없음"),
+                "seller_company": seller_info.get("company_name", ""),
+                "seller_phone": seller_info.get("phone", ""),
+            })
+
         return {
             "success": True,
-            "sellers": result.data or [],
-            "count": len(result.data or []),
+            "sellers": enriched,
+            "count": len(enriched),
         }
     except Exception as e:
         return {"success": False, "error": str(e), "sellers": [], "count": 0}

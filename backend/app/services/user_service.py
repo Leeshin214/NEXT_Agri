@@ -42,7 +42,7 @@ class UserService:
             .select(columns, count="exact")
             .eq("role", target_role)
             .eq("is_active", True)
-            .is_("deleted_at", "null")
+            .is_("deleted_at", None)
         )
 
         if search:
@@ -82,11 +82,10 @@ class UserService:
             .select(columns)
             .eq("id", str(user_id))
             .eq("is_active", True)
-            .is_("deleted_at", "null")
-            .single()
+            .is_("deleted_at", None)
             .execute()
         )
-        return result.data
+        return result.data[0] if result.data else None
 
 
 user_service = UserService()

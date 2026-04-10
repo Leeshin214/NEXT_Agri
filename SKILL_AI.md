@@ -391,8 +391,41 @@ export default function AIChatPanel() {
 
 ### 검증된 프롬프트 패턴
 
-_작업을 진행하면서 채워진다._
+#### TEA 방식 오케스트레이터 (orchestrator.py 실제 구조)
+```
+orchestrator_node (tools 없음, response_format=json_object)
+    → intent: INVENTORY / ORDER → inventory_order_node
+    → intent: GENERAL → response_node (직접 답변 포함)
+
+inventory_order_node (자체 LLM + TOOLS + 자체 루프 최대 3회)
+    → tool 선택·실행·추가 tool 여부 판단 모두 자체 처리
+    → 완료 후 response_node
+
+response_node
+    → tool_results[-1].message 있으면 LLM 없이 바로 반환
+    → 없으면 LLM으로 요약
+```
+
+#### orchestrator_node 핵심 패턴
+- `response_format={"type": "json_object"}` 강제 → `{"intent": "INVENTORY"}` 형식
+- tools 파라미터 완전 제거 (tool_choice도 없음)
+- GENERAL인 경우 `{"intent": "GENERAL", "response": "답변"}` 형식으로 직접 답변
+
+#### inventory_order_node 핵심 패턴
+- 자체 시스템 프롬프트(AGENT_SELLER_SYSTEM / AGENT_BUYER_SYSTEM) 보유
+- orchestrator messages에서 라우터 JSON(`{"intent": ...}`)을 필터링하여 제외
+- tool_calls 루프: `for round_idx in range(MAX_TOOL_ROUNDS)` — finish_reason=="stop"이면 break
+- UUID 파라미터 자동 교정: `_fix_id_params()` 헬퍼로 seller_id/user_id/buyer_id 검증
+
+#### AgentState 필드 (pending_tool_calls 제거됨)
+```python
+class AgentState(TypedDict):
+    user_id, user_role, user_info, message, intent,
+    messages, tool_results, tools_used, final_response, tool_round
+```
 
 ### 주의사항 & 함정
 
-_작업을 진행하면서 채워진다._
+- orchestrator_node가 라우터 JSON을 messages에 assistant로 추가하는데, inventory_order_node에서 이를 필터링하지 않으면 LLM이 혼란 → `_is_router_json()` 헬퍼로 필터링 필수
+- `response_format=json_object` 사용 시 시스템 프롬프트에 반드시 "JSON으로만 응답" 명시해야 함 (미명시 시 API 오류)
+- inventory_order_node의 agent_messages 구성: `state["messages"]`를 그대로 쓰면 orchestrator system prompt가 섞임 → 별도 agent_messages 리스트 새로 구성해야 함
