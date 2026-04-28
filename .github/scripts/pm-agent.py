@@ -153,6 +153,7 @@ if topic:
     preview = "\n".join(preview_lines) if preview_lines else "PM 사이클 완료. 작업 후보 검토 필요."
     push_body = f"{preview}\n\n전체 보기 → 탭"
 
+    # 주의: HTTP 헤더는 latin-1 만 허용 (RFC 7230). 한글 등 non-ASCII 는 본문에만 사용.
     req = urllib.request.Request(
         f"https://ntfy.sh/{topic}",
         data=push_body.encode("utf-8"),
@@ -161,7 +162,7 @@ if topic:
             "Priority": "default",
             "Tags": "memo,clipboard",
             "Click": issue_url,
-            "Actions": f"view, GitHub에서 보기, {issue_url}, clear=true",
+            "Actions": f"view, View Issue, {issue_url}, clear=true",
         },
     )
     try:
