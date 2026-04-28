@@ -204,16 +204,27 @@ router = APIRouter(prefix="/products", tags=["products"])
 @router.get("", response_model=SuccessResponse[list[ProductResponse]])
 async def list_products(
     category: Optional[str] = None,
-    status: Optional[str] = None,
+    product_status: Optional[str] = None,
     seller_id: Optional[UUID] = None,
+    search: Optional[str] = None,
+    max_price: Optional[int] = Query(default=None, ge=0),  # price_per_unit <= max_price
+    min_stock: Optional[int] = Query(default=None, ge=0),  # stock_quantity >= min_stock
     page: int = 1,
     limit: int = 20,
-    sort_by: str = "created_at",
-    order: str = "desc",
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    current_user: dict = Depends(get_current_user),
 ):
     ...
+
+# list_products 서비스 시그니처 (product_service.py)
+# async def list_products(
+#     *, seller_id, category, status, search,
+#     max_price: Optional[int] = None,   → .lte("price_per_unit", max_price)
+#     min_stock: Optional[int] = None,   → .gte("stock_quantity", min_stock)
+#     page, limit
+# ) -> tuple[list[dict], PaginationMeta]
+#
+# 음수 방어: Query(ge=0) 으로 라우터에서 차단 (422 자동 반환)
+# None 이면 해당 필터 생략 — 기존 동작 그대로 유지
 ```
 
 ### orders.py (주문/견적 API)
@@ -221,10 +232,35 @@ async def list_products(
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 # GET /orders - 주문 목록 (역할에 따라 내 주문)
+#   - order_status: Optional[str]                     단일 상태 (backward compat)
+#   - status_in:    Optional[list[str]] = Query(None) 다중 상태 — ?status_in=A&status_in=B
+#   - page:  Query(1, ge=1)
+#   - limit: Query(20, ge=1, le=2000)                 프론트가 탭별 전체 조회 시 1000~2000 사용
+#   둘 다 전달 시 status_in 이 우선 적용. 빈 list 면 단일 status fallback 안 함.
 # GET /orders/{id} - 주문 상세
 # POST /orders - 견적 요청 (구매자만)
 # PATCH /orders/{id}/status - 상태 변경
 # POST /orders/{id}/items - 아이템 추가
+```
+
+### calendar.py (일정 API)
+```python
+router = APIRouter(prefix="/calendar", tags=["calendar"])
+
+# GET /calendar - 일정 조회
+#   - year:  Optional[int] = Query(None, ge=1900, le=2200)
+#   - month: Optional[int] = Query(None, ge=1, le=12)
+#   year + month 모두 전달 → 해당 월 범위 필터.
+#   둘 중 하나라도 없으면 user 의 전체 active 일정 반환.
+#   (프론트 우측 패널 "전체 일정" 리스트가 모든 월 일정을 받아오기 위함)
+# POST /calendar - 일정 생성
+# PATCH /calendar/{id} - 일정 수정
+# DELETE /calendar/{id} - 일정 삭제 (soft)
+#
+# 호출 예:
+#   GET /api/v1/calendar                      → 전체 active 일정
+#   GET /api/v1/calendar?year=2026&month=5    → 5월만
+#   GET /api/v1/calendar?year=2026            → year 만 단독은 전체 반환 (month 없으면 year 무시)
 ```
 
 ### schedule_agent.py (GPT 스케줄 조율 에이전트 API)
@@ -246,34 +282,81 @@ router = APIRouter(prefix="/schedule-agent", tags=["schedule-agent"])
 ```python
 router = APIRouter(prefix="/ai", tags=["ai"])
 
-@router.post("/chat")
-async def ai_chat(
-    request: AIChatRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """스트리밍 AI 응답"""
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+# POST /ai/chat          — 제거됨 (미사용 중복 엔드포인트, 2026-04-27)
+# POST /ai/summarize-chat — 채팅 대화 AI 요약
+# POST /ai/daily-summary  — 오늘의 업무 자동 요약
+# POST /ai/agent/chat     — tool_use 오케스트레이터 기반 메인 AI 에이전트 (프론트 사용)
+# GET  /ai/history        — AI 대화 히스토리 조회
 
-    # 사용자 컨텍스트 조회 (최근 주문, 재고, 일정)
-    context = await build_user_context(current_user, db)
+# 메인 오케스트레이터: POST /api/v1/ai/agent/chat
+# - agent_orchestrator.run() 호출 → tool 루프 → 최종 텍스트 반환
+# - DB에서 최근 대화 10개 조회 후 history로 전달
+# - 응답: SuccessResponse[dict] — { response: str, tools_used: list[str] }
+# - 대화 후 ai_conversations 테이블에 저장 (prompt_type = ",".join(tools_used))
+```
 
-    async def generate():
-        async with client.messages.stream(
-            model="claude-sonnet-4-5",
-            max_tokens=1024,
-            system=f"""당신은 농산물 유통업 B2B 플랫폼의 AI 업무 도우미입니다.
-사용자는 {current_user.role}로 {current_user.company_name}에 근무합니다.
-현재 컨텍스트: {context}
-간결하고 실용적인 답변을 한국어로 제공하세요.""",
-            messages=[{"role": "user", "content": request.prompt}]
-        ) as stream:
-            async for text in stream.text_stream:
-                yield f"data: {text}\n\n"
-        yield "data: [DONE]\n\n"
+### subscriptions.py (정기배송 API — V1.5 Phase 1, V1.6 양방향 승인 2026-04-28)
+```python
+router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+# GET    /subscriptions                          - 내 정기배송 목록
+#   - status: PENDING/ACTIVE/PAUSED/ENDED/CANCELLED/REJECTED (Query alias)
+#   - partner_user_id: UUID — 이 거래처와의 정기배송만
+#   - page, limit (le=2000)
+# GET    /subscriptions/{id}                     - 단일 정기배송 (당사자만)
+# POST   /subscriptions                          - 정기배송 생성 (buyer 또는 seller 본인만)
+#                                                  → V1.6: 초기 status='PENDING', created_by=요청자
+# POST   /subscriptions/{id}/accept              - V1.6 PENDING → ACTIVE
+#   조건: 당사자 본인 + status=PENDING + created_by != user (NULL 이면 누구나 가능)
+#   동작: status=ACTIVE 로 전환, next_delivery_date 를 start_date 또는 오늘 이후 첫 회차로 재설정
+#   400 PENDING 아님 / 403 요청자 본인 또는 당사자 아님 / 404 없음
+# POST   /subscriptions/{id}/reject              - V1.6 PENDING → REJECTED
+#   조건: accept 와 동일 (당사자 + PENDING + created_by != user)
+#   동작: status=REJECTED 전환 (이력 보존; soft-delete 와 별도)
+# PATCH  /subscriptions/{id}                     - 부분 수정 (status 등; next_delivery_date 자동 재계산)
+# DELETE /subscriptions/{id}                     - soft delete
+# POST   /subscriptions/{id}/generate-order      - 이번 회차 주문 생성
+
+# generate-order 동작:
+#   1) orders INSERT (status=CONFIRMED, subscription_id, subscription_round 채워짐)
+#   2) order_items 다중 INSERT (실패 시 orders hard-delete 보상)
+#   3) calendar_events INSERT (양쪽 user; 실패해도 주문 살림)
+#   4) subscription.next_delivery_date 갱신 (compute_next_date)
+#   5) end_date 도달 시 status=ENDED 자동 전환
+```
+
+### partners.py (거래처 API — V1.6 양방향 승인 모델 2026-04-28)
+```python
+# V1.6 — 양방향 승인 모델
+# POST  /partners                  - 거래처 등록 요청
+#   동작: 본인 row(PENDING_OUTGOING) + 상대 row(PENDING_INCOMING) 두 row 동시 생성
+#   응답: 본인 row(PENDING_OUTGOING) 만 partner_user 임베딩으로 반환
+#   400  자기 자신을 거래처로 등록 시도
+#   409  이미 (ACTIVE / PENDING_*) 상태로 row 존재
+#   보상: 상대 row INSERT 실패 시 본인 row hard-delete (partial unique index 보존)
+#
+# POST  /partners/{id}/accept      - 받은 거래처 요청 수락 (status=PENDING_INCOMING 필수)
+#   동작: 본인 row + 반대편 row 모두 status='ACTIVE' 전환
+#   반대편 row 검색: (user_id=상대, partner_user_id=본인) 으로 lookup
+#   400 상태가 PENDING_INCOMING 아님 / 404 row 없음
+#
+# POST  /partners/{id}/reject      - 받은 거래처 요청 거절 (status=PENDING_INCOMING 필수)
+#   동작: 본인 row + 반대편 row 모두 soft-delete (deleted_at = NOW)
+#   400 / 404 동일
+#
+# GET /partners/{id}/stats - 거래처 거래 통계
+#   응답: PartnerStats
+#     - total_orders:         CANCELLED/soft-deleted 제외 양방향 주문 수
+#     - total_amount:         총 합계 금액
+#     - last_order_date:      가장 최근 주문 일자 (YYYY-MM-DD)
+#     - active_subscriptions: ACTIVE 정기배송 개수
+#
+# GET /partners?status=...
+#   클라이언트는 status 파라미터로 그룹 조회:
+#     - status=ACTIVE              : 활성 거래처
+#     - status=PENDING_OUTGOING    : 본인이 보낸 요청
+#     - status=PENDING_INCOMING    : 받은 요청
+#     - status=INACTIVE            : 거래 종료
 ```
 
 ---
@@ -415,6 +498,28 @@ pytest-cov==6.0.0
 
 - **verify_supabase_jwt async 전환**: JWKS 공개 키를 가져오는 `httpx.AsyncClient` 호출이 포함되므로 `verify_supabase_jwt`는 반드시 `async def`로 선언해야 한다. 이를 호출하는 `get_current_user`에서도 `await verify_supabase_jwt(...)`로 호출해야 한다.
 
+- **LangGraph orchestrator `tool_round` 증분 규칙**: `inventory_order_node`(또는 동등한 tool 실행 노드)가 정상 완료 후 반환할 때도, 예외 경로에서 반환할 때도 `tool_round` 는 반드시 `+1` 씩만 증분해야 한다. `+MAX_TOOL_ROUNDS` 같은 값을 사용하면 첫 실행 직후 `tool_round >= 2` 조건이 충족되어 `validator_node`의 RETRY 분기가 절대 발동되지 않는다. 결과적으로 validator가 있어도 항상 FAILED로 단락되는 버그가 발생한다.
+  ```python
+  # 잘못된 패턴 — MAX_TOOL_ROUNDS(=3)만큼 한번에 증가 → RETRY 영구 불발
+  "tool_round": state.get("tool_round", 0) + MAX_TOOL_ROUNDS,
+
+  # 올바른 패턴 — 항상 1씩만 증가
+  "tool_round": state.get("tool_round", 0) + 1,
+  ```
+
+- **시스템 프롬프트 합성 시 `.format()` 절대 금지 — `str.replace()` 명시 치환 사용**: AI 오케스트레이터의 시스템 프롬프트가 `BASE + ROLE_APPENDIX + FEW_SHOT_EXAMPLES` 형태로 합성될 때, APPENDIX 안의 `{seller_name}` 같은 LLM 안내용 중괄호와 FEW_SHOT_EXAMPLES 안의 JSON 예시 `{"name":"이철수",...}` 가 `.format()` 의 placeholder 로 잘못 인식되어 `KeyError: '"name"'` 발생. 결과적으로 모든 AI 호출이 catch 블록으로 떨어져 사용자에게는 "요청 처리 중 오류" 만 도달, AI 도우미 기능 완전 마비. 사용자 정보 치환은 반드시 명시적 `str.replace()` 함수로 처리한다.
+  ```python
+  def _render_agent_system(template: str, *, company_name: str, user_name: str, user_id: str) -> str:
+      return (
+          template
+          .replace("{company_name}", company_name)
+          .replace("{user_name}", user_name)
+          .replace("{user_id}", user_id)
+      )
+  # 호출처: AGENT_SELLER_SYSTEM.format(...) 대신 _render_agent_system(AGENT_SELLER_SYSTEM, ...)
+  ```
+  검증 패턴: 스모크 테스트로 `_render_agent_system(AGENT_SELLER_SYSTEM, company_name='C', user_name='U', user_id='ID')` 가 KeyError 없이 동작하는지 확인.
+
 - **OpenAI `tool_choice` — `tools` 없이 단독 사용 금지**: `tool_choice` 파라미터는 반드시 `tools` 파라미터와 함께 전달해야 한다. `tools` 없이 `tool_choice="none"` 또는 다른 값을 보내면 OpenAI API가 400 에러를 반환한다. 요약/정리 단계처럼 도구 호출이 필요 없는 단순 completion 요청에서는 `tool_choice` 파라미터 자체를 생략한다.
   ```python
   # 잘못된 패턴 — tools 없이 tool_choice 전달 → OpenAI 400
@@ -440,6 +545,117 @@ pytest-cov==6.0.0
   `allow_origin_regex`를 함께 사용해야 localhost 변형 전체를 커버할 수 있다.
 
 - **Response 스키마에서 `deleted_at` 누락 주의**: DB 테이블에 `deleted_at`이 정의되어 있어도 Pydantic Response 스키마에 빠지는 경우가 있다. soft delete를 지원하는 모든 테이블의 Response 스키마에는 `deleted_at: Optional[datetime] = None`을 반드시 포함해야 한다. `UserResponse`에서 이 실수가 발견되어 수정되었다.
+
+- **Response 스키마 ↔ 운영 DB 컬럼 정합 점검 결과 (2026-04-27)**: 운영 Supabase 컬럼과 1:1 매칭되도록 보강 완료한 스키마:
+  - `CalendarEventResponse` — `updated_at`, `deleted_at` 추가 (calendar_events 에 deleted_at 컬럼이 마이그레이션으로 추가됨)
+  - `CalendarEventResponse` — `order_number: Optional[str]`, `product_name: Optional[str]`, `order_status: Optional[str]` 추가 (2026-04-27). DB 컬럼이 아니라 orders/products 임베딩 결과를 flatten 한 파생 필드. order_id 가 None 이거나 주문이 soft-delete 된 경우 세 필드 모두 None. `order_status` 는 calendar_events.event_type 이 ORDER 로 고정되어 프론트가 색상 구분을 못 하던 문제를 해결하기 위해 orders.status 값을 그대로 노출.
+  - `OrderResponse`, `ProductResponse`, `PartnerResponse`, `MessageResponse` — `deleted_at` 추가
+  - `ChatRoomResponse` — `updated_at` 추가 (chat_rooms 는 deleted_at 없음 — 스펙)
+  - `OrderItemResponse`, `AIConversationResponse` — updated_at/deleted_at 모두 없음 (운영 DB와 정합 — 변경 불필요)
+
+- **Calendar list_events backfill 호출 절대 금지 — mutation 시점 sync 만 사용 (2026-04-27 N+1 폭주 수정)**: 한때 `list_events` 첫 줄에서 `_ensure_order_events_for_user(user_id)` 를 호출해 user 의 모든 주문에 대해 `order_service.sync_calendar_events_for_order_id` 를 순차 실행하는 backfill 패턴이 있었다. 결과:
+  1. **N+1 폭주** — user 가 가진 주문 N 건마다 단건 sync (orders SELECT + calendar_events SELECT/INSERT/UPDATE 3~4 round-trip) 가 발생.
+  2. **동시 connection 한도 초과** — 프론트가 month=4,5,6 세 번 동시 호출 시 sync 가 중첩되어 `httpx.ReadError: [Errno 35] Resource temporarily unavailable` 발생. try/except 로 무시되었지만 N×왕복 시간은 그대로 사용자에게 노출.
+  3. **불필요** — `order_service` 의 모든 mutation (`create_order`, `update_status`, `update_order`, `cancel_order`, `submit_counter_offer`, `accept_counter_offer`) 과 `agent_tools.create_order`/`update_order_status` 가 이미 `_sync_calendar_events_for_order` 를 호출하고 있어 calendar_events 는 항상 최신 상태.
+
+  올바른 패턴: **데이터 변경 시점에만 sync, 조회 시점에는 절대 sync 하지 않는다.** 조회는 `calendar_events` 를 그대로 신뢰하면 된다. 만약 미래에 일관성 깨짐이 발견되면 admin endpoint 또는 마이그레이션 스크립트로 1회성 backfill 을 돌리되, 일반 조회 hot path 에는 절대 backfill 을 끼워넣지 않는다.
+
+  ```python
+  # 잘못된 패턴 — 매 GET 마다 user 주문 N 건 sync → ReadError 폭주
+  async def list_events(self, *, user_id, year, month):
+      await self._ensure_order_events_for_user(user_id)  # 절대 금지
+      ...
+
+  # 올바른 패턴 — mutation 시점에만 sync, 조회는 select 만
+  async def list_events(self, *, user_id, year, month):
+      events = await asyncio.to_thread(lambda: self.table.select("*")...)
+      ...
+  ```
+
+  - 적용 위치: `calendar_service.list_events` 에서 `_ensure_order_events_for_user` 호출 제거 + 메서드 자체 dead code 삭제 + `tests/test_calendar_order_backfill.py` 폐기 (2026-04-27).
+  - 검증: 제거 후 `[calendar_service] order calendar sync failed ... ReadError` 로그 사라짐. `order_status='PREPARING'` 등 파생 필드 정상 반환 확인.
+
+- **Calendar 응답 join — list_events batch 분리 + create/update 단일 round-trip (2026-04-27 회귀 수정)**: 초기에는 `calendar_events → orders → order_items → products` 3-depth 임베딩을 한 번의 select 로 처리했으나, 4개 테이블에 대한 RLS 정책이 누적 평가되어 list_events 가 느려지고, create/update 후 `_get_event_with_joins` 로 한 번 더 왕복하던 구조가 추가 지연 원인이었다. 두 가지를 함께 고친다.
+  1. **list_events**: 3-depth 임베딩 제거 → calendar_events 만 단순 select 후, order_id 모아서 단일 `in_("id", order_ids)` 로 orders+items+products 를 batch 조회. 메모리에서 join 합성. RLS 평가가 calendar_events 에서 한 번, orders 에서 한 번 분리되어 3-depth 누적보다 빠름.
+  2. **create_event / update_event**: supabase-py 2.11.0 에는 `.insert(...).select(...)` 체이닝 메서드가 없지만, `builder.params = builder.params.set("select", CALENDAR_SELECT_WITH_JOINS)` 로 query param 을 직접 주입하면 PostgREST 가 `Prefer: return=representation` + `?select=...` 조합으로 INSERT/UPDATE 응답을 임베딩 트리째 돌려준다 → 추가 round-trip 제거.
+
+  ```python
+  CALENDAR_SELECT_WITH_JOINS = (
+      "*,"
+      "order:orders!order_id("
+      "order_number,status,deleted_at,"   # status 추가 → order_status 파생 필드
+      "items:order_items(product:products(name,deleted_at))"
+      ")"
+  )
+
+  def _flatten_event_row(row: dict) -> dict:
+      order_payload = row.pop("order", None)
+      row["order_number"] = None
+      row["product_name"] = None
+      row["order_status"] = None      # event_type=ORDER 고정이라 프론트 색상용
+      if not order_payload or order_payload.get("deleted_at"):
+          return row
+      row["order_number"] = order_payload.get("order_number")
+      row["order_status"] = order_payload.get("status")
+      ...
+
+  # create_event 핵심 — supabase-py 의 SyncQueryRequestBuilder.params 는 mutable
+  # (라이브러리 내부에서도 self.params = self.params.add(...) 로 갱신함)
+  builder = self.table.insert(payload)
+  builder.params = builder.params.set("select", CALENDAR_SELECT_WITH_JOINS)
+  result = await asyncio.to_thread(lambda: builder.execute())
+  return _flatten_event_row(result.data[0])
+
+  # list_events 핵심 — batch 조회로 3-depth 임베딩 회피
+  events = self.table.select("*").eq(...).execute().data  # 1회
+  order_ids = sorted({str(r["order_id"]) for r in events if r.get("order_id")})
+  if order_ids:
+      orders = (self.client.table("orders")
+          .select("id,order_number,status,deleted_at,"
+                  "items:order_items(product:products(name,deleted_at))")
+          .in_("id", order_ids).execute().data)  # 1회
+  ```
+  - PostgREST 는 임베딩 자식 row 의 `deleted_at` 을 자동 필터하지 않으므로, flatten 단계에서 명시 검사 필요.
+  - `order_status` 는 orders.status 값 그대로 노출 (`QUOTE_REQUESTED|NEGOTIATING|CONFIRMED|PREPARING|SHIPPING|COMPLETED|CANCELLED`). calendar_events.event_type 이 "ORDER" 로 고정되어 프론트가 단조로운 색만 칠하던 회귀를 해결.
+  - 쿼리 횟수 비교 — list_events: 3-depth 임베딩 1회 → batch 2회(이벤트+주문). create/update: 2회(INSERT/UPDATE + 재조회) → 1회(임베딩 동봉).
+  - 적용 위치: `calendar_service.list_events`, `create_event`, `update_event`, `_flatten_event_row`, `_attach_order_payload` (2026-04-27 회귀 수정).
+
+- **Calendar list_events year/month Optional — 전체 일정 조회 지원 (2026-04-27)**: 프론트 우측 패널 "전체 일정" 리스트가 현재 월에 한정되어 다른 월 일정이 안 보이던 문제를 해결하기 위해 `year`, `month` 를 `Optional[int] = Query(None, ge=..., le=...)` 로 변경. **둘 다 있을 때만** 월 범위 필터를 적용하고, 그 외(둘 다 None / year 만 / month 만)는 전체 active 일정 반환. 단순화 원칙으로 연 단위 단독 조회는 미지원 — month 가 없으면 year 도 무시.
+  ```python
+  # 라우터
+  @router.get("", response_model=...)
+  async def list_events(
+      current_user: dict = Depends(get_current_user),
+      year: Optional[int] = Query(None, ge=1900, le=2200),
+      month: Optional[int] = Query(None, ge=1, le=12),
+  ):
+      events = await calendar_service.list_events(
+          user_id=current_user["id"], year=year, month=month,
+      )
+      return {"data": events}
+
+  # 서비스 — 쿼리 빌더 분기
+  async def list_events(self, *, user_id, year=None, month=None):
+      base = (self.table.select("*")
+              .eq("user_id", str(user_id))
+              .is_("deleted_at", None))
+      if year is not None and month is not None:
+          start_date = f"{year}-{month:02d}-01"
+          end_date = (f"{year+1}-01-01" if month == 12
+                      else f"{year}-{month+1:02d}-01")
+          base = base.gte("event_date", start_date).lt("event_date", end_date)
+      events_result = await asyncio.to_thread(
+          lambda: base.order("event_date").execute()
+      )
+  ```
+  - **dedupe 안전망 유지**: 전체 조회로 전환해도 `(order_id, event_date)` 키 dedupe 가 그대로 작동해 race-잔존 중복을 흡수한다 (manual event 는 dedupe 제외).
+  - **페이지네이션 미적용**: calendar_events 는 사용자당 수백 건 수준이고 orders batch 조회도 distinct order_ids 수만큼 1회뿐이라 페이지네이션/limit 보호 없이 처리. 운영 로그상 응답 크기 문제 없음.
+  - **호출 예**:
+    - `GET /api/v1/calendar` → 전체 active 일정
+    - `GET /api/v1/calendar?year=2026&month=5` → 5월만
+    - `GET /api/v1/calendar?year=2026` → year 만 단독은 month 가 없으므로 전체 반환
+  - **함정**: `year is not None and month is not None` 으로 명시 체크해야 한다. truthy 체크(`if year and month`) 는 `month=0` 같은 경계값을 잘못 처리할 수 있지만, `Query(ge=1, le=12)` 로 0 이 422 반환되므로 결과는 동일. 그럼에도 명시 비교가 의도를 더 분명히 드러낸다.
+  - 적용 위치: `app/api/v1/calendar.py:list_events`, `app/services/calendar_service.py:list_events` (2026-04-27).
 
 - **모듈 임포트 시점 Supabase 클라이언트 생성 금지**: `services/` 모듈 하단에 `instance = MyClass()`와 같이 즉시 인스턴스화하면, CI 환경처럼 유효한 `SUPABASE_SERVICE_ROLE_KEY`가 없을 때 임포트 시점에 "Invalid API key" 오류가 발생한다. Supabase 클라이언트를 멤버로 가지는 클래스는 반드시 lazy initialization을 적용한다.
   ```python
@@ -550,3 +766,261 @@ pytest-cov==6.0.0
   ```
 
 - **테스트 SAMPLE 데이터는 Response 스키마 필드를 모두 포함**: Pydantic Response 스키마에 required 필드(예: `min_order_qty: int`)가 있으면 SAMPLE dict에도 해당 필드가 있어야 `ResponseValidationError` 없이 응답 직렬화가 성공한다. 스키마 변경 시 테스트 SAMPLE 데이터도 함께 업데이트해야 한다.
+
+- **PostgreSQL UNIQUE 위반(23505) → 500 방지 패턴**: supabase-py 의 INSERT/UPDATE 에서 unique_violation 발생 시 `postgrest.exceptions.APIError` 가 raw 로 raise → FastAPI 가 500 으로 노출된다. 사용자에게는 잘못된 입력이거나 동시성 문제이므로 409 로 변환해야 한다.
+  ```python
+  from postgrest.exceptions import APIError as PostgrestAPIError
+
+  try:
+      result = await asyncio.to_thread(lambda: self.table.insert(payload).execute())
+  except PostgrestAPIError as e:
+      err_code = getattr(e, "code", "") or ""
+      err_msg = (getattr(e, "message", "") or "") + " " + str(e)
+      if err_code == "23505" or "23505" in err_msg or "duplicate" in err_msg.lower():
+          raise HTTPException(409, detail="이미 등록된 …") from e
+      raise
+  ```
+  - `APIError` 의 attribute: `code` (PostgreSQL error code, "23505" 등), `message`, `hint`, `details`. raw dict 는 `_raw_error`.
+  - 적용 위치: `partner_service.create_partner` (UNIQUE(user_id, partner_user_id))
+  - 동일 패턴이지만 "재시도" 가 의미있는 경우(예: order_number 자동생성)는 except 블록에서 재시도 후 최종 실패 시 변환.
+
+- **order_number UNIQUE 충돌 방어 패턴 — 랜덤 + 재시도**: `_generate_order_number` 가 `ORD-{YYYYMMDD}-{HHMMSS}` (시분초) 기반이면 동시 합의 자동 주문 (chat_ws._handle_consensus) 에서 같은 초 두 요청이 충돌해 23505 → 500. 두 단계로 방어:
+  1. 패턴을 `ORD-{YYYYMMDD}-{random.randint(1000,9999)}` 로 통일 (agent_tools.create_order 와 동일)
+  2. INSERT 23505 catch → order_number 재생성 + 재시도 (max 3회). 그래도 실패 시 409 변환.
+  ```python
+  for attempt in range(3):
+      payload = {**base_payload, "order_number": self._generate_order_number()}
+      try:
+          result = await asyncio.to_thread(lambda p=payload: self.orders.insert(p).execute())
+          order = result.data[0]; break
+      except PostgrestAPIError as e:
+          if (e.code == "23505") or "duplicate" in str(e).lower():
+              continue
+          raise
+  else:
+      raise HTTPException(409, "주문 번호 생성 반복 실패")
+  ```
+  적용 위치: `order_service.create_order` 와 `agent_tools.create_order` 양쪽 모두.
+
+- **PostgREST 임베딩으로 N+1 제거 (2026-04-27 검증)**: orders 같은 부모 테이블 응답에 buyer/seller(users), items+product 정보를 함께 내려야 할 때, 서비스 안에서 N개의 자식 select 를 따로 부르는 대신 PostgREST 의 select 임베딩 한 번으로 처리한다. count="exact" 와 임베딩이 동시에 잘 동작한다 (HTTP 206 + content-range 헤더 정상).
+  ```python
+  ORDER_SELECT_WITH_JOINS = (
+      "*,"
+      "items:order_items(*,product:products(name,unit,category)),"
+      "buyer:users!buyer_id(name,company_name),"      # column-alias FK embedding
+      "seller:users!seller_id(name,company_name)"     # FK constraint 이름 명시 불필요
+  )
+
+  def _flatten_order_row(row: dict) -> dict:
+      buyer = row.pop("buyer", None) or {}
+      seller = row.pop("seller", None) or {}
+      row["buyer_name"] = buyer.get("name")
+      row["buyer_company"] = buyer.get("company_name")
+      row["seller_name"] = seller.get("name")
+      row["seller_company"] = seller.get("company_name")
+      for item in (row.get("items") or []):
+          product = item.pop("product", None) or {}
+          item["product_name"] = product.get("name")
+          item["product_unit"] = product.get("unit")
+          item["product_category"] = product.get("category")
+      return row
+  ```
+  - `users!buyer_id` 처럼 컬럼명을 alias 로 쓰면 PostgREST 가 FK constraint 이름(`orders_buyer_id_fkey`) 을 자동 추론한다 — `users!orders_buyer_id_fkey` 처럼 풀네임 쓸 필요 없음.
+  - 응답에 새로 추가하는 join 필드는 모두 `Optional` 로 둔다. 사용자/상품이 soft-delete 된 경우 임베딩이 `None` 이 되므로.
+  - 적용 위치: `OrderResponse.buyer_name/buyer_company/seller_name/seller_company`, `OrderItemResponse.product_name/product_unit/product_category` (2026-04-27).
+  - 회귀 검증: `tests/e2e_orders_join_fields.py` — list_orders / get_order / create_order / update_order / update_status 결과의 join 필드가 모두 채워지는지 검증.
+
+- **상태 전이 역할 가드 — `(current, new)` 페어별 화이트리스트 (2026-04-27 도메인 정책)**: 단일 `new_status` 키 기반 가드 (`{"CONFIRMED": "BUYER", "COMPLETED": "SELLER"}`) 는 `QUOTE_REQUESTED → CONFIRMED` 와 `NEGOTIATING → CONFIRMED` 를 구분 못 하고, 동일한 new_status 라도 출발 상태에 따라 허용 역할이 다른 도메인 규칙(예: SHIPPING → COMPLETED 는 양쪽, 다른 → COMPLETED 는 막혀야 하는 경우)을 표현하지 못한다. 페어 키로 매트릭스를 잡는다.
+  ```python
+  TRANSITION_ROLE_GUARD: dict[tuple[str, str], set[str]] = {
+      ("QUOTE_REQUESTED", "CONFIRMED"):       {"BUYER", "SELLER"},
+      ("NEGOTIATING",     "CONFIRMED"):       {"BUYER", "SELLER"},
+      ("CONFIRMED",       "PREPARING"):       {"SELLER"},        # 출하 책임
+      ("PREPARING",       "SHIPPING"):        {"SELLER"},
+      ("SHIPPING",        "COMPLETED"):       {"BUYER", "SELLER"},  # 수령 확인
+      # 모든 단계 → CANCELLED 는 양쪽 허용
+      ("QUOTE_REQUESTED", "CANCELLED"):       {"BUYER", "SELLER"},
+      ("NEGOTIATING",     "CANCELLED"):       {"BUYER", "SELLER"},
+      ("CONFIRMED",       "CANCELLED"):       {"BUYER", "SELLER"},
+      ("PREPARING",       "CANCELLED"):       {"BUYER", "SELLER"},
+      ("NEGOTIATING",     "QUOTE_REQUESTED"): {"BUYER", "SELLER"},  # 협상 롤백
+      ("QUOTE_REQUESTED", "NEGOTIATING"):     {"BUYER", "SELLER"},
+  }
+  # update_status 안에서:
+  allowed_roles = TRANSITION_ROLE_GUARD.get((current_status, new_status), set())
+  if actor_role not in allowed_roles:
+      raise HTTPException(403, "권한이 없습니다")
+  ```
+  - 매트릭스에 등록되지 않은 페어는 자동으로 `set()` (어느 역할도 불가) — 화이트리스트 방식으로 방어적 디폴트.
+  - 전이 자체의 합법성(`ALLOWED_TRANSITIONS`) 검증은 그대로 두고, 그 이후에 역할 가드를 페어 단위로 확인한다.
+  - 주문 당사자(`buyer_id == user.id` or `seller_id == user.id`) 검증은 별도로 유지 — 외부인 차단.
+
+- **soft delete 필터 누락 — 운영 결함 사전 점검 (2026-04-27)**: `update_*`, `list_*`, `mark_as_*` 등 모든 액션 쿼리에 `.is_("deleted_at", None)` 누락 여부를 표 형태로 점검한다. 누락 시 soft-deleted 행에 영향을 주는 행위가 가능해진다.
+  - `order_service.update_status` — 추가 완료
+  - `chat_service.list_messages` — 추가 완료
+  - `chat_service.mark_as_read` — 추가 완료
+  - `chat_service.list_rooms` — 상대방 user 의 deleted_at 별도 조회로 필터링 (임베디드 조인 deleted_at 자동 적용 안 함)
+  - `ai_context.build_seller_context` / `build_buyer_context` — calendar_events 조회 추가 완료
+
+- **calendar_events 동기화 — order×user 당 active 1개 불변 보장 (2026-04-27 중복 누적 버그 수정)**: `order_service._sync_calendar_events_for_order_sync` 의 기존 구현은 user_id 단위로 매번 서브쿼리를 돌렸지만, 같은 (order_id, user_id) 안에서 event_date 가 다른 잔존 row 를 정리하지 못했고 race condition 에도 취약했다. DB 의 partial unique index `uniq_calendar_events_active_order_user_date` (SKILL_DB.md 참조) 와 함께 동작하도록 다음 패턴으로 견고화한다.
+  ```python
+  def _sync_calendar_events_for_order_sync(self, order: dict) -> None:
+      order_id_str = str(order["id"])
+      if order.get("status") == "CANCELLED" or order.get("deleted_at"):
+          self._soft_delete_calendar_events_for_order_sync(order_id_str)
+          return
+
+      user_ids = self._calendar_user_ids_for_order(order)  # buyer_id, seller_id
+      payload_base = self._build_order_calendar_payload(order)
+      target_event_date = payload_base["event_date"]
+      deleted_at = datetime.now(timezone.utc).isoformat()
+
+      # 1) 한 번의 쿼리로 이 주문의 모든 active calendar_events 조회
+      existing = (self.calendar_events
+          .select("id,user_id,event_date,deleted_at,updated_at,created_at")
+          .eq("order_id", order_id_str).is_("deleted_at", None).execute().data or [])
+
+      # 2) user_id 별로 그룹핑
+      rows_by_user: dict[str, list[dict]] = {}
+      for r in existing:
+          rows_by_user.setdefault(str(r["user_id"]), []).append(r)
+
+      for user_id in user_ids:
+          user_rows = rows_by_user.get(user_id, [])
+          # event_date 일치 여부로 분리 (date 객체 또는 ISO 문자열 양쪽 호환)
+          matching, others = [], []
+          for r in user_rows:
+              rd = str(r.get("event_date"))[:10] if r.get("event_date") else None
+              (matching if rd == target_event_date else others).append(r)
+
+          primary_id = None
+          if matching:
+              # 가장 최신 row 보존 (updated_at DESC, created_at DESC)
+              matching.sort(key=lambda r: (r.get("updated_at") or "",
+                                            r.get("created_at") or ""), reverse=True)
+              primary_id = str(matching[0]["id"])
+              self.calendar_events.update(payload_base).eq("id", primary_id).execute()
+              # matching 중 나머지(중복) soft-delete
+              for dup in matching[1:]:
+                  self.calendar_events.update({"deleted_at": deleted_at}).eq(
+                      "id", str(dup["id"])).execute()
+
+          # 다른 event_date 의 잔존 row 도 모두 soft-delete (납기일 변경 후 정리)
+          for stale in others:
+              self.calendar_events.update({"deleted_at": deleted_at}).eq(
+                  "id", str(stale["id"])).execute()
+
+          if primary_id is None:
+              try:
+                  self.calendar_events.insert({
+                      **payload_base, "user_id": user_id, "order_id": order_id_str
+                  }).execute()
+              except PostgrestAPIError as e:
+                  # partial unique index 충돌(23505) — 정상 race, 무시
+                  if (getattr(e, "code", "") == "23505"
+                      or "23505" in str(e) or "duplicate" in str(e).lower()):
+                      continue
+                  raise
+  ```
+  - **불변 조건**: 한 주문 × 한 user 당 active calendar_events 정확히 1개 (DB partial unique index 와 일치).
+  - **list_events 안전망**: DB 가 정상이어도 미래 race 를 방어하기 위해 `calendar_service.list_events` 응답 직전에 `(order_id, event_date)` 키로 dedupe 추가 — manual event(order_id IS NULL) 는 dedupe 제외.
+  - **검증 포인트**: 사용자 보고된 케이스("같은 5/15 일정 수십개")는 cleanup SQL (위 SKILL_DB.md A/B/C) 적용 + 새 sync 함수 + partial unique index 조합으로 재발 차단.
+
+- **다중값 query 파라미터 — `Query(None)` + `list[T]` 패턴 (2026-04-27 검증)**: 사용자가 한 번의 요청으로 여러 상태/카테고리/ID 등을 필터링하고 싶을 때, FastAPI 는 `param: Optional[list[str]] = Query(None)` 로 선언하면 동일 키 반복(`?status_in=A&status_in=B&status_in=C`) 을 자동으로 list 로 파싱한다. supabase-py 의 `.in_("col", values)` 와 직접 연결된다. 단일값 backward compat 유지하려면 단일 파라미터(`order_status`) 와 다중 파라미터(`status_in`) 를 동시에 받고 `if status_in:` 으로 우선순위 분기.
+  ```python
+  # 라우터
+  @router.get("", response_model=...)
+  async def list_orders(
+      order_status: Optional[str] = None,                    # 기존
+      status_in: Optional[list[str]] = Query(None),          # 신규
+      page: int = Query(1, ge=1),
+      limit: int = Query(20, ge=1, le=2000),                 # 운영 안전 상한
+  ):
+      data, meta = await order_service.list_orders(
+          status=order_status, status_in=status_in, ...
+      )
+
+  # 서비스
+  async def list_orders(self, *, status=None, status_in=None, ...):
+      query = self.orders.select(...)
+      if status_in:                                          # 우선
+          query = query.in_("status", status_in)
+      elif status:                                           # fallback
+          query = query.eq("status", status)
+  ```
+  - **함정 1**: 빈 `[]` 가 들어오면 `if status_in:` 이 False 가 되어 단일 status fallback 으로 빠진다. 빈 list 가 "필터 없음" 이 아닌 "결과 없음" 의미라면 `if status_in is not None` 으로 체크해야 한다. 우리 케이스는 빈 list 의미를 정의하지 않아 truthy 체크로 충분 (UI 가 항상 1개 이상 보냄).
+  - **함정 2**: `limit` 상한이 작으면(`le=100` 등) 프론트가 모든 항목 조회를 위해 보내는 큰 limit 가 422 로 거부된다. 운영 안전을 위해 `le=2000` 권장 — 메모리/응답 시간 모두 수용 가능 범위.
+  - 적용 위치: `orders.list_orders` (status_in 다중 상태 필터, 2026-04-27).
+  - 사용 예: `/api/v1/orders?status_in=COMPLETED&status_in=CANCELLED&limit=2000`
+
+- **`model_dump()` → supabase-py 직렬화 함정 — 반드시 `mode="json"` (2026-04-27 검증)**: Pydantic v2 의 기본 `model_dump()` 은 `date`, `datetime`, `UUID`, `time`, `Decimal` 같은 타입을 Python 객체 그대로 dict 에 담는다. 이 dict 를 supabase-py 의 `.insert()` / `.update()` 에 넘기면 내부 httpx 가 `json.dumps` 로 직렬화하다가 `TypeError: Object of type date is not JSON serializable` 로 500 폭발한다. 라우터에서 `model_dump()` 호출 시 반드시 `mode="json"` 플래그를 붙여 ISO 문자열/문자열로 변환된 dict 를 서비스에 전달한다.
+  ```python
+  # 잘못된 패턴 — date 가 그대로 dict 에 담겨 supabase 호출 시 TypeError
+  data=data.model_dump()
+  data=data.model_dump(exclude_unset=True)
+  data=data.model_dump(exclude_none=True)
+
+  # 올바른 패턴 — date → ISO, UUID → str, Decimal → str
+  data=data.model_dump(mode="json")
+  data=data.model_dump(exclude_unset=True, mode="json")
+  data=data.model_dump(exclude_none=True, mode="json")
+  ```
+  - 적용 위치 (검증된 곳, 2026-04-27):
+    - `orders.py` — `create_order`, `update_order`, `submit_counter_offer` (delivery_date: Optional[date], proposed_items 안의 product_id: UUID)
+    - `calendar.py` — `create_event`, `update_event` (event_date: date, start_time/end_time: time, order_id: UUID)
+    - `partners.py` — `create_partner`, `update_partner` (partner_user_id: UUID; create 측 필수)
+    - `subscriptions.py` — `create_subscription`, `update_subscription` (start_date/end_date: date, seller_id/buyer_id/partner_id/items.product_id: UUID, 2026-04-28)
+  - 일관성 원칙: 라우터에서 `data: Pydantic_Model` 을 받아 service 로 dict 를 넘기는 모든 핸들러는 무조건 `mode="json"`. UUID/date/datetime/time 필드가 없더라도 미래 스키마 추가 시 회귀 방지를 위해 일관성 유지.
+  - 서비스 내부에서 직접 `datetime.now(timezone.utc)` 같은 객체를 dict 에 넣을 때는 반드시 `.isoformat()` 으로 변환 (예: `order_service.cancel_order` 의 `cancelled_at`).
+  - 검증: `tests/e2e_orders_flow.py` — `delivery_date: "2026-05-15"` 가 포함된 견적 요청 → counter-offer → 상태 전환 → 취소까지 전 단계 통과 확인 (2026-04-27, ALL E2E STEPS PASSED).
+
+- **정기배송 generate_order_for_round 트랜잭션 보상 패턴 (2026-04-28 검증)**: supabase-py 는 단일 클라이언트에서 BEGIN/COMMIT 트랜잭션 제어가 약하다 (PostgREST 가 stateless). 다단계 INSERT 가 필요한 경우 "성공한 부분을 hard-delete 로 보상 롤백" 패턴을 사용한다. 정합성 보장은 가능하지만 race condition 직후 짧은 순간 partial state 가 노출될 수 있어 두 가지를 함께 적용해야 한다.
+  1. **순차 실행 + try/except 보상**: 부모 row 먼저 INSERT → 자식 row 들 INSERT. 자식 INSERT 가 어느 한 단계라도 실패하면 부모 row 를 hard-delete (FK CASCADE 가 자식 정리).
+  2. **calendar / next_date 갱신은 best-effort**: 주문 자체는 1단계 + 2단계로 일관되게 보장하고, calendar 동기화나 subscription.next_delivery_date 갱신은 실패해도 주문을 살린다 (로그만 남김 — 사용자가 다음 주기에서 자연 회복 가능).
+  ```python
+  # subscription_service.generate_order_for_round 패턴
+  # 1) orders INSERT (order_number UNIQUE 충돌 시 최대 3회 재시도)
+  for _ in range(3):
+      try:
+          payload = {**base, "order_number": self._generate_order_number()}
+          result = await asyncio.to_thread(lambda p=payload: self.orders_table.insert(p).execute())
+          if result.data: order = result.data[0]; break
+      except PostgrestAPIError as e:
+          if "23505" in str(e): continue
+          raise
+
+  # 2) order_items 다중 INSERT — 실패 시 보상 hard-delete
+  try:
+      for item in items:
+          await asyncio.to_thread(lambda p=item_payload: self.order_items_table.insert(p).execute())
+  except Exception as e:
+      try:
+          await asyncio.to_thread(lambda: self.orders_table.delete().eq("id", order_id).execute())
+      except Exception as rb:
+          print(f"rollback 실패 order_id={order_id}")
+      raise HTTPException(500, f"items insert 실패: {e}")
+
+  # 3) calendar / next_date 는 best-effort (실패해도 raise 안 함, 로그만)
+  ```
+  - 적용 위치: `subscription_service.create_subscription` (subscriptions → subscription_items), `subscription_service.generate_order_for_round` (orders → order_items → calendar → next_date 갱신).
+  - **검증 패턴**: e2e 테스트에서 의도적으로 자식 INSERT 가 실패하는 케이스를 만들어 부모 row 가 hard-delete 되었는지 확인. `select count(*) from subscriptions where deleted_at is null` 등으로 정합성 검증.
+
+- **PostgREST `.or_()` 양방향 페어 쿼리 — `and(...)` 그룹핑 (2026-04-28 검증)**: 거래처 통계 / 정기배송 partner 필터처럼 "(buyer=A AND seller=B) OR (buyer=B AND seller=A)" 양방향 매칭을 한 번의 쿼리로 처리하려면 PostgREST 의 `or` 안에 `and(...)` 그룹을 둘 사용한다.
+  ```python
+  # 잘못된 패턴 — buyer 또는 seller 가 partner 인 모든 주문 (양방향 안 맞음)
+  query.or_(f"buyer_id.eq.{partner_id},seller_id.eq.{partner_id}")
+
+  # 올바른 패턴 — (me, partner) AND (partner, me) 페어만
+  query.or_(
+      f"and(buyer_id.eq.{user_id},seller_id.eq.{partner_id}),"
+      f"and(seller_id.eq.{user_id},buyer_id.eq.{partner_id})"
+  )
+  ```
+  - 적용 위치: `partner_service.get_stats` (orders + subscriptions 카운트), `subscription_service.list_subscriptions` (partner_user_id 필터, 2026-04-28).
+  - **함정**: PostgREST 의 `or_()` 인자 문자열에 공백이 있으면 안 됨 (URL 인코딩 깨짐). 예시처럼 `,` 로만 구분.
+  - **함정 2**: `and(...)` 안에서 sub-condition 은 같은 컬럼이 반복되면 안 된다. PostgREST 가 마지막 것만 적용함. 위 패턴은 컬럼이 다르므로 안전.
+
+- **calendar.py route prefix `/calendar` ↔ subscriptions calendar_events 직접 INSERT 분리 (2026-04-28)**: `subscription_service.generate_order_for_round` 가 calendar_events 를 직접 INSERT 하는 이유는 calendar_service 가 user_id 인자를 self("내" 일정만)로 가정하고 있어 양쪽 user 에게 동시 생성하기 어렵기 때문. order_service 도 동일 패턴(`_sync_calendar_events_for_order_sync` 안에서 calendar_events 테이블 직접 사용)을 쓴다. 이 패턴 유지 시 주의:
+  - `event_type='SHIPMENT'` 또는 `'ORDER'` 등 calendar_events.CHECK 제약과 일치해야 함.
+  - DB 의 `uniq_calendar_events_active_order_user_date` partial unique index 와 충돌 시 23505 발생 가능 — try/except 로 무시 (정상 race).
+  - manual event 만 다루는 calendar_service 와는 격리된 기능으로 본다.

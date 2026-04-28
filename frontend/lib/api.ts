@@ -37,9 +37,18 @@ export const api = {
   get<T>(path: string, params?: Record<string, unknown>): Promise<T> {
     let url = path;
     if (params) {
+      // FastAPI Query(None) 다중값은 ?key=A&key=B 형태(repeat)를 기대.
+      // axios 기본 직렬화(?key[]=A&key[]=B)와 호환되지 않으므로 fetch 기반에서도 동일하게 repeat 으로 직렬화한다.
       const searchParams = new URLSearchParams();
       Object.entries(params).forEach(([k, v]) => {
-        if (v != null) searchParams.set(k, String(v));
+        if (v == null) return;
+        if (Array.isArray(v)) {
+          v.forEach((x) => {
+            if (x != null) searchParams.append(k, String(x));
+          });
+        } else {
+          searchParams.append(k, String(v));
+        }
       });
       const qs = searchParams.toString();
       if (qs) url += `?${qs}`;

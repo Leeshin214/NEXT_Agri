@@ -53,7 +53,7 @@ frontend/
 │   └── useChat.ts
 ├── store/
 │   ├── authStore.ts                ← user, setUser, logout
-│   └── uiStore.ts                  ← sidebarOpen, toggleSidebar
+│   └── uiStore.ts                  ← aiPanelOpen, toggleAIPanel (사이드바 state 없음 — 호버 전용)
 ├── types/
 │   ├── user.ts                     ← User, UserRole
 │   └── api.ts                      ← SuccessResponse<T>, ErrorResponse
@@ -83,43 +83,31 @@ frontend/
 ```
 
 **반응형 레이아웃 핵심 규칙:**
-- Sidebar: 모바일(md 미만) → `fixed inset-y-0 left-0 z-40` 오버레이, sidebarOpen false면 `-translate-x-full`
-- Sidebar: 데스크탑(md 이상) → `relative`, `md:translate-x-0` (항상 표시), 열린 상태 너비 `md:w-56`
-- AppLayout: 모바일에서 sidebarOpen=true일 때 `fixed inset-0 z-30 bg-black/40` 오버레이 배경 추가
-- AppLayout: 초기 렌더 + resize 시 md 미만이면 `setSidebarOpen(false)` 자동 처리
-- TopBar: 모바일에서만 햄버거 버튼 표시 (`md:hidden`)
+- Sidebar: **2단계 반응형** (lg 미만 / lg 이상) — 호버 전용, 핀/토글 개념 완전 제거됨
+  - lg 미만(<1024px): `absolute inset-y-0 left-0 z-40 shadow-sm` 오버레이. **항상 w-16 collapsed 디폴트**. 호버 시에만 w-56 슬라이드 펼침, 마우스 떠나면 즉시 w-16 축소. 화살표/토글 버튼 **없음**. 본문 자리는 자리표시 div(`block lg:hidden w-16 flex-shrink-0`)가 항상 차지 → 호버 펼침 시 본문이 밀리지 않음.
+  - 큰 화면(≥1024px): `lg:relative lg:w-56` 인라인 + 항상 펼침 강제(`expanded = isLargeScreen || isHovered`).
+- Sidebar 상태 모델: `isHovered`(local) + `isLargeScreen`(matchMedia) + `canHover`(matchMedia `(hover: hover)`). **Zustand 의존성 제거됨**. `expanded = isLargeScreen || isHovered`. 터치 디바이스에서 끈적한 호버 방지를 위해 `handleMouseEnter`는 `canHover` 체크 후에만 setIsHovered(true) → 터치 디바이스는 항상 collapsed.
+- AppLayout: **`relative` 필수** — lg 미만에서 Sidebar가 `absolute` 이므로 부모 기준 배치. 빠뜨리면 사이드바가 화면 전체로 튐.
+- AppLayout: resize 핸들러 제거됨 — Sidebar가 자체 matchMedia로 lg 분기 처리.
+- AppLayout: 모바일 오버레이 배경 div 제거됨 (사이드바가 absolute overlay라 본문을 가리지 않으므로 backdrop 불필요).
+- TopBar: 햄버거 버튼 제거됨 — 사이드바가 모든 화면에서 항상 보이므로 별도 토글 버튼 불필요. 좌측에는 빈 `<div />` 자리표시만 유지.
+- uiStore: 사이드바 관련 state(`sidebarOpen`/`toggleSidebar`/`setSidebarOpen`) **완전 제거됨**. AI 패널 state(`aiPanelOpen`/`toggleAIPanel`/`setAIPanelOpen`)만 유지.
 - AIChatPanel: 축소 상태(aiPanelOpen=false)는 모든 화면에서 w-12 바 표시 / 확장 상태(aiPanelOpen=true)는 모바일(md 미만) fixed 오버레이, md 이상 인라인 w-[360px] xl:w-[400px] 2xl:w-[440px]
 - main padding: 모바일 `p-4`, 데스크탑 `md:p-6`
 
-**실제 AppLayout.tsx (반응형 적용 후):**
+**실제 AppLayout.tsx (단순화 — 사이드바 state 의존성 완전 제거):**
 ```tsx
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const { user } = useAuthStore();
-  const { sidebarOpen, setSidebarOpen } = useUIStore();
   const pathname = usePathname();
+  const menus = user?.role === 'SELLER' ? sellerMenus : buyerMenus;
   const isFullPage = pathname === '/profile';
 
-  // 모바일에서 기본으로 사이드바 닫기
-  useEffect(() => {
-    const handleResize = () => {
-      if (window.innerWidth < 768) setSidebarOpen(false);
-    };
-    handleResize();
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [setSidebarOpen]);
-
+  // useUIStore / resize 핸들러 없음 — Sidebar가 자체 matchMedia로 lg 분기 처리
   return (
-    <div className="flex h-screen overflow-hidden bg-gray-50">
-      {!isFullPage && (
-        <>
-          {sidebarOpen && (
-            <div className="fixed inset-0 z-30 bg-black/40 md:hidden"
-              onClick={() => { if (window.innerWidth < 768) setSidebarOpen(false); }} />
-          )}
-          <Sidebar menus={menus} currentPath={pathname} role={user?.role} />
-        </>
-      )}
+    // relative 필수 — lg 미만에서 Sidebar가 absolute 로 부모 기준 배치됨
+    <div className="relative flex h-screen overflow-hidden bg-gray-50">
+      {!isFullPage && <Sidebar menus={menus} currentPath={pathname} role={user?.role} />}
       <div className="flex flex-1 flex-col overflow-hidden">
         <TopBar user={user} />
         <div className="flex flex-1 overflow-hidden">
@@ -130,6 +118,53 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     </div>
   );
 }
+```
+
+**Sidebar.tsx 핵심 패턴 (호버 전용 — 핀/토글 버튼 완전 제거, lg 강제 펼침, 터치 디바이스 호버 회피):**
+```tsx
+const [isHovered, setIsHovered] = useState(false);
+const [isLargeScreen, setIsLargeScreen] = useState(false);
+const [canHover, setCanHover] = useState(true);
+
+useEffect(() => {
+  const mq = window.matchMedia('(min-width: 1024px)');
+  const update = () => setIsLargeScreen(mq.matches);
+  update();
+  mq.addEventListener('change', update);
+  return () => mq.removeEventListener('change', update);
+}, []);
+
+useEffect(() => {
+  const mq = window.matchMedia('(hover: hover)');     // 터치 디바이스(hover: none)는 끈적한 호버 회피
+  const update = () => setCanHover(mq.matches);
+  update();
+  mq.addEventListener('change', update);
+  return () => mq.removeEventListener('change', update);
+}, []);
+
+// 큰 화면: 항상 펼침 / 그 외: 호버 여부만으로 결정 (Zustand 핀 의존성 제거됨)
+const expanded = isLargeScreen || isHovered;
+
+const handleMouseEnter = () => { if (canHover) setIsHovered(true); };
+
+return (
+  <>
+    {/* lg 미만 자리표시 — 사이드바가 absolute 로 떠있어도 본문 시작점 고정 */}
+    <div className="block lg:hidden w-16 flex-shrink-0" aria-hidden="true" />
+    <aside
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={() => setIsHovered(false)}
+      className={cn(
+        'flex flex-col border-r border-gray-200 bg-white transition-all duration-200',
+        'absolute inset-y-0 left-0 z-40 shadow-sm',              // lg 미만: absolute hover overlay
+        expanded ? 'w-56' : 'w-16',
+        'lg:relative lg:w-56 lg:shadow-none lg:z-auto'            // lg: 인라인 강제 펼침
+      )}
+    >
+      {/* 로고 / 역할 배지 / 메뉴 — 토글 버튼 없음 */}
+    </aside>
+  </>
+);
 ```
 
 ---
@@ -214,7 +249,7 @@ const res = await api.get<SuccessResponse<Product[]>>('/products');
 ### 상태 관리
 ```typescript
 const { user, setUser } = useAuthStore();  // user.role: 'SELLER' | 'BUYER' | 'ADMIN'
-const { sidebarOpen, toggleSidebar } = useUIStore();
+const { aiPanelOpen, toggleAIPanel } = useUIStore();  // 사이드바 state는 없음 (Sidebar 자체 호버 처리)
 ```
 
 ### Tailwind 색상
@@ -223,6 +258,21 @@ const { sidebarOpen, toggleSidebar } = useUIStore();
 - 페이지 배경: `bg-gray-50`
 - 버튼: `bg-primary-600 hover:bg-primary-700 text-white`
 - 보조 텍스트: `text-gray-500 text-sm`
+
+### Tailwind content 스캔 경로 (필수)
+`tailwind.config.ts`의 `content` 배열에는 **className 문자열이 등장하는 모든 디렉토리**를 포함해야 한다. JIT 모드는 스캔 경로 밖에 string literal로 존재하는 클래스를 인식하지 못해 빌드 CSS에서 누락시킨다.
+
+```ts
+content: [
+  './app/**/*.{js,ts,jsx,tsx,mdx}',
+  './components/**/*.{js,ts,jsx,tsx,mdx}',
+  './constants/**/*.{js,ts,jsx,tsx,mdx}',  // ORDER_STATUS_CONFIG.solidClassName, EVENT_TYPE_COLOR_CLASS 등
+  './hooks/**/*.{js,ts,jsx,tsx,mdx}',
+  './lib/**/*.{js,ts,jsx,tsx,mdx}',
+],
+```
+
+특히 `constants/status.ts` 의 `ORDER_STATUS_CONFIG[*].solidClassName` (`bg-purple-500`, `bg-orange-500`, `bg-indigo-500`, `bg-blue-500`, `bg-green-500`, `bg-red-500`, `bg-gray-500`) 와 `EVENT_TYPE_COLOR_CLASS` 가 오직 `constants/` 안에서만 string literal로 정의된다. `constants/` 가 content에 없으면 캘린더 셀의 일정 색이 모두 누락되어 흰 배경에 흰 글씨로 보이는 버그가 재발한다.
 
 ### StatusBadge 상태값
 ```
@@ -238,19 +288,19 @@ const { sidebarOpen, toggleSidebar } = useUIStore();
 ### 판매자
 - [ ] dashboard — SummaryCard 4개, 최근 주문 테이블, 이번 주 출하 일정
 - [ ] calendar — 월간 달력, 이벤트 타입별 색상, 날짜 클릭 상세 패널
-- [ ] partners — 거래처 테이블, 검색/필터, 행 클릭 슬라이드 패널
-- [x] members — 회원 검색 테이블, 프로필 모달, 채팅 생성
+- [x] partners — 거래처 테이블 (서버 사이드 필터), 즐겨찾기 토글, AddPartnerModal, 빠른 액션(채팅) — 주문 작성은 V1 숨김 (전용 새 페이지 미존재)
+- [x] members — 회원 검색 카드, 프로필 모달, 채팅 생성, 거래처 추가 버튼
 - [ ] products — 상품 목록, 상태 필터, 등록 모달 (React Hook Form)
-- [ ] orders — 탭(견적/진행/완료), 상세 패널, 상태 변경 버튼
+- [x] orders — 탭(견적/진행/완료), 상세 패널, 상태 변경 + 협상가 제시/수락/거절 + 취소
 - [ ] chat — 채팅방 목록 (좌), 메시지 창 (우), Realtime 구독
 
 ### 구매자
 - [ ] dashboard — SummaryCard 4개, 진행 주문 현황, 납품 예정
 - [ ] calendar — 판매자와 동일 패턴
-- [ ] partners — 판매자와 동일 패턴
-- [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat)
-- [ ] browse — 상품 카드 그리드, 카테고리/가격 필터, 견적 요청 버튼
-- [ ] orders — 구매자 관점 주문 목록, 상태 추적
+- [x] partners — 판매자와 동일 패턴 + 빠른 액션 "주문 작성" → /buyer/browse?seller_id=...
+- [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat) + 거래처 추가 버튼
+- [x] browse — 상품 카드 그리드, 카테고리/가격 필터, 견적 요청 버튼, ?seller_id= 쿼리로 판매자 필터
+- [x] orders — 견적 생성/수정/취소 모달 + 협상가 제시/수락/거절 + 상세 슬라이드
 - [ ] chat — 판매자와 동일 패턴
 
 ### 공통
@@ -296,28 +346,26 @@ Vercel 배포 후 Railway URL로 전환할 때는 `NEXT_PUBLIC_API_URL` 환경�
 
 ### 주의사항 & 함정
 
+- **Sidebar lg 미만 absolute 배치 시 부모 `relative` 필수.** AppLayout 루트 div에 `relative` 빠뜨리면 사이드바가 화면 전체 기준으로 튐. 또한 본문이 좌측으로 붙어 가려지지 않도록 `<div className="block lg:hidden w-16 flex-shrink-0" />` 자리표시 div가 사이드바 앞에 항상 있어야 한다.
+- **Sidebar는 호버 전용 — 핀/토글 state 없음.** `expanded = isLargeScreen || isHovered` 단순 OR 조합. 과거에는 `sidebarOpen`(zustand 핀) + `isHovered`(local) 합산이었으나, "lg 미만으로 줄였을 때 사이드바가 펼쳐진 채로 시작되어 다시 화살표를 눌러야 collapsed 됨" 문제로 인해 핀 개념과 화살표 토글 버튼을 모두 제거. 이제 lg 미만에서는 무조건 collapsed로 시작하고 마우스 호버 시에만 펼쳐진다.
+- **`window.matchMedia('(min-width: 1024px)')`로 isLargeScreen 동기화.** Tailwind `lg:` 만으로는 JS 분기가 안 되므로 `useState + matchMedia.addEventListener('change')` 패턴 사용. resize 이벤트보다 효율적. AppLayout에서 따로 resize 핸들러를 둘 필요 없음 — Sidebar가 자체 처리.
+- **터치 디바이스 호버 회피: `(hover: hover)` matchMedia 사용.** 모바일/태블릿에서 onMouseEnter는 탭 시 발화하고 다음 탭까지 호버 상태가 유지되는 "끈적한 호버" 문제가 있다. `canHover` 상태로 호버 가능한 디바이스에서만 setIsHovered(true)를 호출하여 이를 회피. 토글 버튼이 없으므로 터치 디바이스에서는 lg 미만일 때 항상 collapsed 상태로 고정 (디자인 의도).
+- **TopBar 햄버거 버튼 없음.** 사이드바가 모든 화면에서 항상 보이는 collapsed 패턴이라 별도 토글 버튼이 불필요. 좌측에 빈 `<div />` 만 placeholder로 둔다. `useUIStore`/`Menu` 아이콘 임포트도 제거.
 - `AIChatPanel`이 xl 이상에서 `w-[400px]`를 차지하므로, 페이지 콘텐츠(`main`)는 `min-w-0`이 필수. 없으면 flex 오버플로우 발생.
 - AIChatPanel은 `isMobile` state + `aiPanelOpen` 상태를 조합해 조건부 return으로 렌더링한다. Tailwind `hidden` 클래스 분기 방식이 아닌 JS 조건 분기 방식을 사용한다. 축소 상태는 항상 w-12 바를 반환, 모바일 확장은 fixed 오버레이, md 이상 확장은 인라인 div를 반환한다.
 - 사이드바 메뉴에 `AI 업무 도우미` 항목을 추가하지 말 것. AI는 `AIChatPanel`로만 접근.
 - `/ai-assistant` 라우트는 사용하지 않음 (파일은 남아있으나 사이드바 미노출).
 - `/profile` 페이지는 `isFullPage = true` → Sidebar, AIChatPanel 숨김. TopBar만 유지. 전체 화면을 마이페이지가 차지.
 
-### Supabase SSR 쿠키 타입 패턴 (검증됨)
+### Supabase 클라이언트 — 탭별 격리 storage (검증됨, 2026-04-27 재설계)
 
-`@supabase/ssr` 0.5.2부터 `CookieOptionsWithName`에 `value` 필드가 없어 컴파일 오류 발생.
-`lib/supabase/server.ts`와 `middleware.ts` 양쪽 모두 아래 패턴을 사용한다.
+`@supabase/ssr` 의 `createBrowserClient` (쿠키 기반)는 더 이상 사용하지 않는다. 같은 도메인 내 탭이 서로 다른 계정으로 동시 로그인 가능하도록 `@supabase/supabase-js` 의 `createClient` + 탭별 `storageKey` 패턴으로 전환되었다. 자세한 내용은 `SKILL_AUTH.md` 참조.
 
-```typescript
-// lib/supabase/server.ts, middleware.ts 공통 패턴
-import { createServerClient } from '@supabase/ssr';
-import type { CookieOptions } from '@supabase/ssr';
-
-// CookieOptionsWithName 사용 금지 — 0.5.2에서 value 필드 없음
-// setAll 콜백 파라미터는 인라인 타입으로 명시
-setAll(cookiesToSet: { name: string; value: string; options: CookieOptions }[]) {
-  cookiesToSet.forEach(({ name, value, options }) => ...);
-}
-```
+핵심 한 줄 요약:
+- `lib/supabase/client.ts` — `storageKey: 'agriflow-auth-{tabId}'`, `storage: window.localStorage`, 모듈 레벨 `_client` 캐시
+- `lib/supabase/server.ts` — deprecated, 호출 시 throw
+- `middleware.ts` — `matcher: []` 비활성화, 인증 가드는 `<AuthGuard>` (클라이언트)에서
+- `store/authStore.ts` — persist name도 tabId suffix, `loginExpiresAt` 필드로 2일 만료 정책
 
 #### useMutation 온디맨드 호출 패턴 (검증됨)
 
@@ -345,19 +393,273 @@ const result = data?.data;  // SuccessResponse 래퍼 안의 data 필드
 // 상태 분기: isIdle → 초기 안내 + 버튼 / isPending → 스피너 / result → 결과 / isError → 에러
 ```
 
-#### 캘린더 사이드바에 AI 패널 추가 시 래퍼 패턴 (검증됨)
+#### 캘린더 일정 클릭 → EventDetailModal 패턴 (검증됨, 2026-04-27)
 
-캘린더 페이지의 사이드 컬럼(기존 단일 카드)에 AI 패널을 추가할 때는 `space-y-6` 래퍼 div로 묶는다.
-`lg:grid-cols-4` 레이아웃에서 컬럼 수 변경 없이 수직 스택으로 패널을 추가할 수 있다.
+캘린더 셀의 일정 항목과 우측 "전체 일정" 리스트의 일정 카드 클릭 시 동일하게 상세 모달이 열려야 한다.
+페이지에서는 `selectedEvent: CalendarEvent | null` 상태 하나만 두고, 셀/리스트 양쪽 모두 `setSelectedEvent(ev)` 호출.
+
+**셀 안의 일정 클릭은 반드시 `e.stopPropagation()`** — 셀 자체 클릭은 `setSelectedDate(dateStr)` + `setDayModalDate(dateStr)` 이므로 이벤트 버블링이 일어나면 두 모달이 동시에 열려 충돌한다. 또한 셀 안의 일정 노드를 `<div>` 가 아닌 `<button type="button">` 으로 만들어 키보드 접근성도 확보.
 
 ```tsx
-<div className="space-y-6">          {/* 새 래퍼 — 기존 col 설정 제거 */}
-  <div className="rounded-xl bg-white p-6 shadow-sm">  {/* 기존 날짜 상세 카드 */}
-    ...
+{dayEvents.slice(0, 3).map((ev) => (
+  <button
+    key={ev.id}
+    type="button"
+    onClick={(e) => { e.stopPropagation(); setSelectedEvent(ev); }}
+    className={cn('block w-full rounded px-1 py-0.5 text-left text-[10px] text-white hover:opacity-90', getCalendarEventColorClass(ev))}
+  >
+    <div className="truncate font-medium">{main}</div>
+    {sub && <div className="truncate text-[9px] text-white/80">{sub}</div>}
+  </button>
+))}
+{dayEvents.length > 3 && (
+  <p className="mt-0.5 rounded bg-gray-200 px-1 py-0.5 text-center text-[10px] font-semibold text-gray-700">
+    +{dayEvents.length - 3}개 더보기
+  </p>
+)}
+```
+
+**우측 리스트 클릭은 모달 오픈만, 날짜 이동(setSelectedDate) 없음.** 이전에는 `setSelectedDate(ev.event_date)`로 날짜 이동만 했으나, "정보가 안 보인다"는 사용자 페인포인트의 핵심이라 모달 직접 오픈으로 변경. 리스트 카드의 활성 표시도 `selectedDate === ev.event_date` 가 아닌 `selectedEvent?.id === ev.id` 로 변경.
+
+**(2026-04-27 갱신) 우측 리스트 클릭은 캘린더 그리드 월 이동 + 모달 오픈을 함께 수행한다.** 리스트가 모든 월의 일정을 보여주므로(아래 "전체 월 일정" 패턴 참조) 다른 월 일정을 클릭하면 그리드도 함께 그 월로 이동해야 위치를 인식할 수 있다.
+
+```ts
+const handleListItemClick = (ev: CalendarEvent) => {
+  const [y, m] = ev.event_date.split('-').map(Number);
+  if (y && m) { setYear(y); setMonth(m); }
+  setSelectedDate(ev.event_date);
+  setSelectedEvent(ev);   // EventDetailModal 직접 오픈 — 사용자가 그 카드를 직접 눌렀으므로
+};
+
+const handleListHeaderClick = (date: string) => {
+  const [y, m] = date.split('-').map(Number);
+  if (y && m) { setYear(y); setMonth(m); }
+  setSelectedDate(date);
+  setDayModalDate(date);  // 날짜 그룹 헤더는 그날 전체를 보여주는 DayEventsModal 오픈
+};
+```
+
+**셀 안 일정은 클릭 핸들러 없는 div** — `<button onClick={(e) => { e.stopPropagation(); setSelectedEvent(ev); }}>` 패턴은 폐기되었다. 이전에는 셀 안 일정 클릭은 EventDetailModal 직접 오픈, 셀 빈 영역 클릭은 DayEventsModal 오픈으로 두 진입점이 갈렸다. 사용자 일관성 요구로 **어디든 클릭하면 무조건 DayEventsModal**만 뜨도록 통일.
+
+```tsx
+{dayEvents.slice(0, 3).map((ev) => {
+  const { main, sub } = getEventLabels(ev);
+  return (
+    <div
+      key={ev.id}
+      className={cn(
+        'block w-full rounded px-1 py-0.5 text-left text-[10px] text-white',
+        getCalendarEventColorClass(ev)
+      )}
+    >
+      <div className="truncate font-medium">{main}</div>
+      {sub && <div className="truncate text-[9px] text-white/80">{sub}</div>}
+    </div>
+  );
+})}
+```
+
+`hover:opacity-90` 도 함께 제거 — 셀 hover 효과(`hover:bg-gray-50`)에 자연스럽게 통합되도록. EventDetailModal 진입점은 이제 두 곳: ① DayEventsModal 안의 카드 클릭 (`onSelectEvent`), ② 우측 리스트의 카드 클릭 (`handleListItemClick`).
+
+**EventDetailModal** (`components/calendar/EventDetailModal.tsx`):
+- Props: `event: CalendarEvent | null`, `onClose: () => void`, `role: 'seller' | 'buyer'`
+- 헤더: 메인=`product_name ?? title`, 서브=`order_number`(있을 때만)
+- 본문: 색상 점 + 유형 뱃지(EVENT_TYPE_OPTIONS 라벨), 날짜(YYYY년 M월 D일 한국식), 시간(HH:MM ~ HH:MM 또는 "종일"), 설명(있을 때만)
+- `order_id` 있으면 "주문 상세 보기" 버튼 → role 따라 `/buyer/orders/{id}` 또는 `/seller/orders/{id}`
+- 푸터: 닫기 버튼 + 삭제 버튼(`useDeleteCalendarEvent` 훅, `confirm()` 후 `mutateAsync` → `onClose()`)
+- `event === null` 일 때는 `Modal isOpen={false}` 로 빈 모달 반환 (조건부 렌더링 없이도 안전하게 hooks 호출)
+
+```tsx
+<EventDetailModal event={selectedEvent} onClose={() => setSelectedEvent(null)} role="seller" />
+```
+
+#### 캘린더 셀 클릭 → DayEventsModal 패턴 (검증됨, 2026-04-27)
+
+날짜 셀(빈 영역) 클릭 시 단순 `setSelectedDate`만으로는 시각적 피드백이 약하다. 클릭 시 그날의 전체 일정을 리스트로 보여주는 별도 모달(`DayEventsModal`)을 띄운다.
+
+**페이지 상태 구조 — 3단계 상태 분리**:
+```typescript
+const [selectedDate, setSelectedDate] = useState<string | null>(null);   // 셀 하이라이트용
+const [dayModalDate, setDayModalDate] = useState<string | null>(null);   // 날짜 모달 트리거
+const [selectedEvent, setSelectedEvent] = useState<CalendarEvent | null>(null); // EventDetailModal 트리거
+```
+
+**셀 onClick 흐름** — 두 상태를 함께 세팅:
+```tsx
+onClick={() => {
+  setSelectedDate(dateStr);     // 시각 피드백 (border-primary-500 bg-primary-50)
+  setDayModalDate(dateStr);     // 모달 오픈
+}}
+```
+
+셀 안의 일정 버튼은 기존 패턴 유지 — `e.stopPropagation()` 후 `setSelectedEvent(ev)`로 EventDetailModal 직접 오픈 (Day 모달을 거치지 않는 단축 흐름).
+
+**DayEventsModal 협업 — 두 진입점 처리**:
+```tsx
+<DayEventsModal
+  date={dayModalDate}
+  events={dayModalDate ? visibleEvents.filter((e) => e.event_date === dayModalDate) : []}
+  onClose={() => setDayModalDate(null)}
+  onSelectEvent={(ev) => {
+    setDayModalDate(null);   // 일정 카드 클릭 → Day 모달 닫고 Detail 모달 오픈
+    setSelectedEvent(ev);
+  }}
+  onAddEvent={(d) => {
+    setDayModalDate(null);   // "일정 추가" 버튼 → Day 모달 닫고 추가 모달 오픈
+    setSelectedDate(d);
+    setShowModal(true);
+  }}
+  role="seller"  // 또는 "buyer"
+/>
+```
+
+**컴포넌트 위치**: `components/calendar/DayEventsModal.tsx`. 헤더는 한국식 + 요일(`2026년 5월 6일 (수)`), 본문은 start_time 오름차순 정렬(없으면 마지막), 일정 없으면 "이 날짜에 등록된 일정이 없습니다" 메시지, 푸터는 "일정 추가" + "닫기" 버튼. 기존 공통 `Modal` 컴포넌트 재사용.
+
+#### 캘린더 페이지 — 우측 패널 "전체 일정" 단일 카드 패턴 (검증됨, 2026-04-27)
+
+기존 "선택한 날짜 일정 + ScheduleAgentPanel" 2단 스택 구조에서, **단일 "전체 일정" 카드**로 통합되었다.
+ScheduleAgentPanel/useScheduleAgent는 다른 곳 재사용 예정으로 **파일은 보존**, 캘린더 페이지에서만 import/렌더링 제거.
+
+레이아웃 (seller/buyer 동일):
+- `lg:grid-cols-4` → 달력 `lg:col-span-3` + 우측 단일 카드 (col-span 1)
+- 우측 카드의 `space-y-6` 래퍼 div 제거됨 (스택할 컴포넌트가 사라짐)
+
+```tsx
+<div className="rounded-xl bg-white p-6 shadow-sm">
+  <div className="mb-4 flex items-center justify-between">
+    <h3 className="font-semibold text-gray-900">전체 일정</h3>
+    <button onClick={() => { /* selectedDate 없으면 오늘로 fallback */ setShowModal(true); }} ...>
+      <Plus className="h-4 w-4" />
+    </button>
   </div>
-  <ScheduleAgentPanel year={year} month={month} />
+  {sortedEvents.length === 0 ? (
+    <p className="text-sm text-gray-400">등록된 일정이 없습니다.</p>
+  ) : (
+    <div className="max-h-[calc(100vh-260px)] space-y-3 overflow-y-auto pr-1">
+      {sortedEvents.map((ev) => /* 카드 */)}
+    </div>
+  )}
 </div>
 ```
+
+스크롤 영역 높이는 `max-h-[calc(100vh-260px)]` 사용 — TopBar/PageHeader/카드 패딩을 제외한 잔여 높이.
+
+#### 캘린더 — CANCELLED 일정 방어적 프론트 필터링 (검증됨, 2026-04-27)
+
+백엔드 `order_service`가 CANCELLED 주문의 calendar_events를 즉시 soft-delete 하지만, 캐시·sync 누락 등 사이드 케이스에서 `order_status === 'CANCELLED'` 이벤트가 응답에 섞여 들어올 수 있다. 페이지에서 한 번 가공해 모든 노출 지점에서 같이 차단한다.
+
+```typescript
+const visibleEvents = useMemo(
+  () => events.filter((e) => e.order_status !== 'CANCELLED'),
+  [events]
+);
+```
+
+`getEventsForDay`, `sortedEvents`, `DayEventsModal`로 전달하는 events 모두 `visibleEvents` 사용 — 셀·우측 리스트·날짜 모달 어디서도 보이지 않게 통일. seller/buyer 양쪽 동일 적용.
+
+#### 캘린더 — dateStr 생성 방식 (timezone-safe 순수 문자열) (검증됨, 2026-04-27)
+
+캘린더 셀의 dateStr 과 `event.event_date` 비교는 `===` 단순 문자열 비교다. `new Date(...).toISOString().split('T')[0]` 같은 방식은 KST(UTC+9)에서 자정 무렵 하루 어긋남이 발생하므로 **금지**. 항상 순수 문자열 조합으로 생성하여 timezone 영향을 차단한다.
+
+```typescript
+const buildDateStr = (d: number) =>
+  `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+```
+
+백엔드 `event_date`는 Postgres `date` → `'YYYY-MM-DD'` 문자열로 안정적으로 직렬화되므로 양쪽이 정확히 일치한다.
+
+#### CalendarEvent — product_name/order_number/order_status 필드 패턴 (검증됨, 2026-04-27)
+
+백엔드 `CalendarEventResponse`에 `order_number`, `product_name`, `order_status` 세 필드가 추가됨.
+`order_id` 없는 일정(MEETING 등)은 모두 null.
+
+```typescript
+// types/calendar.ts
+import type { OrderStatus } from './order';
+
+export interface CalendarEvent {
+  // 기존 필드들...
+  order_number: string | null;
+  product_name: string | null;
+  order_status: OrderStatus | null;  // 백엔드는 string | null, 프론트는 OrderStatus union으로 좁힘
+}
+```
+
+표시 규칙 — **메인 라인은 product_name fallback title, 서브 라인은 order_number 작은 글씨**:
+```tsx
+const main = ev.product_name ?? ev.title;
+const sub = ev.order_number;
+
+// 캘린더 셀 (좁은 영역, 흰색 텍스트 위)
+<div className="rounded px-1 py-0.5 text-[10px] text-white" /* event color bg */>
+  <div className="truncate font-medium">{main}</div>
+  {sub && <div className="truncate text-[9px] text-white/80">{sub}</div>}
+</div>
+
+// 일정 카드 (넓은 영역, 회색 텍스트)
+<span className="text-sm font-medium text-gray-900">{main}</span>
+{sub && <p className="text-xs text-gray-500">{sub}</p>}
+```
+
+`title` fallback 필수: 사용자가 수동 등록한 일정은 product_name이 null이라 title이 메인이 된다.
+
+#### 캘린더 일정 색상/라벨 — order_status 필드 우선, event_type fallback (검증됨, 2026-04-27)
+
+`getCalendarEventColorClass(event)` / `getCalendarEventLabel(event)` 두 함수가 `frontend/constants/status.ts`에 정의됨.
+**텍스트 파싱(title/description) 레거시는 완전 제거됨** — 백엔드가 더 이상 상태 키워드를 텍스트에 넣지 않으므로 항상 fallback으로 떨어져 모든 주문 일정이 회색·"주문" 라벨로 보이는 버그가 있었음.
+
+핵심 매핑 규칙:
+- `event.order_status`가 있으면 `ORDER_STATUS_CONFIG[order_status].solidClassName / .label` 사용 → **주문/견적 페이지와 색·라벨 자동 일치**
+- 없으면 `EVENT_TYPE_COLOR_CLASS[event_type] / EVENT_TYPE_LABEL[event_type]` fallback (MEETING은 보라, SHIPMENT는 파랑 등)
+
+백엔드 트랩: 모든 주문 관련 일정의 `event_type`이 `'ORDER'`로 고정 송출되므로 `EVENT_TYPE_LABEL`만으로는 모든 일정이 "주문"으로 표시됨. **반드시 order_status 우선 매핑**.
+
+```typescript
+// constants/status.ts (실제 코드 발췌)
+export function getCalendarEventColorClass(
+  event: Pick<CalendarEvent, 'event_type' | 'order_status'>
+): string {
+  if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
+    return ORDER_STATUS_CONFIG[event.order_status].solidClassName;
+  }
+  return EVENT_TYPE_COLOR_CLASS[event.event_type] ?? EVENT_TYPE_COLOR_CLASS.OTHER;
+}
+
+export function getCalendarEventLabel(
+  event: Pick<CalendarEvent, 'event_type' | 'order_status'>
+): string {
+  if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
+    return ORDER_STATUS_CONFIG[event.order_status].label;
+  }
+  return EVENT_TYPE_LABEL[event.event_type] ?? '기타';
+}
+```
+
+호출부 (셀, 우측 리스트, EventDetailModal 모두 동일):
+```tsx
+// 라벨 (이전: EVENT_TYPE_OPTIONS.find(...)?.label — 모두 "주문"으로 보였음)
+const typeLabel = getCalendarEventLabel(ev);
+
+// 색 (이전: 텍스트 파싱 후 fallback이라 죄다 회색)
+className={cn('...', getCalendarEventColorClass(ev))}
+```
+
+`ORDER_STATUS_CONFIG`의 `solidClassName`/`label`은 **주문/견적 페이지(StatusBadge)에서도 동일하게 사용**되므로 캘린더와 색·라벨이 자동으로 일관됨. `aliases` 필드와 텍스트 파싱 헬퍼(`getOrderStatusFromText`, `getOrderStatusFromCalendarEvent`, `ORDER_STATUS_MATCH_ORDER`, `normalizeStatusText`)는 모두 제거됨.
+
+#### 정렬 — event_date asc, 동일 날짜는 start_time asc (검증됨)
+
+```typescript
+const sortedEvents = useMemo(() => {
+  return [...events].sort((a, b) => {
+    if (a.event_date !== b.event_date) return a.event_date.localeCompare(b.event_date);
+    const aStart = a.start_time ?? '';
+    const bStart = b.start_time ?? '';
+    return aStart.localeCompare(bStart);
+  });
+}, [events]);
+```
+
+`event_date`는 'YYYY-MM-DD' 문자열, `start_time`은 'HH:MM:SS' 또는 null이라 `localeCompare`로 정렬해도 사전순=시간순으로 일치한다.
 
 #### AI 패널 컴포넌트 디렉토리 위치
 
@@ -495,6 +797,274 @@ try {
 
 적용 위치: `hooks/useAuth.ts` (세션 동기화), `app/(auth)/login/page.tsx` (로그인 후 리다이렉트).
 
+#### AI 히스토리 훅 패턴 (검증됨)
+
+`useAIHistory` 훅은 `enabled: !!user`로 인증 후에만 실행한다. 백엔드 `/ai/history` 응답 필드는
+`user_message`/`ai_response`가 **아닌** `prompt`/`response`임에 주의한다.
+
+```typescript
+// hooks/useAIHistory.ts
+export interface AIConversation {
+  id: string;
+  user_id: string;
+  prompt: string;       // ← user_message 아님
+  response: string;     // ← ai_response 아님
+  prompt_type: string | null;
+  created_at: string;
+}
+
+export function useAIHistory(limit = 50) {
+  const { user } = useAuthStore();
+  return useQuery({
+    queryKey: ['ai-history', limit],
+    queryFn: () => api.get<SuccessResponse<AIConversation[]>>(`/ai/history`, { limit }),
+    enabled: !!user,
+    staleTime: 30_000,
+  });
+}
+```
+
+#### AI 어시스턴트 페이지 — 히스토리 + 날짜 구분선 패턴 (검증됨)
+
+- 백엔드는 **최신순** 반환 → 페이지에서 `.reverse()`로 뒤집어 표시
+- 날짜 구분선: 인접한 두 항목의 `created_at.slice(0, 10)` 비교
+- 현재 세션 응답(useAIStream)은 히스토리 아래 별도로 렌더링, 날짜 구분선 추가
+
+```tsx
+const sortedHistory = [...history].reverse(); // 오래된순 정렬
+
+{sortedHistory.map((conv, idx) => {
+  const dateLabel = conv.created_at.slice(0, 10);
+  const prevLabel = idx > 0 ? sortedHistory[idx - 1].created_at.slice(0, 10) : null;
+  return (
+    <div key={conv.id}>
+      {dateLabel !== prevLabel && <DateDivider label={dateLabel} />}
+      <div className="flex justify-end mb-2">  {/* 사용자: 오른쪽, bg-primary-100 */}
+        <div className="max-w-[75%] rounded-2xl bg-primary-100 px-4 py-2 text-sm text-primary-900">
+          {conv.prompt}
+        </div>
+      </div>
+      <div className="flex justify-start mb-2">  {/* AI: 왼쪽, bg-gray-100 */}
+        <div className="max-w-[75%] rounded-2xl bg-gray-100 px-4 py-2 text-sm text-gray-800 whitespace-pre-wrap">
+          {conv.response}
+        </div>
+      </div>
+    </div>
+  );
+})}
+```
+
+#### useAIStream — manualReview 플래그 (검증됨)
+
+`useAIStream`이 `manualReview: boolean`을 추가로 반환한다.
+백엔드 orchestrator `final_state.manual_review`가 `true`이면 페이지에서 경고 배너를 표시한다.
+
+```typescript
+// hooks/useAIStream.ts — 반환값
+return { response, isStreaming, manualReview, stream, abort, reset };
+
+// 페이지에서 사용
+const { response, isStreaming, manualReview, stream } = useAIStream();
+
+{manualReview && (
+  <div className="bg-yellow-50 border border-yellow-400 rounded p-3 mb-2 flex items-center gap-2">
+    <AlertTriangle className="h-4 w-4 text-yellow-500 flex-shrink-0" aria-hidden="true" />
+    <span className="text-yellow-800 text-sm">
+      AI 답변 검토 필요 — 처리 중 이상이 감지됐습니다. 결과를 직접 확인해 주세요.
+    </span>
+  </div>
+)}
+```
+
+백엔드 orchestrator.py `run()` return에도 `manual_review` 필드를 포함해야 한다:
+```python
+return {
+    "response": final_state.get("final_response") or "응답을 생성하지 못했습니다.",
+    "tools_used": final_state.get("tools_used", []),
+    "manual_review": final_state.get("manual_review", False),  # ← 필수
+}
+```
+
+#### 대시보드 미확인 채팅 카운트 연동 패턴 (검증됨)
+
+`useChatRooms()`의 데이터에서 `unread_count`를 합산한다.
+`ChatRoom` 타입 어노테이션을 명시해야 `reduce` 타입 추론이 정확하다.
+
+```typescript
+import { useChatRooms } from '@/hooks/useChat';
+import type { ChatRoom } from '@/types';
+
+const { data: roomsData } = useChatRooms();
+const rooms: ChatRoom[] = roomsData?.data ?? [];
+const unreadTotal = rooms.reduce((sum, r) => sum + (r.unread_count ?? 0), 0);
+
+<SummaryCard title="미확인 채팅" value={unreadTotal} ... />
+```
+
+#### useProducts 서버 측 필터 패턴 (검증됨)
+
+`ProductFilters`에 백엔드 쿼리 파라미터를 모두 포함시키고, browse 페이지에서 state 값을 훅에 직접 전달한다.
+`queryKey: ['products', filters]`는 filters 객체 전체를 포함하므로 `max_price`/`min_stock` 추가만으로 state 변경 시 자동 refetch된다. 별도 queryKey 수정 불필요.
+
+```typescript
+// hooks/useProducts.ts
+interface ProductFilters {
+  category?: string;
+  product_status?: string;
+  seller_id?: string;
+  search?: string;
+  page?: number;
+  limit?: number;
+  max_price?: number;  // 백엔드 쿼리 파라미터
+  min_stock?: number;  // 백엔드 쿼리 파라미터
+}
+
+export function useProducts(filters?: ProductFilters) {
+  return useQuery({
+    queryKey: ['products', filters],  // filters 전체가 키 → 어떤 필드 추가해도 자동 반영
+    queryFn: () =>
+      api.get<SuccessResponse<Product[]>>('/products', filters as Record<string, unknown>),
+  });
+}
+```
+
+browse 페이지에서 state → 훅 전달 (클라이언트 filter() 제거):
+```typescript
+// 빈 문자열은 undefined로 변환해야 백엔드가 해당 파라미터를 무시함
+const { data, isLoading } = useProducts({
+  search: search || undefined,
+  category: categoryFilter || undefined,
+  max_price: maxPrice ? Number(maxPrice) : undefined,
+  min_stock: minStock ? Number(minStock) : undefined,
+});
+const filtered = data?.data ?? [];  // 서버가 필터링한 결과 그대로 사용
+```
+
+- 클라이언트 `products.filter()` useMemo 제거 — 페이지네이션 시 전체 데이터 없어도 서버가 정확히 필터링
+- `'' || undefined` 패턴 필수: 빈 문자열을 그대로 보내면 백엔드가 빈 값으로 필터링함
+
+#### useOrders status_in 다중값 + 탭별 서버 필터링 (검증됨, 2026-04-27)
+
+주문/견적 페이지(`seller/orders`, `buyer/orders`)는 탭마다 백엔드를 다시 호출해 해당 상태만 받는다.
+**`useOrders()` 인자 없이 호출 → `allOrders.filter(...)` 클라이언트 필터링 패턴 금지** — 첫 20개에만 필터가 적용되어 "최근 20개 중 완료된 주문만" 보여주는 버그 발생.
+
+```typescript
+// hooks/useOrders.ts
+interface OrderFilters {
+  order_status?: OrderStatus;
+  status_in?: OrderStatus[];   // 다중 상태 필터 — 백엔드 GET /orders 의 status_in 다중 query 와 매핑
+  page?: number;
+  limit?: number;
+}
+```
+
+페이지에서 활성 탭의 statuses 만 서버에 전달:
+```typescript
+const activeStatuses = tabs.find((t) => t.key === activeTab)?.statuses ?? [];
+const { data: listData, isLoading } = useOrders({
+  status_in: activeStatuses,
+  limit: 2000,   // 사실상 전체
+});
+const filteredOrders = listData?.data ?? [];   // 서버가 필터링한 결과 그대로
+```
+
+- 탭 전환 시 React Query `queryKey: ['orders', filters]` 가 `status_in` 배열 변화로 자동 refetch
+- 카운트 뱃지: 활성 탭만 `(N)` 표시 (서버에서 비활성 탭의 카운트를 한 번에 알 수 없으므로 비활성 탭은 카운트 생략)
+- 데이터 테이블은 `<div className="max-h-[calc(100vh-280px)] overflow-y-auto rounded-xl">` 로 감싸서 헤더 위치 고정 + 본문 스크롤
+
+#### lib/api.ts 배열 query param 직렬화 (검증됨, 2026-04-27)
+
+FastAPI `Query(None)` 다중값은 `?key=A&key=B` (repeat) 형식을 기대한다. axios 기본은 `?key[]=A&key[]=B` 라 호환 안 됨.
+이 프로젝트의 `lib/api.ts`는 fetch 기반이며, `api.get(path, params)` 의 `Object.entries(params)` 루프에서 `Array.isArray(v)` 분기로 `searchParams.append(k, ...)` 를 반복 호출해 repeat 직렬화한다. 단일 값은 기존대로 `searchParams.append(k, String(v))`.
+
+```typescript
+// lib/api.ts api.get
+Object.entries(params).forEach(([k, v]) => {
+  if (v == null) return;
+  if (Array.isArray(v)) {
+    v.forEach((x) => { if (x != null) searchParams.append(k, String(x)); });
+  } else {
+    searchParams.append(k, String(v));
+  }
+});
+```
+
+훅 측에서는 별도 직렬화 없이 그냥 `{ status_in: ['COMPLETED', 'CANCELLED'] }` 처럼 배열을 넘기면 된다. `qs` 라이브러리 의존성 없음.
+
+#### browse "문의" → 채팅방 생성 → 시스템 메시지 → 라우팅 패턴 (검증됨)
+
+`[문의]` 버튼 전용 흐름. 견적 요청은 별도 모달로 분리됨(위 섹션 참조).
+
+```typescript
+// 1. 채팅방 생성 (product.seller_id → partner_user_id)
+const roomRes = await createChatRoom.mutateAsync({ partner_user_id: product.seller_id });
+const roomId = roomRes.data.id;
+
+// 2. 시스템 메시지 발송 — 라벨은 [상품 문의] (견적이 아니므로 구분)
+await sendMessage.mutateAsync({
+  roomId,
+  content: `[상품 문의] 상품: ${product.name} (${categoryLabel}) / 단가: ${product.price_per_unit.toLocaleString()}원/${product.unit}`,
+});
+
+// 3. 채팅 페이지 이동 (room_id 쿼리스트링)
+router.push(`/buyer/chat?room_id=${roomId}`);
+```
+
+채팅 페이지에서 room_id 쿼리스트링 자동 선택:
+```typescript
+// buyer/chat/page.tsx
+const searchParams = useSearchParams();
+useEffect(() => {
+  const roomIdParam = searchParams.get('room_id');
+  if (roomIdParam) {
+    setSelectedRoomId(roomIdParam);
+    setMobileView('messages');
+  }
+}, [searchParams]);
+```
+
+#### 시스템 메시지 렌더링 패턴 (검증됨)
+
+`[견적 요청]` 등 `[` 시작 + `]` 포함 내용은 시스템 메시지로 판별해 가운데 회색 pill로 표시한다.
+
+```tsx
+const isSystem = msg.content.startsWith('[') && msg.content.includes(']');
+if (isSystem) {
+  return (
+    <div key={msg.id} className="flex justify-center">
+      <div className="rounded-full bg-gray-100 px-4 py-1 text-xs text-gray-500">
+        {msg.content}
+      </div>
+    </div>
+  );
+}
+```
+
+#### useMessagesWithWebSocket — alternativePartnersSuggestion 노출 (검증됨)
+
+`lastMessage.type === 'alternative_partners_suggestion'`인 경우 훅에서 별도로 추출해 반환한다.
+채팅 페이지에서 배너로 표시한다.
+
+```typescript
+// hooks/useChat.ts
+const alternativePartnersSuggestion =
+  lastMessage?.type === 'alternative_partners_suggestion' ? lastMessage : null;
+
+return { messageQuery, isConnected, sendMessage, wsError, alternativePartnersSuggestion };
+
+// 채팅 페이지에서
+const { ..., alternativePartnersSuggestion } = useMessagesWithWebSocket(selectedRoomId);
+
+{alternativePartnersSuggestion && (
+  <div className="flex items-center gap-2 border-b border-yellow-200 bg-yellow-50 px-4 py-2">
+    <AlertTriangle className="h-4 w-4 flex-shrink-0 text-yellow-500" aria-hidden="true" />
+    <p className="flex-1 text-xs text-yellow-800">
+      대체 거래처가 제안됐습니다. 거래처 목록에서 확인해 보세요.
+    </p>
+  </div>
+)}
+```
+
 ### 도메인 타입 → `Record` 키 타입 패턴 (검증됨)
 
 상태 전이 맵처럼 값이 도메인 타입인 경우 `Record<string, DomainType>` 형태로 선언한다. 키는 런타임에 동적으로 조회되므로 `string`으로 유지한다.
@@ -510,3 +1080,883 @@ const nextStatusMap: Record<string, OrderStatus> = {
 };
 // → nextStatusMap[order.status] 의 반환 타입이 OrderStatus로 좁혀짐
 ```
+
+#### 주문/견적 도메인 — 입력 타입 통합 패턴 (검증됨)
+
+백엔드 Pydantic의 `OrderItemCreate` / `OrderItemUpdate` / `CounterOffer.proposed_items`가
+모두 동일한 구조(`product_id`, `quantity`, `unit_price`, `notes?`)이므로
+프론트에서는 **단일 `OrderItemInput`** 에 매핑한다. 기존 코드 호환을 위해
+`OrderItemCreate`는 별칭으로 유지한다.
+
+```typescript
+// types/order.ts
+export interface OrderItemInput {
+  product_id: string;
+  quantity: number;
+  unit_price: number;
+  notes?: string;
+}
+// 기존 import 호환 (구상품 페이지 등)
+export type OrderItemCreate = OrderItemInput;
+```
+
+`types/index.ts` 배럴 파일에 `OrderItemInput`, `OrderUpdate`, `CounterOffer`,
+`CounterOfferCreate`, `CounterOfferStatus`, `FromRole` 추가 export 필요.
+
+#### 주문 상세 — useOrder 별도 쿼리 + invalidate 키 분리 (검증됨)
+
+목록(`['orders']`)과 상세(`['order', orderId]`)를 분리해 캐싱한다.
+상세는 액션(상태 변경/협상 제시·수락·거절/취소) 직후 자동 refetch가 필요하므로 모든 mutation의 `onSuccess`에서 두 키를 함께 invalidate한다.
+
+```typescript
+// hooks/useOrders.ts — 모든 단건 액션 mutation
+onSuccess: (_, variables) => {
+  queryClient.invalidateQueries({ queryKey: ['orders'] });
+  queryClient.invalidateQueries({ queryKey: ['order', variables.id] });
+  queryClient.invalidateQueries({ queryKey: ['negotiation', variables.id] });
+}
+```
+
+페이지에서는 `selectedOrderId` 상태로 슬라이드 패널에 띄울 주문을 선택하고,
+`useOrder(selectedOrderId)`로 최신 상세를 받으며 목록 데이터로 fallback 한다:
+
+```typescript
+const { data: detailData } = useOrder(selectedOrderId ?? '');
+const selectedOrder: Order | null =
+  detailData?.data ??
+  (selectedOrderId
+    ? allOrders.find((o) => o.id === selectedOrderId) ?? null
+    : null);
+```
+
+#### 협상 이력 — 본인/상대 판별로 액션 노출 가드 (검증됨)
+
+`useNegotiationHistory(orderId)`로 받은 협상가 목록에서
+**가장 최근의 PENDING 항목**이 상대방 제시이면 수락/거절 노출,
+본인 제시이면 "상대방 응답 대기 중"만 표시한다.
+
+```tsx
+const latestPending = sorted.find((o) => o.status === 'PENDING');
+const canRespond =
+  latestPending &&
+  user &&
+  latestPending.from_user_id !== user.id &&  // 상대방 제시건만
+  (orderStatus === 'QUOTE_REQUESTED' || orderStatus === 'NEGOTIATING');
+```
+
+`from_role`(SELLER/BUYER)은 배지 표시용. 인증된 사용자 ID와의 비교는
+반드시 `from_user_id` 사용 — `from_role`만으로 본인/상대 판별 금지(같은 역할 두 사용자가 있을 수 있음).
+
+#### 판매자 vs 구매자 — 상태 전이 권한 매트릭스 (검증됨, 2026-04-27 갱신)
+
+백엔드 역할 가드가 일부 완화되어 양쪽 모두 가능한 전이가 늘었다.
+다음 상태 버튼이 자동 노출되지 않는 전이는 **명시적 액션 버튼**으로 노출한다 (예: 판매자의 "주문 확정", 구매자의 "수령 완료").
+
+| 상태 | BUYER | SELLER |
+|---|---|---|
+| `QUOTE_REQUESTED → CONFIRMED` | O | O (신규) |
+| `NEGOTIATING → CONFIRMED` | O | O |
+| `CONFIRMED → PREPARING` | X | O |
+| `PREPARING → SHIPPING` | X | O |
+| `SHIPPING → COMPLETED` | O (신규) | O |
+| 취소 | O | O |
+
+판매자 next-status 맵 (자동 "다음 상태로 진행" 버튼용 — 일반적인 단일 다음 상태만):
+```typescript
+// seller/orders/page.tsx
+const sellerNextStatusMap: Record<string, OrderStatus> = {
+  CONFIRMED: 'PREPARING',
+  PREPARING: 'SHIPPING',
+  SHIPPING: 'COMPLETED',
+};
+```
+
+`QUOTE_REQUESTED`/`NEGOTIATING`은 sellerNextStatusMap에 넣지 않는다 — "주문 확정" 명시 버튼이 더 직관적이므로 별도 버튼으로 분리:
+
+```tsx
+{counterOfferableStatuses.includes(selectedOrder.status) && (
+  <button
+    onClick={() => updateStatus.mutate({ id: selectedOrder.id, status: 'CONFIRMED' })}
+    disabled={updateStatus.isPending}
+    className="rounded-lg bg-primary-600 px-3 py-2 text-xs font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+  >
+    주문 확정
+  </button>
+)}
+```
+
+구매자 페이지도 마찬가지로 `SHIPPING → COMPLETED`는 명시 버튼으로 노출하고 안내 텍스트를 함께 표시:
+```tsx
+{selectedOrder.status === 'SHIPPING' && (
+  <p className="mb-2 text-xs text-gray-500">물건을 받으셨다면 완료 처리해 주세요</p>
+)}
+{selectedOrder.status === 'SHIPPING' && (
+  <button onClick={() => updateStatus.mutate({ id: selectedOrder.id, status: 'COMPLETED' })} ...>
+    수령 완료
+  </button>
+)}
+```
+
+구매자 페이지에서 `useUpdateOrderStatus` 임포트 누락 함정: 기존 구매자 페이지는 상태 변경이 없어서 import가 빠져있었다. SHIPPING → COMPLETED 추가 시 반드시 추가.
+
+#### 주문 목록/상세 — 백엔드 join 평탄화 필드 활용 (검증됨)
+
+백엔드가 `Order` 응답에 `buyer_name`/`buyer_company`/`seller_name`/`seller_company`,
+`OrderItem` 응답에 `product_name`/`product_unit`/`product_category`를 평탄화해 내려준다.
+모두 `string | null | undefined` (사용자/상품 soft-delete 시 null).
+
+**목록 첫 컬럼 패턴 — 상품명 메인 / 주문번호 서브:**
+```tsx
+{
+  key: 'product',
+  header: '상품',
+  render: (item) => {
+    const firstName = item.items?.[0]?.product_name ?? '상품 정보 없음';
+    const extra = item.items.length > 1 ? ` 외 ${item.items.length - 1}건` : '';
+    return (
+      <div className="flex flex-col">
+        <span className="font-medium text-gray-900">{firstName}{extra}</span>
+        <span className="text-xs text-gray-500">{item.order_number}</span>
+      </div>
+    );
+  },
+},
+```
+
+**상대방 컬럼 (구매자 페이지에는 판매자, 판매자 페이지에는 구매자):**
+```tsx
+{
+  key: 'seller',  // 또는 'buyer'
+  header: '판매자',  // 또는 '구매자'
+  render: (item) => (
+    <div className="flex flex-col">
+      <span className="text-sm text-gray-900">{item.seller_name ?? '-'}</span>
+      {item.seller_company && (
+        <span className="text-xs text-gray-500">{item.seller_company}</span>
+      )}
+    </div>
+  ),
+},
+```
+
+**상세 슬라이드 헤더 — 상품 요약 한 줄 + 주문번호 서브 + 상대방 한 줄:**
+```tsx
+<div className="flex items-start justify-between border-b border-gray-200 px-6 py-4">
+  <div className="min-w-0 flex-1 pr-3">
+    {(() => {
+      const firstItem = selectedOrder.items?.[0];
+      const firstName = firstItem?.product_name ?? '상품 정보 없음';
+      const qtyUnit = firstItem ? ` ${firstItem.quantity}${firstItem.product_unit ?? ''}` : '';
+      const extra = selectedOrder.items.length > 1 ? ` 외 ${selectedOrder.items.length - 1}건` : '';
+      return (
+        <h2 className="truncate text-lg font-semibold text-gray-900">
+          {firstName}{qtyUnit}{extra}
+        </h2>
+      );
+    })()}
+    <p className="mt-0.5 truncate text-xs text-gray-500">{selectedOrder.order_number}</p>
+    <p className="mt-1 truncate text-xs text-gray-600">
+      판매자: {selectedOrder.seller_name ?? '-'}
+      {selectedOrder.seller_company ? ` (${selectedOrder.seller_company})` : ''}
+    </p>
+  </div>
+  <button onClick={closeDetail} className="flex-shrink-0 ...">닫기</button>
+</div>
+```
+
+- 헤더는 `items-start` (헤더가 3줄로 늘어나므로) + `min-w-0 flex-1` + 닫기 버튼은 `flex-shrink-0` — 긴 상품명 truncate 보장.
+- 상세 항목 카드에도 `<p className="mb-1 font-medium text-gray-900">{item.product_name ?? '상품 정보 없음'}</p>` 라인을 맨 위에 추가하면 어떤 상품인지 즉시 파악 가능.
+- 수량 표시에 `{item.product_unit ?? ''}`를 붙여 "수량 10kg × ..." 형태로 자연스럽게 단위 노출.
+
+#### 견적 생성 모달 — 검색형 판매자 선택 (검증됨, 2026-04-27 갱신)
+
+**도메인 정의**: `partners` = 정기배송 관계, **주문/견적 = 일회성 거래** (거래처 등록과 무관).
+따라서 견적 모달은 `usePartners`에 **의존하지 않는다**. 대신 `useMembers({role: 'SELLER'})` 로 전체 판매자를 typeahead 검색.
+
+```typescript
+// CreateOrderModal.tsx — 검색형 dropdown 패턴
+const [sellerSearch, setSellerSearch] = useState('');
+const [debouncedSearch, setDebouncedSearch] = useState('');
+
+// 디바운스 300ms
+useEffect(() => {
+  const handle = setTimeout(() => setDebouncedSearch(sellerSearch), 300);
+  return () => clearTimeout(handle);
+}, [sellerSearch]);
+
+const membersQuery = useMembers({
+  role: 'SELLER',
+  search: debouncedSearch || undefined,  // 빈 문자열은 undefined로 → 초기 20명 fetch
+  page: 1,
+  limit: 20,
+});
+```
+
+UI 패턴:
+- **선택 전**: 검색 input + absolute dropdown (외부 클릭 시 닫기 — useRef + mousedown)
+- **선택 후**: `bg-primary-50` 카드 + 이름(회사명) 표시 + "변경" 버튼 → 다시 검색 모드 복귀
+
+**판매자 변경 시 항목 초기화 — `useRef` 기반 prevId 비교 패턴 권장**:
+모달이 열릴 때 `initialItem`으로 prefill한 첫 항목까지 함께 날리지 않으려면, 단순 `useEffect([sellerId])` 대신 prev/현재 값 비교가 필요하다.
+
+```typescript
+const prevSellerIdRef = useRef<string>('');
+useEffect(() => {
+  if (!isOpen) return;
+  if (prevSellerIdRef.current && prevSellerIdRef.current !== sellerId) {
+    setItems([{ ...emptyItem }]);  // 사용자가 판매자를 "변경"한 경우에만 초기화
+  }
+  prevSellerIdRef.current = sellerId;
+}, [sellerId, isOpen]);
+```
+
+**Props**: `initialSellerId?`, `initialSellerName?` (라벨 즉시 표시용), `initialItem?: { product_id; quantity?; unit_price? }` 로 상품 카드 → 견적 모달 prefill 흐름 지원.
+
+상품 select는 그대로 `useProducts({ seller_id: sellerId, limit: 200 })` 사용. seller_id 단수 컬럼이므로 다른 SELLER 상품 섞기 자연 차단.
+
+#### browse 페이지 — 문의(채팅) + 견적 요청(모달) 분리 (검증됨)
+
+상품 카드 액션을 두 버튼으로 분리하여 의도를 명확히 구분.
+- `[문의]` (MessageCircle, outline 스타일): 채팅방 생성 + `[상품 문의]` 시스템 메시지 + `/buyer/chat?room_id=...` 라우팅
+- `[견적 요청]` (FileText, primary 스타일): `CreateOrderModal` 오픈 (해당 상품을 첫 항목에 prefill)
+
+```tsx
+const [orderModalProduct, setOrderModalProduct] = useState<Product | null>(null);
+
+<CreateOrderModal
+  isOpen={!!orderModalProduct}
+  onClose={() => setOrderModalProduct(null)}
+  initialSellerId={orderModalProduct?.seller_id}
+  initialItem={
+    orderModalProduct
+      ? { product_id: orderModalProduct.id, quantity: 1, unit_price: orderModalProduct.price_per_unit }
+      : undefined
+  }
+/>
+```
+
+이전 패턴(견적 요청 = 채팅방 생성)은 **폐기됨**: 새 주문/견적 시스템과 연결되지 않아 결제/협상 흐름을 못 탔다. 채팅 흐름은 `[문의]`로 흡수.
+
+---
+
+#### 거래처(Partner) V1 UI 패턴 (검증됨, 2026-04-27)
+
+거래처 페이지(seller/buyer)와 회원 검색 페이지(seller/buyer)에 거래처 등록 흐름이 통합되어 있다. **seller/buyer byte-identical** 패턴 — 두 역할의 페이지는 myRole 값과 라우트 prefix 만 다르고 컴포넌트 구조/UI 전부 동일하다.
+
+##### usePartners 훅 확장 (`hooks/usePartners.ts`)
+
+```typescript
+// 즐겨찾기 토글 — 내부적으로 PATCH /partners/{id} { is_favorite }
+export function useTogglePartnerFavorite() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, is_favorite }: { id: string; is_favorite: boolean }) =>
+      api.patch<SuccessResponse<Partner>>(`/partners/${id}`, { is_favorite }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['partners'] }),
+  });
+}
+
+// 회원 검색 페이지에서 "이미 거래처" 표시용 — usePartners() 와 동일 queryKey 캐시 공유
+export function usePartnerUserIdSet(): Set<string> {
+  const { data } = usePartners();
+  return useMemo(
+    () => new Set((data?.data ?? []).map((p) => p.partner_user_id)),
+    [data]
+  );
+}
+```
+
+`usePartnerUserIdSet()` 은 인자 없이 `usePartners()` 를 호출 → `queryKey: ['partners', undefined]` 가 거래처 페이지의 `['partners', { partner_status, search }]` 와 다른 캐시이지만, 거래처 추가/삭제 시 `invalidateQueries({ queryKey: ['partners'] })` 가 둘 다 무효화하므로 일관성이 유지된다. **즉시 동기화**: 회원 검색 페이지에서 "거래처 추가" → React Query mutation onSuccess → invalidate → 같은 페이지의 partnerUserIdSet 도 자동 refetch → 카드가 즉시 "거래처 등록됨" 으로 전환.
+
+##### AddPartnerModal (`components/partners/AddPartnerModal.tsx`)
+
+거래처 페이지의 "+ 거래처 추가" 버튼 클릭 시 오픈되는 모달. 검색 input + 결과 리스트 + 카드별 "추가" 버튼 구조. **V1에서는 nickname 입력 생략** — 회사명/이름 그대로 거래처로 등록되며, 별칭 편집 UI 는 V1.5 로 미룸.
+
+Props:
+```typescript
+interface AddPartnerModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  myRole: 'SELLER' | 'BUYER';   // 본인 역할 — 검색은 oppositeRole 만
+}
+```
+
+내부 동작:
+- `oppositeRole = myRole === 'SELLER' ? 'BUYER' : 'SELLER'`
+- 검색은 엔터 또는 검색 버튼 클릭 시에만 트리거 — 입력 디바운스 없이 명시적 트리거 패턴
+- `useMembers({ search, role: oppositeRole })` + 클라이언트 폴백 필터(`m.role === oppositeRole`) — 백엔드 role 필터가 미반영 시 안전장치
+- `usePartnerUserIdSet()` 으로 이미 거래처면 "거래처 등록됨" 뱃지로 대체 (버튼 숨김)
+- 추가 성공 → React Query invalidate → 그 자리에서 즉시 뱃지로 전환 (모달 자체는 사용자가 닫을 때까지 유지)
+
+##### 회원 검색 페이지 — MemberCard 거래처 버튼
+
+`app/(dashboard)/{seller,buyer}/members/page.tsx` MemberCard 컴포넌트:
+- props 에 `myRole`, `isPartner`, `isAddingPartner`, `onAddPartner` 추가
+- `canAddPartner = member.role !== myRole && member.role !== 'ADMIN'` — 본인과 같은 역할 또는 ADMIN 인 경우 거래처 추가 버튼 숨김
+- 채팅하기 버튼 위에 "거래처 추가" 버튼 배치 (outline primary 스타일)
+- 이미 거래처면 회색 "거래처 등록됨" 뱃지로 대체
+
+페이지 레벨 상태:
+```typescript
+const [addingPartnerId, setAddingPartnerId] = useState<string | null>(null);
+const createPartner = useCreatePartner();
+const partnerUserIdSet = usePartnerUserIdSet();
+
+const handleAddPartner = (userId: string) => {
+  if (addingPartnerId || partnerUserIdSet.has(userId)) return;
+  setAddingPartnerId(userId);
+  createPartner.mutate({ partner_user_id: userId }, {
+    onSettled: () => setAddingPartnerId(null),
+  });
+};
+```
+
+##### 거래처 페이지 — 즐겨찾기 우선 정렬 + 빠른 액션
+
+`app/(dashboard)/{seller,buyer}/partners/page.tsx` 핵심:
+
+1. **서버 사이드 필터로 통일** — 이전 buyer 페이지는 클라이언트 필터링이었으나 seller 와 동일하게 `usePartners({ partner_status, search })` 패턴으로 일치시킴
+2. **즐겨찾기 우선 정렬** — `is_favorite desc → created_at desc`:
+   ```typescript
+   const sortedPartners = [...partners].sort((a, b) => {
+     if (a.is_favorite !== b.is_favorite) return a.is_favorite ? -1 : 1;
+     return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+   });
+   ```
+3. **PageHeader action 슬롯에 "+ 거래처 추가" 버튼** → `AddPartnerModal` 오픈
+4. **빠른 액션 컬럼** — 행 우측에 채팅/주문 버튼:
+   - 채팅: `useCreateChatRoom({ partner_user_id })` → `/{role}/chat?room_id=${res.data.id}` 라우팅
+   - 주문 작성:
+     - **buyer**: `/buyer/browse?seller_id=${partner_user_id}` 로 라우팅 (browse 페이지가 sellerFilter state 로 받아 useProducts 의 seller_id 인자에 전달)
+     - **seller**: `/seller/orders/new` 페이지가 V1 에 존재하지 않음 → `showCreateOrderAction = false` 로 버튼 숨김 (V1.5 에서 추가 예정)
+
+##### buyer/browse 페이지 — ?seller_id 쿼리 처리
+
+`useSearchParams()` + state 동기화로 처리:
+```typescript
+const searchParams = useSearchParams();
+const [sellerFilter, setSellerFilter] = useState<string | null>(null);
+
+useEffect(() => {
+  setSellerFilter(searchParams.get('seller_id'));
+}, [searchParams]);
+
+const { data } = useProducts({
+  // 기존 필터들 ...
+  seller_id: sellerFilter || undefined,
+});
+
+const clearSellerFilter = () => {
+  setSellerFilter(null);
+  router.replace('/buyer/browse');
+};
+```
+
+`useProducts` 훅은 이미 `seller_id` 필터를 받고 백엔드 `GET /products` 도 이를 지원하므로 추가 변경 불필요. URL 에 `?seller_id=...` 가 있을 때 페이지 상단에 primary-50 배너로 "특정 거래처의 상품만 표시 중입니다 / [전체 보기]" 표시.
+
+##### 빠른 액션 라우팅 매트릭스
+
+| 위치 | 채팅 시작 | 주문 작성 |
+|------|---------|---------|
+| seller/partners | `/seller/chat?room_id=${id}` | **숨김** (V1) |
+| buyer/partners | `/buyer/chat?room_id=${id}` | `/buyer/browse?seller_id=${id}` |
+
+---
+
+#### 정기배송(Subscription) V1.5 Phase 2 UI 패턴 (검증됨, 2026-04-27)
+
+거래처 행 클릭 시 `PartnerDetailModal` 이 열리고, 그 안에서 정기배송 목록/생성/일시정지/주문 즉시 생성 등 모든 액션을 처리한다. seller/buyer **byte-identical** 페이지 구조 유지.
+
+##### 백엔드 응답 컬럼 추가
+- `OrderResponse.subscription_id: Optional[UUID]` / `subscription_round: Optional[int]` 추가 — 일반 주문은 None, 정기배송 자동 생성 주문은 값 채워짐. 프론트 `Order` 타입에도 동일 필드를 옵셔널로 추가.
+
+##### 신규 타입/훅 정리
+- `types/subscription.ts`: `Subscription`, `SubscriptionItem`, `SubscriptionItemCreate`, `SubscriptionCreate`, `SubscriptionUpdate`, `SubscriptionFrequency`, `SubscriptionStatus`, `PartnerStats` (PartnerStats도 같은 파일에 둠 — 다른 도메인에서 import 일관성 위해)
+- `hooks/useSubscriptions.ts`: `useSubscriptions(filters)`, `useSubscription(id)`, `useCreateSubscription`, `useUpdateSubscription(id)`, `useDeleteSubscription`, `useGenerateSubscriptionOrder`
+- `hooks/usePartners.ts`에 `usePartnerStats(partnerId)` 추가
+- 모든 정기배송 mutation은 `onSuccess`에서 `['subscriptions']` + `['partner-stats']` (해당하는 경우 `['orders']`/`['calendar']`까지) invalidate
+
+##### Modal `xl` size 추가
+`Modal.tsx`에 `size: 'xl'` (max-w-3xl) 옵션을 추가. 큰 상세 모달(PartnerDetailModal, SubscriptionFormModal)에서 사용. 기존 `'sm' | 'md' | 'lg'`는 그대로 유지.
+
+##### PartnerDetailModal 구조 (`components/partners/PartnerDetailModal.tsx`)
+- **Props**: `partner: Partner | null`, `myRole: 'SELLER' | 'BUYER'`, `onClose: () => void`
+- `partner === null` 처리: `<Modal isOpen={false} ...>` 빈 모달 반환 (hooks 호출 순서 보장)
+- 섹션 구성: 헤더(즐겨찾기/상태/빠른액션) → 프로필 → 별칭+메모 인라인 편집 → 거래 통계 4타일 → 정기배송 목록 → 푸터(닫기)
+- **인라인 편집 패턴**: 클릭 시 `editingNickname`/`editingNotes` state 토글 → `<input autoFocus>`/`<textarea autoFocus>` → `onBlur`/`Enter`로 `useUpdatePartner.mutate({ id, data: { nickname/notes } })`. 미변경 시 mutate 스킵. Esc로 취소.
+- **정기배송 목록 패턴**: 펼침/접힘 토글 (`expandedSubId` state). 펼친 영역에 시작/종료일, 배송지, 메모, 항목 리스트, 액션 버튼(주문 생성/일시정지·재개/삭제) 노출.
+- **selectedPartner 동기화**: 부모 페이지(seller/buyer partners)에서 `useEffect`로 partners 갱신 시 `selectedPartner`도 최신 row로 동기화 — 별칭/즐겨찾기 PATCH 후 모달이 stale 데이터 보여주지 않도록.
+
+```typescript
+// seller|buyer partners 페이지
+useEffect(() => {
+  if (!selectedPartner) return;
+  const fresh = partners.find((p) => p.id === selectedPartner.id);
+  if (fresh && fresh !== selectedPartner) setSelectedPartner(fresh);
+  if (!fresh) setSelectedPartner(null);  // 삭제된 경우
+}, [partners, selectedPartner]);
+```
+
+##### SubscriptionFormModal (`components/subscriptions/SubscriptionFormModal.tsx`)
+- **Props**: `isOpen`, `onClose`, `partner: Partner`, `myRole: 'SELLER' | 'BUYER'`
+- 주기(WEEKLY/BIWEEKLY/MONTHLY) → 요일 또는 결제일(1~31) → 시작일/종료일 → 납품 주소/메모 → 상품 라인 (다중)
+- **상품 검색은 myRole에 따라 seller_id 분기**:
+  ```typescript
+  // SELLER가 만들 때: 본인(partner.user_id) 상품
+  // BUYER가 만들 때:  거래처 판매자(partner.partner_user_id) 상품
+  const sellerIdForProducts =
+    myRole === 'SELLER' ? partner.user_id : partner.partner_user_id;
+  useProducts({ seller_id: sellerIdForProducts, limit: 200 });
+  ```
+- **seller_id/buyer_id 매핑**:
+  ```typescript
+  const seller_id = myRole === 'SELLER' ? partner.user_id : partner.partner_user_id;
+  const buyer_id  = myRole === 'BUYER'  ? partner.user_id : partner.partner_user_id;
+  ```
+- 검증: 모든 항목 product_id 선택, quantity ≥ 1, unit_price ≥ 0, start_date ≥ today, end_date ≥ start_date, MONTHLY는 day_of_month 1~31, WEEKLY/BIWEEKLY는 day_of_week 0~6
+- 날짜는 timezone-safe 문자열 조합 — `defaultStartDate()`는 오늘+7일을 `YYYY-MM-DD` 로 직접 생성 (ISO 변환 금지)
+
+##### EventType 'SUBSCRIPTION' 추가 — 캘린더 가상 이벤트
+`types/calendar.ts`의 `EventType` union에 `'SUBSCRIPTION'` 추가. 단 **백엔드는 이 값을 송출하지 않음** — 프론트에서만 `useSubscriptions({ status: 'ACTIVE' })`의 결과로부터 향후 3개월(약 12회) 분량의 가상 이벤트를 합성한다.
+
+```typescript
+// seller|buyer/calendar/page.tsx
+const subscriptionVirtualEvents: CalendarEvent[] = useMemo(() => {
+  const events: CalendarEvent[] = [];
+  const now = new Date();
+  const horizon = new Date(now.getFullYear(), now.getMonth() + 3, 0);
+
+  for (const sub of activeSubs) {
+    const cur = new Date(sub.next_delivery_date);
+    let round = 1;
+    while (cur <= horizon && round <= 50) {
+      events.push({
+        id: `sub-virtual-${sub.id}-${round}`,
+        user_id: '', order_id: null,
+        title: '정기배송 예정',
+        event_type: 'SUBSCRIPTION',
+        event_date: `${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`,
+        start_time: null, end_time: null,
+        description: `정기배송 ${round}회차 — ${sub.items[0]?.product_name ?? '상품'}`,
+        is_allday: true, created_at: '',
+        order_number: null,
+        product_name: sub.items[0]?.product_name ?? '정기배송',
+        order_status: null,
+      });
+      // 다음 회차 계산 — 백엔드 compute_next_date 와 동일 로직
+      if (sub.frequency === 'WEEKLY') cur.setDate(cur.getDate() + 7);
+      else if (sub.frequency === 'BIWEEKLY') cur.setDate(cur.getDate() + 14);
+      else if (sub.frequency === 'MONTHLY') {
+        cur.setMonth(cur.getMonth() + 1);
+        if (sub.day_of_month) {
+          const lastDay = new Date(cur.getFullYear(), cur.getMonth()+1, 0).getDate();
+          cur.setDate(Math.min(sub.day_of_month, lastDay));
+        }
+      }
+      round += 1;
+    }
+  }
+  return events;
+}, [activeSubs]);
+
+const visibleMonthEvents = useMemo(() => [...baseMonthEvents, ...subscriptionVirtualEvents], ...);
+const visibleAllEvents   = useMemo(() => [...baseAllEvents,   ...subscriptionVirtualEvents], ...);
+```
+
+`constants/status.ts`의 `EVENT_TYPE_COLOR_CLASS` / `EVENT_TYPE_LABEL`에 `SUBSCRIPTION: 'bg-purple-400'` / `'정기배송'` 추가. 일정 추가 모달의 `EVENT_TYPE_OPTIONS`에는 추가하지 **않음** (사용자가 수동 등록할 수 없는 가상 타입).
+
+##### EventDetailModal — 가상 이벤트 삭제 버튼 숨김 (함정)
+`event.id`가 `'sub-virtual-'` 로 시작하거나 `event_type === 'SUBSCRIPTION'` 인 경우 DB row가 없으므로 `useDeleteCalendarEvent.mutate(event.id)`가 404를 던진다. 푸터의 삭제 버튼을 조건부로 숨겨야 한다.
+
+```tsx
+const isVirtual = event.event_type === 'SUBSCRIPTION' || event.id.startsWith('sub-virtual-');
+
+footer={
+  <>
+    {!isVirtual && <button onClick={handleDelete}>...삭제...</button>}
+    <button onClick={onClose}>닫기</button>
+  </>
+}
+```
+
+##### 정기배송 출처 뱃지 — 주문/견적 페이지
+`Order.subscription_id`가 있으면 상품 컬럼에 보라색 pill `정기 N회차`(N = `subscription_round`) 표시. 상세 슬라이드 헤더에도 같은 뱃지를 주문번호 아래에 노출.
+
+```tsx
+{item.subscription_id && (
+  <span className="inline-flex flex-shrink-0 items-center rounded-full bg-purple-100 px-1.5 py-0.5 text-[10px] font-medium text-purple-700">
+    정기 {item.subscription_round ?? '?'}회차
+  </span>
+)}
+```
+
+##### 빠른 액션 라우팅 매트릭스 (V1.5 갱신)
+
+| 위치 | 채팅 시작 | 주문 작성 |
+|------|---------|---------|
+| seller/partners 행 | (모달 안 버튼) `/seller/chat?room_id=${id}` | **숨김** (V1.5도 미존재) |
+| buyer/partners 행 | (모달 안 버튼) `/buyer/chat?room_id=${id}` | (모달 안 버튼) `/buyer/browse?seller_id=${id}` |
+| 거래처 행 자체 | 클릭 시 `PartnerDetailModal` 오픈 | — |
+
+#### 거래처 V1.5 Phase 3 — 즐겨찾기 필터 + 삭제 (검증됨, 2026-04-27)
+
+##### 즐겨찾기만 토글 — 클라이언트 필터링 (백엔드 미지원 함정)
+
+백엔드 `partner_service.list_partners` 는 현재 `is_favorite` 파라미터를 받지 않는다. `?is_favorite=true` 를 쿼리에 추가해도 무시되므로 **클라이언트 사이드에서 필터링**한다 (V1.6 정도에 백엔드 지원 추가 가능).
+
+```tsx
+// seller|buyer/partners/page.tsx
+const [favoriteOnly, setFavoriteOnly] = useState(false);
+
+// 정렬은 항상 동일 — is_favorite desc → created_at desc
+const sortedPartners = useMemo(
+  () => [...partners].sort((a, b) => {
+    if (a.is_favorite !== b.is_favorite) return a.is_favorite ? -1 : 1;
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  }),
+  [partners]
+);
+
+// favoriteOnly === true 인 경우만 필터 적용
+const visiblePartners = useMemo(
+  () => favoriteOnly ? sortedPartners.filter((p) => p.is_favorite) : sortedPartners,
+  [sortedPartners, favoriteOnly]
+);
+```
+
+토글 버튼 스타일 — 활성/비활성 색상 명세:
+```tsx
+className={`mb-4 inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+  favoriteOnly
+    ? 'border-yellow-300 bg-yellow-50 text-yellow-600'
+    : 'border-gray-200 bg-white text-gray-500 hover:bg-gray-50'
+}`}
+```
+
+`SearchFilterBar` 가 자체 `mb-4` 를 갖고 있어 토글 버튼도 동일 `mb-4` 를 줘야 baseline 정렬이 맞는다. 컨테이너는 `flex flex-wrap items-center gap-3` + 검색 박스에 `flex-1 min-w-[240px]` 을 주어 좁은 화면에서 토글이 다음 줄로 떨어지도록.
+
+##### 거래처 삭제 — 활성 정기배송 PAUSED 일괄 처리 후 soft-delete
+
+거래처 soft-delete 시 연결된 활성 정기배송이 그대로 남아 다음 회차에 주문이 자동 생성되면 안 된다. **삭제 전에 그 거래처와 연결된 ACTIVE 정기배송을 모두 PAUSED 로 전환** (데이터 보존 위해 정기배송 자체는 삭제하지 않음).
+
+```typescript
+// seller|buyer/partners/page.tsx
+const subData = useSubscriptions({ status: 'ACTIVE', limit: 200 });
+const updateSubscription = useUpdateSubscriptionGeneric();
+const deletePartner = useDeletePartner();
+
+const handleDeletePartner = async (partner: Partner) => {
+  if (deletePendingId) return;
+  const confirmed = window.confirm(
+    `'${partner.nickname || partner.partner_company || partner.partner_name || ''}' 거래처를 삭제하시겠습니까?\n진행 중인 정기배송이 일시정지됩니다.`
+  );
+  if (!confirmed) return;
+
+  setDeletePendingId(partner.id);
+  try {
+    // 1) Subscription.partner_id 로 매칭 (partner_user_id 가 아님 — 함정)
+    const activeSubs = (subData.data?.data ?? []).filter(
+      (s) => s.partner_id === partner.id && s.status === 'ACTIVE'
+    );
+    await Promise.all(
+      activeSubs.map((s) =>
+        updateSubscription.mutateAsync({ id: s.id, data: { status: 'PAUSED' } })
+      )
+    );
+    await deletePartner.mutateAsync(partner.id);
+    setSelectedPartner(null);  // 모달 열려있으면 닫기
+  } catch (e) {
+    console.error('[seller/partners] delete failed:', e);
+    alert('삭제에 실패했습니다. 잠시 후 다시 시도해주세요.');
+  } finally {
+    setDeletePendingId(null);
+  }
+};
+```
+
+##### useUpdateSubscriptionGeneric — 동적 id 일괄 처리용 훅 (검증됨)
+
+기존 `useUpdateSubscription(id)` 는 컴포넌트 마운트 시점에 id 가 고정되어야 하므로 `Promise.all` 로 여러 정기배송을 한꺼번에 update 할 수 없다. 이 한계 때문에 `hooks/useSubscriptions.ts` 에 일반화된 변형을 추가:
+
+```typescript
+export function useUpdateSubscriptionGeneric() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, data }: { id: string; data: SubscriptionUpdate }) =>
+      api.patch<SuccessResponse<Subscription>>(`/subscriptions/${id}`, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['subscriptions'] });
+      qc.invalidateQueries({ queryKey: ['partner-stats'] });
+    },
+  });
+}
+```
+
+`mutateAsync({ id, data })` 형태로 호출 → 거래처 삭제 시 활성 정기배송 일괄 PAUSED 같은 시나리오에 사용. 단건 update 는 기존 `useUpdateSubscription(id)` 그대로 유지.
+
+##### 삭제 UI — 행 액션 + 모달 양쪽
+
+거래처 행 액션 영역 (DataTable column) + `PartnerDetailModal` 헤더 빠른액션 영역 양쪽에 삭제 버튼 노출. 핸들러는 페이지 컨테이너에 한 번만 정의하고 모달에는 props 로 위임 (`onDelete?: (partner: Partner) => void`, `deletePending?: boolean`).
+
+```tsx
+// 행 액션 — 작은 빨간 hover Trash2 아이콘만
+<button
+  onClick={(e) => { e.stopPropagation(); handleDeletePartner(item); }}
+  disabled={deletePendingId === item.id || !!deletePendingId}
+  className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-400 hover:border-red-300 hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
+>
+  <Trash2 className="h-3.5 w-3.5" />
+</button>
+
+// 모달 헤더 — 라벨 포함 빨간 outline 버튼
+{onDelete && (
+  <button
+    onClick={() => onDelete(partner)}
+    disabled={deletePending}
+    className="inline-flex items-center gap-1 rounded-lg border border-red-300 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
+  >
+    <Trash2 className="h-3.5 w-3.5" />
+    거래처 삭제
+  </button>
+)}
+```
+
+`onDelete` 가 없으면 모달에 삭제 버튼이 노출되지 않음 — 호출처(거래처 페이지)에서만 삭제 가능. 다른 컨텍스트에서 모달이 재사용될 때 안전하게 동작.
+
+##### 확인 다이얼로그 — `window.confirm` (공통 ConfirmDialog 부재)
+
+`components/common/` 에 ConfirmDialog 가 없으므로 (Modal/AuthGuard/CancelOrderModal 등만 존재) `window.confirm` 으로 처리. 메시지에 `\n` 으로 줄바꿈 포함.
+
+##### byte-identical 유지 규칙
+
+seller/buyer 양쪽 page.tsx 의 차이는 다음으로만 한정 (diff 검증):
+- 컴포넌트명 (`SellerPartnersPage` vs `BuyerPartnersPage`)
+- 채팅 라우트 (`/seller/chat` vs `/buyer/chat`)
+- 주문 작성 라우트 (`/seller/orders/new?buyer_id=` vs `/buyer/browse?seller_id=`)
+- `showCreateOrderAction` (false vs true)
+- log prefix (`[seller/partners]` vs `[buyer/partners]`)
+- copy (`바이어 거래처` vs `공급처`, 검색 placeholder)
+- `myRole` ('SELLER' vs 'BUYER')
+
+즐겨찾기 토글, 삭제 핸들러, useMemo 정렬 로직 등은 양쪽 완전히 동일.
+
+---
+
+#### V1.6 — 거래처/정기배송 양방향 승인 UI (검증됨, 2026-04-27)
+
+##### 거래처 PartnerStatus 확장
+
+`PartnerStatus` union 에 `PENDING_OUTGOING` / `PENDING_INCOMING` 추가. `PENDING` 은 V1.5 이전 데이터 호환용으로 deprecated 상태로 유지.
+
+```typescript
+// types/partner.ts
+export type PartnerStatus =
+  | 'ACTIVE'
+  | 'INACTIVE'
+  | 'PENDING'              // deprecated — 호환만
+  | 'PENDING_OUTGOING'     // 본인이 보낸 요청
+  | 'PENDING_INCOMING';    // 받은 요청
+```
+
+`PARTNER_STATUS_CONFIG` 의 신규 라벨 컬러:
+- `PENDING_OUTGOING`: `bg-yellow-100 text-yellow-800` 라벨 "보낸 요청"
+- `PENDING_INCOMING`: `bg-blue-100 text-blue-800` 라벨 "받은 요청"
+
+##### usePartnerStatusMap — 회원 검색 카드 분기용 (Set → Map)
+
+기존 `usePartnerUserIdSet()` 은 "이미 거래처인가" 까지만 알 수 있었으나, 4종 분기 UI 가 필요해져 `Map<partner_user_id, PartnerStatus>` 로 확장.
+
+```typescript
+// hooks/usePartners.ts
+export function usePartnerStatusMap(): Map<string, PartnerStatus> {
+  const { data } = usePartners();   // status 인자 없이 호출 → 백엔드 list_partners 가 모든 상태 반환
+  return useMemo(() => {
+    const m = new Map<string, PartnerStatus>();
+    for (const p of data?.data ?? []) m.set(p.partner_user_id, p.status);
+    return m;
+  }, [data]);
+}
+```
+
+**백엔드 list_partners 동작 확인**: `partner_service.list_partners` 는 `status` 인자 미전송 시 `if status: query = query.eq("status", status)` 분기를 타지 않아 모든 상태(ACTIVE/INACTIVE/PENDING_*)를 반환. 별도 백엔드 수정 불필요.
+
+기존 `usePartnerUserIdSet()` 은 호환 유지(AddPartnerModal 등 사용). 새로운 분기 UI 는 `usePartnerStatusMap()` + `partnerIdByUserId` Map 조합으로 처리.
+
+##### 회원 검색 카드 — 4종 분기 UI
+
+```tsx
+{/* ACTIVE / PENDING (deprecated) → 거래처 등록됨 (회색, Check 아이콘) */}
+{(partnerStatus === 'ACTIVE' || partnerStatus === 'PENDING') && (
+  <span className="bg-gray-100 text-gray-500">거래처 등록됨</span>
+)}
+{/* PENDING_OUTGOING → 보낸 요청 (노란색, Clock 아이콘, 비활성) */}
+{partnerStatus === 'PENDING_OUTGOING' && (
+  <span className="bg-yellow-50 border border-yellow-200 text-yellow-700">요청 보냄</span>
+)}
+{/* PENDING_INCOMING → 수락 버튼 (파란색, Inbox 아이콘) */}
+{partnerStatus === 'PENDING_INCOMING' && partnerId && (
+  <button onClick={() => onAcceptPartner(partnerId)} className="bg-blue-600 text-white">
+    요청 받음 — 수락
+  </button>
+)}
+{/* (없음) 또는 INACTIVE → 거래처 추가 (primary outline, UserPlus 아이콘) */}
+```
+
+PENDING_INCOMING 카드의 수락 버튼은 회원 user_id 가 아닌 **partner row id** 를 사용한다 — `useAcceptPartner.mutate(partnerId)`. 회원 카드 컴포넌트에서는 `partnerIdByUserId.get(member.id)` 로 partner.id 매핑.
+
+##### 거래처 페이지 상단 — 받은 요청 / 보낸 요청 섹션
+
+```tsx
+// 본인 row.status 기준으로 3분류
+const incomingRequests = partners.filter((p) => p.status === 'PENDING_INCOMING');
+const outgoingRequests = partners.filter((p) => p.status === 'PENDING_OUTGOING');
+const mainListPartners = partners.filter(
+  (p) => p.status !== 'PENDING_OUTGOING' && p.status !== 'PENDING_INCOMING'
+);
+```
+
+- 받은 요청 섹션: `bg-blue-50 border border-blue-200 rounded-xl`. 각 행에 [수락] [거절] 버튼.
+- 보낸 요청 섹션: `bg-yellow-50 border border-yellow-200 rounded-xl`. "수락 대기 중" 텍스트 + [요청 회수] 버튼 (window.confirm 후 reject 호출).
+- 메인 데이터 테이블은 `mainListPartners` 만 노출 — PENDING_OUTGOING/INCOMING 은 상단 섹션에서만.
+
+`useAcceptPartner` / `useRejectPartner` 훅은 mutation 성공 시 `['partners']` 만 invalidate. accept 는 양쪽 row 가 ACTIVE 로 전환되므로 자동으로 메인 리스트에 등장.
+
+##### 정기배송 SubscriptionStatus 확장
+
+```typescript
+// types/subscription.ts
+export type SubscriptionStatus =
+  | 'PENDING'    // V1.6 신규 — 생성 직후 상대 수락 대기
+  | 'ACTIVE'
+  | 'PAUSED'
+  | 'ENDED'
+  | 'CANCELLED'
+  | 'REJECTED';  // V1.6 신규 — 상대가 거절
+
+export interface Subscription {
+  // ...기존
+  created_by: string | null;  // V1.6 — 정기배송을 만든 사용자 (수락 권한 판단용)
+}
+```
+
+##### SUBSCRIPTION_STATUS_CONFIG — 신규 통합 색 매핑
+
+`constants/status.ts` 에 추가:
+
+```typescript
+export const SUBSCRIPTION_STATUS_CONFIG = {
+  PENDING:   { label: '승인 대기', className: 'bg-amber-100 text-amber-800',   solidClassName: 'bg-amber-500' },
+  ACTIVE:    { label: '진행중',    className: 'bg-purple-100 text-purple-800', solidClassName: 'bg-purple-500' },
+  PAUSED:    { label: '일시정지',  className: 'bg-gray-100 text-gray-700',     solidClassName: 'bg-gray-500' },
+  ENDED:     { label: '종료',      className: 'bg-slate-100 text-slate-700',   solidClassName: 'bg-slate-500' },
+  CANCELLED: { label: '취소',      className: 'bg-red-100 text-red-700',       solidClassName: 'bg-red-500' },
+  REJECTED:  { label: '거절',      className: 'bg-rose-100 text-rose-700',     solidClassName: 'bg-rose-500' },
+} as const satisfies Record<SubscriptionStatus, SubscriptionStatusConfig>;
+```
+
+캘린더 가상 이벤트 색은 `EVENT_TYPE_COLOR_CLASS.SUBSCRIPTION` 도 `bg-purple-500` 으로 통일 — ACTIVE 정기배송 색과 일치(과거 `bg-purple-400` 은 약해 보였음).
+
+##### PartnerDetailModal — 정기배송 분류 (받은 요청 / 보낸 요청 / 메인)
+
+```typescript
+import { useAuthStore } from '@/store/authStore';
+const { user } = useAuthStore();
+const currentUserId = user?.id ?? '';
+
+// 받은 요청: PENDING + created_by != currentUser (NULL 아닐 때만)
+const incomingPendingSubs = subscriptions.filter(
+  (s) => s.status === 'PENDING' && s.created_by !== null && s.created_by !== currentUserId
+);
+// 보낸 요청: PENDING + created_by == currentUser (또는 NULL — V1.5 이전 데이터)
+const outgoingPendingSubs = subscriptions.filter(
+  (s) => s.status === 'PENDING' && (s.created_by === null || s.created_by === currentUserId)
+);
+// 메인: PENDING 외 모든 상태
+const mainListSubs = subscriptions.filter((s) => s.status !== 'PENDING');
+```
+
+훅: `useAcceptSubscription` / `useRejectSubscription`. Accept 시 `['subscriptions', 'partner-stats', 'calendar']` 모두 invalidate — ACTIVE 전환 후 캘린더 가상 이벤트가 즉시 등장하도록.
+
+##### 주문/견적 페이지 — "정기배송" 탭 (TabDef + isSubTab 분기)
+
+```typescript
+interface TabDef {
+  key: string;
+  label: string;
+  statuses?: OrderStatus[];     // 일반 주문 탭
+  isSubscription?: boolean;     // 정기배송 탭이면 true
+}
+
+const tabs: TabDef[] = [
+  { key: 'pending', label: '견적/진행', statuses: [...] },
+  { key: 'shipping', label: '배송중', statuses: ['SHIPPING'] },
+  { key: 'done', label: '완료/취소', statuses: ['COMPLETED', 'CANCELLED'] },
+  { key: 'subscription', label: '정기배송', isSubscription: true },   // 신규
+];
+
+const activeTabDef = tabs.find((t) => t.key === activeTab);
+const isSubTab = !!activeTabDef?.isSubscription;
+```
+
+데이터 fetch 분기:
+```typescript
+// 일반 주문 — 정기배송 탭이면 status_in: [] 로 비활성화 (useOrders 가 자동 enabled: false)
+const { data: listData } = useOrders({ status_in: isSubTab ? [] : activeStatuses, limit: 2000 });
+// 정기배송 — 비활성 탭에서는 enabled: false
+const subsData = useSubscriptions({ limit: 2000 }, { enabled: isSubTab });
+```
+
+`useOrders(filters, options?)` / `useSubscriptions(filters, options?)` 모두 `{ enabled?: boolean }` 옵션 추가. `useOrders` 는 추가로 `status_in: []` 을 자동 비활성화 가드(빈 status 배열로 모든 주문이 fetch 되는 사고 방지).
+
+행 컬럼/액션:
+- 컬럼: 상품, 상대방(seller_name 또는 buyer_name), 주기 라벨(매주/격주/매월), 다음 배송일, 회당 금액, 상태 뱃지(`SUBSCRIPTION_STATUS_CONFIG`), 액션
+- 액션 분기:
+  - PENDING + 본인 created_by 아님 → [수락] [거절] 버튼 (`onClick` 에 `e.stopPropagation()` 필수 — 행 클릭 핸들러와 분리)
+  - ACTIVE → [회차 생성] 버튼 (window.confirm 후 useGenerateSubscriptionOrder)
+  - 그 외 → 액션 없음
+- 행 클릭 → 거래처 user_id 매핑 후 `PartnerDetailModal` 오픈 (selectedPartner 상태 사용)
+
+```typescript
+const handleSubRowClick = (sub: Subscription) => {
+  const counterpartUserId = sub.seller_id === currentUserId ? sub.buyer_id : sub.seller_id;
+  const partner = partners.find((p) => p.partner_user_id === counterpartUserId);
+  if (partner) setSelectedPartner(partner);
+  else alert('이 정기배송에 연결된 거래처가 없습니다.');
+};
+```
+
+##### 주문 행 정기배송 출처 뱃지 — 색 통일
+
+기존 `bg-purple-100 text-purple-700` (옅은 보라 + 보라 텍스트) → `bg-purple-500 text-white` 로 통일하여 정기배송 도메인 색(진한 보라)과 일치.
+
+```tsx
+{item.subscription_id && (
+  <span className="inline-flex flex-shrink-0 items-center rounded-full bg-purple-500 px-1.5 py-0.5 text-[10px] font-medium text-white">
+    정기 {item.subscription_round ?? '?'}회차
+  </span>
+)}
+```
+
+상세 슬라이드 헤더의 뱃지도 동일하게 `bg-purple-500 text-white` 로 변경.
+
+##### useOrders / useSubscriptions — enabled 옵션 패턴 (검증됨)
+
+탭 전환 시 비활성 탭의 fetch 를 차단하기 위한 패턴:
+
+```typescript
+// hooks/useOrders.ts
+export function useOrders(filters?: OrderFilters, options?: { enabled?: boolean }) {
+  const isEmptyStatusIn = filters?.status_in !== undefined && filters.status_in.length === 0;
+  const enabled = (options?.enabled ?? true) && !isEmptyStatusIn;
+  return useQuery({ queryKey: ['orders', filters], queryFn: ..., enabled });
+}
+```
+
+`status_in: []` 가 자동으로 enabled=false 를 트리거하므로, 호출처에서는 `useOrders({ status_in: isSubTab ? [] : statuses })` 만 써도 안전. `useSubscriptions` 는 `enabled` 옵션만 명시적으로 전달.
+
+##### byte-identical 유지 — 정기배송 탭 추가 후 (V1.6)
+
+seller/buyer 양쪽 orders/page.tsx 차이는 기존과 동일하게 한정:
+- 컴포넌트명 / 페이지 description / role-specific 컬럼명 (구매자 vs 판매자) / 채팅 라우트 / `myRole` ('SELLER' vs 'BUYER')
+- 정기배송 탭 컬럼은 양쪽이 거의 동일하지만 "구매자" vs "판매자" 라벨과 buyer_name/seller_name 필드만 다름
+- 액션 동작(수락/거절/회차 생성)은 양쪽 동일

@@ -6,6 +6,7 @@ from app.models.partner import Partner
 from app.models.chat import ChatRoom, Message
 from app.models.calendar import CalendarEvent
 from app.models.ai_conversation import AIConversation
+from app.models.negotiation import NegotiationHistory
 
 __all__ = [
     "Base",
@@ -20,4 +21,5 @@ __all__ = [
     "Message",
     "CalendarEvent",
     "AIConversation",
+    "NegotiationHistory",
 ]

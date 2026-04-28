@@ -15,14 +15,19 @@ import SummaryCard from '@/components/common/SummaryCard';
 import StatusBadge from '@/components/common/StatusBadge';
 import { useOrders } from '@/hooks/useOrders';
 import { useProducts } from '@/hooks/useProducts';
+import { useChatRooms } from '@/hooks/useChat';
+import type { ChatRoom } from '@/types';
 
 export default function SellerDashboardPage() {
   const router = useRouter();
   const { data: ordersData } = useOrders({ limit: 5 });
   const { data: lowStockData } = useProducts({ product_status: 'LOW_STOCK' });
+  const { data: roomsData } = useChatRooms();
 
   const orders = ordersData?.data ?? [];
   const lowStockCount = lowStockData?.meta?.total ?? 0;
+  const rooms: ChatRoom[] = roomsData?.data ?? [];
+  const unreadTotal = rooms.reduce((sum, r) => sum + (r.unread_count ?? 0), 0);
 
   const todayShipments = orders.filter(
     (o) => o.status === 'PREPARING' || o.status === 'SHIPPING'
@@ -54,7 +59,7 @@ export default function SellerDashboardPage() {
         />
         <SummaryCard
           title="미확인 채팅"
-          value={0}
+          value={unreadTotal}
           subtitle="읽지 않은 메시지"
           icon={MessageCircle}
           iconColor="text-blue-600 bg-blue-100"

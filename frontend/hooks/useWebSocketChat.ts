@@ -2,9 +2,10 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import type { AlternativePartner, MessageMetadata, MessageType } from '@/types';
 
 export interface WebSocketMessage {
-  type: 'message' | 'error';
+  type: 'message' | 'error' | 'system' | 'alternative_partners_suggestion';
   id?: string;
   room_id?: string;
   sender_id?: string;
@@ -12,7 +13,15 @@ export interface WebSocketMessage {
   is_read?: boolean;
   created_at?: string;
   deleted_at?: string | null;
-  message?: string; // error type일 때
+  // 주문 협상 ↔ 채팅 메시지 타입 / metadata (백엔드 order_service _emit_chat_event 동기화)
+  message_type?: MessageType;
+  metadata?: MessageMetadata | null;
+  // error / alternative_partners_suggestion type 공통: 표시용 메시지
+  message?: string;
+  // alternative_partners_suggestion type 전용:
+  // 백엔드 chat_ws.py _handle_rejected payload 매칭
+  alternatives?: AlternativePartner[];
+  category?: string;
 }
 
 const WS_BASE_URL =
@@ -97,19 +106,25 @@ export function useWebSocketChat(roomId: string | null): {
       }
 
       if (
-        typeof parsed === 'object' &&
-        parsed !== null &&
-        'type' in parsed &&
-        (parsed as { type: unknown }).type === 'message'
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        !('type' in parsed)
       ) {
-        setLastMessage(parsed as WebSocketMessage);
-      } else if (
-        typeof parsed === 'object' &&
-        parsed !== null &&
-        'type' in parsed &&
-        (parsed as { type: unknown }).type === 'error'
-      ) {
-        const errMsg = (parsed as WebSocketMessage).message ?? '알 수 없는 오류가 발생했습니다.';
+        return;
+      }
+
+      const msg = parsed as WebSocketMessage;
+
+      if (msg.type === 'message') {
+        setLastMessage(msg);
+      } else if (msg.type === 'system') {
+        // 시스템 메시지 — lastMessage로 전달해 채팅창에서 스타일 분기 처리
+        setLastMessage(msg);
+      } else if (msg.type === 'alternative_partners_suggestion') {
+        // 대체 거래처 제안 — lastMessage로 전달해 채팅창에서 배너 표시
+        setLastMessage(msg);
+      } else if (msg.type === 'error') {
+        const errMsg = msg.message ?? '알 수 없는 오류가 발생했습니다.';
         setError(errMsg);
       }
     };

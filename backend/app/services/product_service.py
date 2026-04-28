@@ -29,6 +29,8 @@ class ProductService:
         category: Optional[str] = None,
         status: Optional[str] = None,
         search: Optional[str] = None,
+        max_price: Optional[int] = None,
+        min_stock: Optional[int] = None,
         page: int = 1,
         limit: int = 20,
     ) -> tuple[list[dict], PaginationMeta]:
@@ -42,6 +44,10 @@ class ProductService:
             query = query.eq("status", status)
         if search:
             query = query.ilike("name", f"%{search}%")
+        if max_price is not None:
+            query = query.lte("price_per_unit", max_price)
+        if min_stock is not None:
+            query = query.gte("stock_quantity", min_stock)
 
         offset = (page - 1) * limit
         query = query.order("created_at", desc=True).range(offset, offset + limit - 1)

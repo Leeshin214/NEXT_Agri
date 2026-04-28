@@ -348,6 +348,387 @@ ws.onclose = (event) => {
 };
 ```
 
+### WebSocket 다중 탭 send_private_message (검증됨)
+
+`ConnectionManager.active_user_connections` 는 `dict[str, set[WebSocket]]` 로 같은 user_id 가 여러 탭/디바이스로 접속해도 모두에 broadcast 가능하다. `send_private_message` 는 set 의 모든 ws 에 try/except 로 전송하고 끊긴 ws 는 자동 정리한다. 단일 ws 매핑(`dict[str, WebSocket]`)으로 두면 두 번째 탭이 첫 번째 탭의 매핑을 덮어쓰고 첫 번째 탭은 alternative_partners_suggestion 같은 개별 알림을 받지 못한다.
+
+```python
+# connection_manager.py
+self.active_user_connections: dict[str, set[WebSocket]] = {}
+
+async def send_private_message(self, user_id, message):
+    ws_set = self.active_user_connections.get(user_id)
+    if not ws_set:
+        return
+    dead = []
+    for ws in list(ws_set):
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        ws_set.discard(ws)
+```
+
+### 합의 자동 주문 검증 + 멱등성 (검증됨)
+
+`chat_ws.py _handle_consensus` 가 LLM 의 `extracted` 필드를 신뢰하기 전 검증을 모두 통과해야 `create_order` 진입한다:
+1. `product`: 비어있지 않은 문자열
+2. `quantity`: int > 0 AND ≤ `_MAX_QUANTITY`(10_000_000) — LLM 환각/오타 비현실적 큰 값 차단 (Postgres int4 max 보호)
+3. `price_per_unit`: int > 0 AND ≤ `_MAX_PRICE_PER_UNIT`(100_000_000원/단위)
+4. `delivery_date`: `date.fromisoformat(...)` 파싱 가능 + 오늘 이후
+
+검증 실패 시 `[SYSTEM]` 메시지를 messages 테이블에 INSERT 하고 broadcast: `"⚠️ AI가 합의를 감지했지만 주문 정보(수량/단가/납기일)가 불완전해 자동 생성을 보류했습니다. ({reason})"` — 사용자가 무엇이 문제인지 알 수 있도록 reason 포함.
+
+멱등성 다층 방어:
+1. **signature 비교** (`_handle_consensus` 진입 직후) — `f"{buyer_id}|{seller_id}|{product}|{delivery_date}"` 가 직전 처리된 합의와 동일하면 즉시 skip (False 반환). 같은 채팅방에서 다른 거래 합의는 정상 처리.
+2. **DB 중복 주문 확인** (`_check_recent_duplicate_order`) — 동일 (buyer_id, seller_id, product_id, delivery_date) 조합 주문이 최근 1시간 이내 존재하면 skip + 시스템 메시지.
+3. **낙관적 락** (C-3) — `_handle_consensus` 진입 전에 `consensus_handled=True` 마킹. 같은 합의에 대한 동시 LLM 호출/시스템 메시지 중복 방지. 검증 실패/예외 시 호출처 try/except 에서 `consensus_handled=False` 로 되돌림.
+
+`should_analyze` 쿨다운 정책:
+- 빈 상태: True
+- `consensus_handled=True` AND elapsed ≤ 60s: False (디바운스 — 같은 거래 즉각 재분석 방지, LLM 비용 절감)
+- `consensus_handled=True` AND 60s < elapsed ≤ 1800s: True (signature 비교는 `_handle_consensus` 가 담당 → 같은 거래는 거기서 skip, 다른 거래는 처리)
+- elapsed > 1800s: 일반 status 분기 (general 60s, negotiating 10s, consensus/rejected 항상 True)
+
+`last_analysis` 는 `cachetools.TTLCache(maxsize=10000, ttl=3600)` 사용 (메모리 누수 방지). cachetools 미설치 시 일반 dict로 fallback.
+
+```python
+# C-3 낙관적 락 패턴 (chat_ws.py)
+if status == "consensus":
+    last_analysis[room_id] = {..., "consensus_handled": True, "consensus_signature": sig}  # lock acquire
+    try:
+        handled = await _handle_consensus(room_id, result)
+        if not handled:
+            last_analysis[room_id] = {..., "consensus_handled": False, ...}  # release on logical fail
+    except Exception:
+        last_analysis[room_id] = {..., "consensus_handled": False, ...}  # release on exception
+```
+
+### 시스템 메시지 DB INSERT (검증됨)
+
+`messages.sender_id` 는 `NOT NULL` 이므로 시스템 메시지도 sender_id 가 필요하다. `chat_service.send_system_message(room_id, content, sender_id)` 가 fallback sender_id (chat_room.seller_id 사용)로 INSERT 하고 content 앞에 `[SYSTEM]` prefix 를 붙여 시스템 메시지임을 표시한다. `is_read=True` 로 설정해 읽음 처리에서 제외한다.
+
+broadcast payload 에는 INSERT 된 message_id 와 created_at 을 포함하여 프론트가 메시지 추적 가능하도록 한다:
+```python
+payload = {"type": "system", "content": ..., "room_id": ..., "id": message_id, "created_at": ...}
+```
+
+### `_broadcast_system_message` sender_id_fallback 가드 (검증됨)
+
+`chat_ws.py _broadcast_system_message(room_id, content, sender_id_fallback)` 의 `sender_id_fallback = seller_id or buyer_id` 가 둘 다 빈 문자열이면 `UUID("")` 변환에서 `ValueError` 가 발생해 DB INSERT 가 무조건 실패한다. messages.sender_id 는 NOT NULL FK 이므로 빈 값으로는 INSERT 불가하다. 두 단계 가드를 적용한다.
+
+```python
+sender_clean = (sender_id_fallback or "").strip()
+if not sender_clean:
+    print(f"[system_msg] sender_id_fallback 비어있음 → DB INSERT skip ...")
+else:
+    try:
+        sender_uuid = UUID(sender_clean)
+    except (ValueError, TypeError) as e:
+        print(f"[system_msg] sender_id_fallback UUID 변환 실패 → DB INSERT skip ...")
+    else:
+        # DB INSERT 진행
+        message = await chat_service.send_system_message(...)
+
+# 어떤 경로든 broadcast 는 항상 시도 (채팅 흐름 우선)
+await manager.broadcast(room_id, payload)
+```
+
+핵심: **DB INSERT skip 시에도 broadcast 는 반드시 진행** — 시스템 메시지 자체는 사용자에게 전달되어야 한다. 단, payload 에 `id`/`created_at` 필드는 빠진다 (프론트가 옵셔널로 처리).
+
+### analyze_chat_consensus 권한 검증 (검증됨)
+
+`analyze_chat_consensus(room_id, last_n_messages, caller_user_id)` 의 `caller_user_id` 가 chat_room 의 buyer_id/seller_id 와 일치하지 않으면 fallback `{"status": "general", ...}` 반환. WebSocket 핸들러에서 caller_user_id 를 항상 전달하도록 `analyze_chat_consensus(room_id, 10, user_id)` 호출.
+
+### 대체 거래처 제안 (alternative_partners_suggestion) 풀 페이로드 패턴 (검증됨)
+
+백엔드 `chat_ws.py _handle_rejected` 가 보내는 payload 전체를 프론트에서 사용한다:
+`{type, message, alternatives: AlternativePartner[], category}`. 단순 배너만 띄우면 dead-data가 된다.
+
+```typescript
+// types/chat.ts — 백엔드 find_alternative_partners alternatives 항목 매칭
+export interface AlternativePartner {
+  user_id: string;
+  name: string;
+  company_name?: string;
+  trade_count?: number;
+  last_trade_date?: string | null;
+  stock_quantity?: number | null;
+  price_per_unit?: number | null;
+  unit?: string;
+  product_name?: string;
+  category?: string;
+  phone?: string;
+  email?: string;
+}
+
+// hooks/useWebSocketChat.ts — WebSocketMessage에 alternatives, category 필드 정의
+import type { AlternativePartner } from '@/types';
+export interface WebSocketMessage {
+  type: 'message' | 'error' | 'system' | 'alternative_partners_suggestion';
+  // ...기존 필드
+  message?: string; // error / suggestion 공통 표시용
+  alternatives?: AlternativePartner[]; // suggestion 전용
+  category?: string;
+}
+```
+
+채팅 페이지 배너:
+- 상단 1~3개 카드 미리보기 (`alternatives.slice(0, 3)`)
+- 각 카드 클릭 → `useCreateChatRoom` 으로 새 채팅방 개설 → `setSelectedRoomId(newRoomId)` + `router.push('/{seller|buyer}/chat?room_id=...')`
+- 우측 X 버튼으로 닫기 (`suggestionDismissed` 로컬 state)
+- 새 suggestion 도착 시 useEffect로 `setSuggestionDismissed(false)` 자동 초기화
+
+```tsx
+// 닫힘 + 새 suggestion 자동 초기화
+const [suggestionDismissed, setSuggestionDismissed] = useState(false);
+useEffect(() => {
+  if (alternativePartnersSuggestion) setSuggestionDismissed(false);
+}, [alternativePartnersSuggestion]);
+const visibleSuggestion = !suggestionDismissed ? alternativePartnersSuggestion : null;
+const previewAlternatives = (visibleSuggestion?.alternatives ?? []).slice(0, 3);
+
+// 클릭 핸들러
+const handleAlternativeClick = async (partner: AlternativePartner) => {
+  if (!partner.user_id || createChatRoom.isPending) return;
+  const res = await createChatRoom.mutateAsync({ partner_user_id: partner.user_id });
+  setSuggestionDismissed(true);
+  router.push(`/seller/chat?room_id=${res.data.id}`);
+  setSelectedRoomId(res.data.id);  // 같은 페이지 내 라우팅이므로 직접 갱신
+};
+```
+
+### open_chat_room 보안 검증 (검증됨)
+
+`agent_tools.open_chat_room(user_id, partner_user_id)` 의 보안 검증은 두 가지만 수행:
+1. self-chat 거부 (`user_id == partner_user_id` → `self_chat_not_allowed`)
+2. partner 존재 + `deleted_at IS NULL` 확인 (없으면 `partner_not_found`)
+
+기존에 있던 24h 5건 throttle (`rate_limited`) 은 dead code 였다 — 기존 방이 항상 `existing.data` 검색에서 잡히므로 동일 (seller, buyer) 페어가 24시간 내 5번씩 새 방을 만드는 시나리오 자체가 발생 불가. 제거함.
+
+### 시스템 메시지 prefix 화이트리스트 패턴 (검증됨)
+
+`msg.content.startsWith('[') && msg.content.includes(']')` 같은 느슨한 매칭은 사용자가 보낸 "[중요]"
+같은 일반 텍스트도 시스템 pill로 잘못 표시한다. `constants/chat.ts` 에 prefix 화이트리스트를 정의해 사용한다.
+
+```typescript
+// constants/chat.ts
+export const SYSTEM_MESSAGE_PREFIXES = ['[견적 요청]', 'AI가', '⚠️', '🤖'] as const;
+export function isSystemMessageContent(content: string): boolean {
+  return SYSTEM_MESSAGE_PREFIXES.some((p) => content.startsWith(p));
+}
+
+// 채팅 페이지에서 — 레거시 호환용 (message_type 없는 옛 메시지)
+import { isSystemMessageContent } from '@/constants/chat';
+const isSystem = isSystemMessageContent(msg.content);
+```
+
+WebSocket `lastMessage.type === 'system'` (실시간 system broadcast)는 별도 분기 — 백엔드 `chat_ws.py` 의
+`{"type":"system", "content":"AI가 거래 합의를 감지하여 ..."}` 는 prefix `AI가` 로 시작하므로
+`useMessagesWithWebSocket` 캐시에 들어가 같은 화이트리스트로 자연스럽게 처리된다.
+
+### 주문 협상 ↔ 채팅 양방향 연결 (검증됨, 2026-04-27)
+
+backend 가 message에 `message_type` + `metadata` 를 함께 broadcast하므로 프론트는 prefix 매칭 없이
+`message_type` 으로 분기 렌더한다. 레거시 호환만 prefix 화이트리스트를 사용한다.
+
+#### 메시지 타입 정의 (types/chat.ts)
+
+```typescript
+export type MessageType =
+  | 'TEXT'
+  | 'SYSTEM'
+  | 'COUNTER_OFFER'
+  | 'OFFER_ACCEPTED'
+  | 'OFFER_REJECTED'
+  | 'ORDER_STATUS'
+  | 'ORDER_CANCELLED';
+
+// metadata 는 message_type별 형태가 다름 — 모든 키 optional
+export interface MessageMetadata {
+  order_id?: string;
+  order_number?: string;
+  total_amount?: number;
+  offer_id?: string;
+  proposed_total_amount?: number;
+  from_role?: 'SELLER' | 'BUYER';
+  notes?: string;
+  status?: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'SUPERSEDED';
+  accepted_amount?: number;
+  from_status?: string;
+  to_status?: string;
+  reason?: string;
+  cancelled_by?: string;
+  [key: string]: unknown;
+}
+
+export interface Message {
+  // ... 기존 필드
+  message_type?: MessageType;
+  metadata?: MessageMetadata | null;
+}
+```
+
+`useWebSocketChat`의 `WebSocketMessage` 인터페이스에도 `message_type`, `metadata` 필드를 추가하고,
+`useMessagesWithWebSocket`의 `incomingMessage` 객체 생성 시 두 필드를 함께 전달해야 캐시에 정상 반영됨.
+
+#### MessageBubble — message_type별 분기 렌더 (components/chat/MessageBubble.tsx)
+
+`switch (type)` 으로 단일 컴포넌트에서 분기. 본인/상대 판별은 **`sender_id === user.id` 우선**
+(metadata.from_role 만으로는 같은 역할 두 사용자 구분 불가).
+
+| type | 렌더 |
+|---|---|
+| `TEXT` | 일반 말풍선 (mine: bg-primary-600 text-white / 상대: bg-gray-100) |
+| `SYSTEM` | 가운데 회색 안내 박스. content의 `[SYSTEM]` prefix 자동 제거. |
+| `COUNTER_OFFER` | amber 강조 카드 + DollarSign 아이콘 + 큰 글씨 amount + status 배지. 상대 PENDING이면 수락/거절 버튼 (useAcceptCounterOffer/useRejectCounterOffer) |
+| `OFFER_ACCEPTED` | 가운데 초록 카드 + Check + "{amount}원에 협상 수락" |
+| `OFFER_REJECTED` | 가운데 회색 카드 + X + "협상가 거절" |
+| `ORDER_STATUS` | 가운데 파란 박스 + Package + StatusBadge from → to |
+| `ORDER_CANCELLED` | 가운데 빨간 카드 + Ban + "주문이 취소됐습니다" + reason |
+
+채팅 페이지에서는 `MessageBubble` 한 줄로 호출 + 레거시 호환 분기:
+```tsx
+{messages.map((msg) => {
+  // 옛 메시지 (message_type 없음) 중 prefix 패턴은 SYSTEM 으로 변환
+  if (!msg.message_type && isSystemMessageContent(msg.content)) {
+    return <MessageBubble key={msg.id} message={{ ...msg, message_type: 'SYSTEM' }} />;
+  }
+  return <MessageBubble key={msg.id} message={msg} />;
+})}
+```
+
+#### useSubmitCounterOfferViaChat 훅 (hooks/useChat.ts)
+
+채팅 입력창의 "가격 제시" 버튼이 호출하는 mutation. 백엔드 `POST /chat/rooms/{room_id}/counter-offer`.
+chat_room.order_id 가 없으면 백엔드가 400 으로 거부 → 호출 측 가드 필요 (PriceOfferPopover 가 disable).
+
+```typescript
+export function useSubmitCounterOfferViaChat(roomId: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: CounterOfferCreate) => {
+      if (!roomId) throw new Error('채팅방이 선택되지 않아 협상가를 제시할 수 없습니다.');
+      return api.post<SuccessResponse<CounterOffer>>(
+        `/chat/rooms/${roomId}/counter-offer`,
+        payload
+      );
+    },
+    onSuccess: (res) => {
+      const orderId = res.data.order_id;
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+      if (orderId) {
+        queryClient.invalidateQueries({ queryKey: ['order', orderId] });
+        queryClient.invalidateQueries({ queryKey: ['negotiation', orderId] });
+      }
+      if (roomId) queryClient.invalidateQueries({ queryKey: ['messages', roomId] });
+      queryClient.invalidateQueries({ queryKey: ['chatRooms'] });
+    },
+  });
+}
+```
+
+#### WS 수신 시 주문/협상 캐시 자동 invalidate
+
+`useMessagesWithWebSocket` 의 useEffect에서 incoming message의 `message_type`이
+`COUNTER_OFFER`/`OFFER_ACCEPTED`/`OFFER_REJECTED`/`ORDER_STATUS`/`ORDER_CANCELLED`/`SYSTEM` 중 하나면
+`['orders']`, `['order', metadata.order_id]`, `['negotiation', metadata.order_id]`,
+**그리고 `['messages', roomId]`** 캐시를 invalidate.
+**같은 사용자가 다른 탭에서 주문 페이지 열어둔 경우 자동 동기화** 효과.
+
+`['messages', roomId]` invalidate 가 반드시 필요한 이유 (검증됨, 2026-04-27):
+백엔드는 협상가 accept/reject/SUPERSEDED 시 같은 `offer_id` 를 가진 **이전** `messages` 행의
+`metadata.status` 도 함께 ACCEPTED/REJECTED/SUPERSEDED 로 동기화한다. 그러나 WebSocket 은
+**새 메시지 INSERT 만** broadcast 하고, **기존 메시지의 metadata UPDATE 는 알리지 않는다**.
+따라서 클라이언트가 messages 쿼리를 다시 fetch 하지 않으면 stale 데이터 (이전 카드 status='PENDING')
+를 그대로 보여주고, MessageBubble 의 수락/거절 버튼이 사라지지 않는다.
+
+```typescript
+if (msgType && ORDER_RELATED_TYPES.includes(msgType)) {
+  // ...orders/order/negotiation invalidate
+  queryClient.invalidateQueries({ queryKey: ['messages', roomId] });  // ← 필수
+}
+```
+
+#### counter-offer mutation onSuccess 에서 broad messages invalidate (검증됨)
+
+`useSubmitCounterOffer` / `useAcceptCounterOffer` / `useRejectCounterOffer` (`useOrders.ts`) 의
+onSuccess 에서도 `['messages']` 를 broad 하게 invalidate 해야 한다. 이 mutation 들은 roomId 를
+모르므로 (`['messages', roomId]` 가 아닌) `['messages']` 로 모든 채팅방 메시지를 함께 무효화한다.
+
+`useSubmitCounterOfferViaChat` (`useChat.ts`) 도 같은 이유로 `['messages', roomId]` 대신
+`['messages']` (broad) 로 변경됨 — 동일 사용자가 다른 채팅방을 열어둔 탭도 함께 갱신.
+
+```typescript
+// hooks/useOrders.ts — 세 mutation 모두
+onSuccess: () => {
+  queryClient.invalidateQueries({ queryKey: ['orders'] });
+  queryClient.invalidateQueries({ queryKey: ['order', orderId] });
+  queryClient.invalidateQueries({ queryKey: ['negotiation', orderId] });
+  queryClient.invalidateQueries({ queryKey: ['messages'] });  // ← broad
+}
+```
+
+#### MessageBubble race condition 가드 (검증됨)
+
+`canAct = !isMine && offerStatus === 'PENDING'` 으로 버튼 자체는 status 변경 시 사라지지만,
+fetch race 또는 stale 카드 잠재 클릭 대비로 onClick 핸들러 안에서도 한 번 더 status 검증한다.
+
+```typescript
+const handleAccept = () => {
+  if (!offerId || !orderId) return;
+  if (offerStatus !== 'PENDING') return;  // race condition 가드
+  acceptMutation.mutate({ offerId });
+};
+```
+
+#### OrderContextBanner — 헤더 아래 주문 요약 배너 (components/chat/OrderContextBanner.tsx)
+
+`selectedRoom?.order_id` 가 있을 때만 렌더. `useOrder(orderId)` 로 주문 정보 fetch.
+- 상품명 첫 항목 + "외 N건"
+- StatusBadge
+- 주문번호 + 총액
+- 우측 "주문 상세 보기" 버튼 → `onOpenOrder(id)` 콜백 (페이지에서 `router.push('/{role}/orders?id=...')`)
+
+주문이 없거나 fetch 실패 시 배너 자동 숨김 (요구사항).
+
+#### PriceOfferPopover — 채팅 입력창 가격 제시 버튼 (components/chat/PriceOfferPopover.tsx)
+
+DollarSign 아이콘 버튼 + 외부 클릭으로 닫히는 팝오버 입력 폼. amount(필수, >0 정수) + notes(선택).
+- room.order_id 가 없으면 비활성화 + tooltip 안내
+- 제출 → `useSubmitCounterOfferViaChat(roomId).mutate(...)`
+- 외부 클릭 감지: `useRef + mousedown` (drop-down 패턴과 동일)
+
+채팅 페이지 입력창에 `<input>` 좌측에 배치:
+```tsx
+<div className="flex gap-2">
+  <PriceOfferPopover roomId={selectedRoomId} orderId={linkedOrderId} currentTotal={linkedOrderTotal} />
+  <input ... />
+  <button onClick={handleSend}>...</button>
+</div>
+```
+
+#### 주문 상세 → 채팅 이동 흐름 (양 페이지)
+
+`buyer/orders` `seller/orders` 상세 슬라이드 액션 영역 첫 번째 버튼:
+```tsx
+const createChatRoom = useCreateChatRoom();
+const handleOpenChat = async () => {
+  if (!selectedOrder) return;
+  const res = await createChatRoom.mutateAsync({
+    partner_user_id: selectedOrder.seller_id, // buyer 페이지: seller_id, seller 페이지: buyer_id
+    order_id: selectedOrder.id,
+  });
+  router.push(`/buyer/chat?room_id=${res.data.id}`);
+};
+```
+
+채팅 페이지에서는 `searchParams.get('room_id')` 로 자동 선택 (기존 buyer 페이지 패턴 유지, seller 페이지에도 동일 추가).
+
+반대로 채팅의 "주문 상세 보기" 버튼은 `/{role}/orders?id=...` 로 라우팅하고, 주문 페이지에서
+`searchParams.get('id')` 로 `setSelectedOrderId` 자동 호출 → 슬라이드 패널 자동 오픈.
+
 ### 채팅 페이지 채팅방 목록 로딩/에러 상태 표시 패턴 (검증됨)
 
 `useChatRooms()`에서 `isLoading`, `error`, `refetch`를 함께 destructure해 로딩 스피너와 에러+재시도 버튼을 표시한다.

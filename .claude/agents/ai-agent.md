@@ -2,7 +2,7 @@
 name: ai-agent
 description: AgriFlow AI 기능 전담. Anthropic Claude API 연동, 스트리밍 응답, 시스템 프롬프트 설계, 역할별 컨텍스트 빌더, 프롬프트 엔지니어링, AI 대화 기록, 채팅 요약, 업무 자동화 AI 기능 개발에 사용. "AI 기능 추가", "프롬프트 개선", "스트리밍 구현", "AI 도우미 확장" 등 AI 관련 모든 요청에 자동 위임.
 tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch
-model: sonnet
+model: opus
 ---
 
 # AgriFlow AI Agent

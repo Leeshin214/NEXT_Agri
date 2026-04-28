@@ -1,10 +1,9 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Bell, LogOut, User as UserIcon, Settings, Menu } from 'lucide-react';
+import { Bell, LogOut, User as UserIcon, Settings } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/hooks/useAuth';
-import { useUIStore } from '@/store/uiStore';
 import type { User } from '@/types/user';
 
 interface TopBarProps {
@@ -14,7 +13,6 @@ interface TopBarProps {
 export default function TopBar({ user }: TopBarProps) {
   const { signOut } = useAuth();
   const router = useRouter();
-  const { toggleSidebar } = useUIStore();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -30,16 +28,11 @@ export default function TopBar({ user }: TopBarProps) {
 
   return (
     <header className="flex h-16 items-center justify-between border-b border-gray-200 bg-white px-4 md:px-6">
-      {/* 좌측: 모바일 햄버거 메뉴 */}
-      <button
-        onClick={toggleSidebar}
-        className="flex h-9 w-9 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-600 md:hidden"
-        aria-label="메뉴 열기"
-      >
-        <Menu className="h-5 w-5" />
-      </button>
-      {/* 데스크탑에서 좌측 빈 공간 유지 */}
-      <div className="hidden md:block" />
+      {/*
+        좌측 빈 공간 — 햄버거 메뉴 제거됨.
+        사이드바는 모든 화면에서 항상 표시되며 호버로 펼쳐지므로 별도 토글 버튼이 불필요.
+      */}
+      <div />
 
       {/* 우측: 사용자 정보 */}
       <div className="flex items-center gap-4">

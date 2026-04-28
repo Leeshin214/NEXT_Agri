@@ -10,13 +10,14 @@ Anthropic Claude API를 활용한 AI 업무 도우미 기능을 구현한다.
 
 ## AI 기능 목록
 
-| 기능 | 엔드포인트 | 설명 |
+| 기능 | 엔드포인트 / 위치 | 설명 |
 |------|-----------|------|
 | 일반 대화 | POST /ai/chat | 프롬프트 자유 입력, 스트리밍 응답 |
 | 업무 요약 | POST /ai/daily-summary | 오늘의 업무 자동 요약 |
 | 채팅 요약 | POST /ai/summarize-chat | 채팅 내용 요약 |
 | 메시지 초안 | POST /ai/draft-message | 상황에 맞는 메시지 초안 작성 |
 | 재고 분석 | POST /ai/inventory-alert | 재고 현황 분석 및 경고 |
+| 채팅 합의 감지 | agent_tools.analyze_chat_consensus | 채팅 메시지 → 합의/협상/거절/일반 분류, 합의 시 주문·캘린더 자동 생성 (AgenticPay) |
 
 ---
 
@@ -402,8 +403,9 @@ inventory_order_node (자체 LLM + TOOLS + 자체 루프 최대 3회)
     → 완료 후 response_node
 
 response_node
-    → tool_results[-1].message 있으면 LLM 없이 바로 반환
-    → 없으면 LLM으로 요약
+    → success=True 이고 재고 부족 아닌 경우: tool_results[-1].message 있으면 LLM 없이 바로 반환
+    → success=False 또는 재고 부족(LOW_STOCK/OUT_OF_STOCK/요청수량>재고): 단락회로 건너뜀, LLM이 타협안 생성
+    → 그 외(message 없음): LLM으로 요약
 ```
 
 #### orchestrator_node 핵심 패턴
@@ -416,16 +418,63 @@ response_node
 - orchestrator messages에서 라우터 JSON(`{"intent": ...}`)을 필터링하여 제외
 - tool_calls 루프: `for round_idx in range(MAX_TOOL_ROUNDS)` — finish_reason=="stop"이면 break
 - UUID 파라미터 자동 교정: `_fix_id_params()` 헬퍼로 seller_id/user_id/buyer_id 검증
+- MAX_TOOL_ROUNDS 마지막 라운드 강제 break 제거 — validator_node가 tool_round < 2 기준으로 RETRY 관리하므로 두 로직 동시 존재 시 validator 발동 전에 루프 종료됨
 
 #### AgentState 필드 (pending_tool_calls 제거됨)
 ```python
 class AgentState(TypedDict):
     user_id, user_role, user_info, message, intent,
-    messages, tool_results, tools_used, final_response, tool_round
+    messages, tool_results, tools_used, final_response, tool_round,
+    validation_status, manual_review
 ```
+
+#### TOOL_FUNCTION_MAP 전체 목록 (18개)
+```
+get_products, check_stock, update_stock, create_product, delete_product, update_product,
+get_orders, get_order_detail, update_order_status, create_order, delete_order,
+find_sellers_by_product, find_buyers_by_product,
+open_chat_room, get_calendar_events, create_calendar_event,
+find_alternative_partners, get_user_profile
+```
+
+#### 시스템 프롬프트 고도화 패턴 (Phase 2)
+- 12가지 CASE 안내를 AGENT_SELLER_SYSTEM / AGENT_BUYER_SYSTEM에 명시 → LLM이 도구 선택 실수 감소
+- FEW_SHOT_EXAMPLES 모듈 상수로 분리 → 두 시스템 프롬프트에 공통 삽입 (문자열 연결)
+- 권한 원칙(주문/상품 소유자 검증), 상품명 모호성 처리(조회 vs 삭제/수정 분기), 일정 중복 확인, 대체 거래처 추천 원칙을 프롬프트 섹션으로 분리 명시
+- CASE-4: create_order 성공 시 create_calendar_event 즉시 자동 연쇄 호출 → 납품일 캘린더 자동 등록
+
+#### 새 tool 함수 패턴
+- `open_chat_room`: chat_rooms 테이블 직접 조회, 양방향 검색(자신의 role에 따라 seller_id/buyer_id 배치)
+- `get_calendar_events`: `calendar.monthrange(year, month)[1]`로 말일 계산, `.is_("deleted_at", None)` 패턴 준수
+- `create_calendar_event`: order_id 빈 문자열이면 None으로 저장
+- `find_alternative_partners`: BUYER→products+partners 조인, SELLER→order_items+partners 조인. 정렬 금지, LLM이 추천 순위 생성
+- `get_user_profile`: user_id → username → company_name 우선순위 검색, asyncio 없이 동기 호출
 
 ### 주의사항 & 함정
 
 - orchestrator_node가 라우터 JSON을 messages에 assistant로 추가하는데, inventory_order_node에서 이를 필터링하지 않으면 LLM이 혼란 → `_is_router_json()` 헬퍼로 필터링 필수
 - `response_format=json_object` 사용 시 시스템 프롬프트에 반드시 "JSON으로만 응답" 명시해야 함 (미명시 시 API 오류)
 - inventory_order_node의 agent_messages 구성: `state["messages"]`를 그대로 쓰면 orchestrator system prompt가 섞임 → 별도 agent_messages 리스트 새로 구성해야 함
+- response_node 단락회로: success=False 또는 재고 부족 결과는 반드시 LLM 통과시켜야 타협안 생성 가능. `last.get("message")` 유무만으로 단락회로 결정하면 이분법 거절 응답이 그대로 반환됨
+- find_alternative_partners에 단순 정렬 공식 추가 금지 — DB 결과 그대로 반환, 추천 순위는 LLM(response_node)이 자연어로 생성
+
+#### analyze_chat_consensus 구현 패턴 (Phase 3 검증)
+- 동기 함수로 구현 (`openai.OpenAI(...)` 동기 클라이언트) — `asyncio.run` 절대 사용 금지 (이벤트루프 충돌)
+- `chat_ws.py`에서 반드시 `await asyncio.to_thread(analyze_chat_consensus, room_id)` 로 호출
+- `response_format={"type": "json_object"}` + temperature=0 → 안정적인 JSON 반환
+- LLM이 buyer_id/seller_id를 모를 수 있으므로 chat_rooms 조회 결과로 항상 덮어씀
+- OPENAI_API_KEY 없거나 예외 발생 시 `{"status": "general", ...}` fallback → 서버 죽이지 않음
+- `copy.deepcopy(_CONSENSUS_FALLBACK)` 패턴으로 fallback dict 공유 참조 오염 방지
+
+#### connection_manager.py send_private_message 패턴
+- `active_user_connections: dict[str, WebSocket]` 추가 — user_id → WebSocket 1:1 매핑
+- `connect(room_id, websocket, user_id)` 시그니처에 user_id 추가 (기존 room_id 등록 + user_id 매핑 동시 처리)
+- `disconnect(room_id, websocket, user_id=None)` — user_id 선택적, remove() 시 ValueError try/except 필수
+- `send_private_message(user_id, message)` — ws 없으면 조용히 무시 (연결 끊긴 사용자 대상 무해)
+
+#### chat_ws.py 합의 감지 통합 패턴
+- broadcast 직후 `if should_analyze(room_id):` 블록에서 `asyncio.to_thread` 호출
+- 합의 감지 전체 블록을 try/except로 감싸 실패해도 WebSocket 연결 유지
+- consensus 후속 처리(`_handle_consensus`) 내부도 각 단계별 try/except — product 미매칭 시 주문 스킵 후 시스템 메시지만 broadcast
+- rejected 후속 처리(`_handle_rejected`) — `_infer_category(product_name)` 헬퍼로 카테고리 추론, 매칭 실패 시 "VEGETABLE" 기본값
+- `last_analysis` 인메모리 dict는 서버 재시작 시 초기화 — 의도된 동작, 영속성 불필요

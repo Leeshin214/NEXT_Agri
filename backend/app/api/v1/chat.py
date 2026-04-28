@@ -1,3 +1,4 @@
+import asyncio
 from typing import Optional
 from uuid import UUID
 
@@ -11,7 +12,9 @@ from app.schemas.chat import (
     MessageResponse,
 )
 from app.schemas.common import SuccessResponse
+from app.schemas.order import CounterOfferCreate, CounterOfferResponse
 from app.services.chat_service import chat_service
+from app.services.order_service import order_service
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -89,3 +92,58 @@ async def mark_as_read(
         room_id=room_id,
         user_id=current_user["id"],
     )
+
+
+@router.post(
+    "/rooms/{room_id}/counter-offer",
+    response_model=SuccessResponse[CounterOfferResponse],
+    status_code=201,
+)
+async def submit_counter_offer_via_chat(
+    room_id: UUID,
+    data: CounterOfferCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """채팅방의 현재 연결 주문에 대해 협상가 제시.
+
+    - chat_room.order_id 가 None 이면 400 (연결된 주문 없음)
+    - 호출자가 채팅방의 buyer 또는 seller 가 아니면 403
+    - order_service.submit_counter_offer 를 호출 (메시지/브로드캐스트 자동)
+    """
+    # 1) chat_room 조회
+    room_result = await asyncio.to_thread(
+        lambda: chat_service.rooms.select("*")
+        .eq("id", str(room_id))
+        .single()
+        .execute()
+    )
+    room = room_result.data
+    if not room:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="채팅방을 찾을 수 없습니다",
+        )
+
+    # 2) 권한 검증 — buyer 또는 seller 만 허용
+    user_id = str(current_user["id"])
+    if user_id not in (str(room["seller_id"]), str(room["buyer_id"])):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="이 채팅방에 접근할 권한이 없습니다",
+        )
+
+    # 3) 연결된 주문 확인
+    order_id = room.get("order_id")
+    if not order_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="이 채팅방에 연결된 주문이 없습니다",
+        )
+
+    # 4) 협상가 제시 — order_service 가 메시지/브로드캐스트 자동 처리
+    offer = await order_service.submit_counter_offer(
+        order_id=UUID(order_id),
+        payload=data.model_dump(mode="json"),
+        user=current_user,
+    )
+    return {"data": offer}

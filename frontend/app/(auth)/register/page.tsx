@@ -4,7 +4,9 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/client';
-import type { UserRole } from '@/types/user';
+import { useAuthStore, LOGIN_DURATION_MS } from '@/store/authStore';
+import { api } from '@/lib/api';
+import type { SuccessResponse, User, UserRole } from '@/types';
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -61,10 +63,43 @@ export default function RegisterPage() {
       return;
     }
 
-    // 가입 성공 → 역할별 대시보드로
-    const redirectPath =
-      formData.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
-    router.push(redirectPath);
+    // 가입 성공 — 세션이 즉시 발급되었는지 확인
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+
+    if (session) {
+      // 세션 발급된 경우(이메일 확인 미설정 환경) → 프로필 조회 후 즉시 진입
+      const expiresAt = Date.now() + LOGIN_DURATION_MS;
+      let profile: User | null = null;
+      try {
+        const result = await api.get<SuccessResponse<User>>('/users/me');
+        profile = result.data;
+      } catch {
+        profile = {
+          id: '',
+          supabase_uid: session.user.id,
+          email: session.user.email ?? formData.email,
+          name: formData.name,
+          role: formData.role,
+          company_name: formData.company_name || null,
+          phone: null,
+          profile_image: null,
+          is_active: true,
+          created_at: session.user.created_at ?? '',
+          updated_at: session.user.created_at ?? '',
+          deleted_at: null,
+        };
+      }
+      useAuthStore.getState().setSession(profile, expiresAt);
+
+      const redirectPath =
+        profile.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
+      router.replace(redirectPath);
+    } else {
+      // 이메일 확인이 필요한 경우 — 로그인 페이지로 이동시켜 사용자에게 안내
+      router.replace('/login');
+    }
   };
 
   return (

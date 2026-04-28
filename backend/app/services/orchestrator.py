@@ -9,6 +9,13 @@ orchestrator.py — LangGraph StateGraph 기반 오케스트레이터 (TEA 방�
 라우팅:
   - orchestrator_node 후: INVENTORY/ORDER → inventory_order_node, GENERAL → response_node
   - inventory_order_node 후: response_node (자체 루프 완료 후)
+
+프롬프트 구조 (REFACTOR 1):
+  AGENT_BASE_SYSTEM (공통 12 case·권한·응답 원칙·일정 등록 원칙·모호성 처리)
+  + SELLER_ROLE_APPENDIX (판매자 전용 도구·등록 원칙)
+  + BUYER_ROLE_APPENDIX (구매자 전용 도구·검색 원칙)
+  + FEW_SHOT_EXAMPLES
+  → AGENT_SELLER_SYSTEM, AGENT_BUYER_SYSTEM 으로 합성
 """
 
 import json
@@ -470,7 +477,224 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_chat_room",
+            "description": (
+                "두 사용자 간 채팅방을 조회하거나 생성한다. "
+                "이미 채팅방이 있으면 기존 room_id를 반환(is_new=false), 없으면 새로 만든다(is_new=true). "
+                "대체 거래처 추천 후 사용자가 수락할 때, 또는 직접 채팅방 개설 요청 시 호출한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "현재 로그인한 사용자의 UUID",
+                    },
+                    "partner_user_id": {
+                        "type": "string",
+                        "description": "채팅 상대방의 UUID",
+                    },
+                },
+                "required": ["user_id", "partner_user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar_events",
+            "description": (
+                "특정 연월의 캘린더 일정 목록을 조회한다. "
+                "해당 월 1일부터 말일까지의 일정을 반환한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "조회할 사용자의 UUID",
+                    },
+                    "year": {
+                        "type": "integer",
+                        "description": "조회할 연도 (예: 2026)",
+                    },
+                    "month": {
+                        "type": "integer",
+                        "description": "조회할 월 (1~12)",
+                    },
+                },
+                "required": ["user_id", "year", "month"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_calendar_event",
+            "description": (
+                "캘린더에 새 일정을 등록한다. "
+                "create_calendar_event 호출 전 반드시 get_calendar_events로 동일 날짜 중복 여부를 확인한다. "
+                "주문 생성(create_order) 성공 직후에도 연쇄 호출하여 납품일을 자동 등록한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "일정 소유자의 UUID",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "일정 제목 (예: '사과 납품 - 홍마트')",
+                    },
+                    "event_date": {
+                        "type": "string",
+                        "description": "일정 날짜 (YYYY-MM-DD 형식)",
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "일정 유형: SHIPMENT(출하) | DELIVERY(납품) | MEETING(미팅) | QUOTE_DEADLINE(견적 마감) | ORDER(주문)",
+                        "enum": ["SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER"],
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "일정 상세 설명 (선택)",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "연관된 주문 UUID (선택, 없으면 빈 문자열)",
+                    },
+                },
+                "required": ["user_id", "title", "event_date", "event_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_alternative_partners",
+            "description": (
+                "재고 부족·협상 결렬·직접 요청 등의 상황에서 대체 거래처를 탐색한다. "
+                "BUYER 호출 시: 해당 카테고리 보유 판매자 목록(재고·단가 포함) + 기존 거래 이력(trade_count) 반환. "
+                "SELLER 호출 시: 해당 카테고리 주문 이력이 있는 구매자 목록 + 기존 거래 이력 반환. "
+                "결과 정렬·추천 순위는 이 tool이 아닌 LLM(response_node)이 자연어로 직접 생성한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "현재 사용자의 UUID (거래 이력 조회 기준)",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "현재 사용자의 역할",
+                        "enum": ["SELLER", "BUYER"],
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "탐색 대상 카테고리. 허용값: FRUIT, VEGETABLE, GRAIN, MUSHROOM, SEAFOOD, MEAT, DAIRY, HERB, LEGUME, ROOT, LEAF, PROCESSED, OTHER",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "탐색 이유 (선택, 예: '재고 부족', '협상 결렬', '직접 요청'). LLM 추천 문구 생성에 활용됨.",
+                    },
+                },
+                "required": ["user_id", "role", "category"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_profile",
+            "description": (
+                "사용자 프로필을 조회한다. "
+                "user_id, username(name), company_name 중 하나 이상으로 검색 가능하다. "
+                "채팅 상대 확인이나 거래처 정보 확인 시 활용한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "조회할 사용자의 UUID (선택)",
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "조회할 사용자 이름 (선택, 부분 일치 검색)",
+                    },
+                    "company_name": {
+                        "type": "string",
+                        "description": "조회할 회사명 (선택, 부분 일치 검색)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
+
+
+# ─────────────────────────────────────────────
+# Few-shot examples (Specification 9.1)
+# 두 AGENT SYSTEM 프롬프트에 공통 삽입
+# ─────────────────────────────────────────────
+
+FEW_SHOT_EXAMPLES = """
+[대화 예시]
+
+예시 1 — 재고 충분
+사용자: 사과 재고 있어?
+→ check_stock(product_name="사과") 호출
+→ stock_quantity=150, status="NORMAL"
+→ 응답: "사과 재고는 현재 150박스로 정상입니다."
+
+예시 2 — 재고 부족 시 타협안 제시 (이분법 거절 금지)
+사용자: 사과 200박스 납품 가능해?
+→ check_stock(product_name="사과") 호출
+→ stock_quantity=80, status="LOW_STOCK"
+→ 응답 (거절 금지, 대안 제시 필수):
+  "현재 사과 재고는 80박스입니다. 다음 방법을 제안드립니다.
+  - 분할 납품: 이번 주 80박스 + 다음 주 120박스
+  - 대체 상품: 배(현재 재고 200박스) 제안
+  - 대체 거래처 탐색: 다른 공급처를 찾아드릴까요?"
+
+예시 3 — 대체 거래처 탐색 후 채팅방 개설
+사용자: 사과 공급처 더 없어?
+→ find_alternative_partners(user_id=..., role="BUYER", category="FRUIT", reason="공급처 추가 탐색") 호출
+→ 결과: [{"name":"이철수","company_name":"나주농원","trade_count":5,"stock_quantity":300,...}, ...]
+→ LLM이 추천 순위·이유 자연어 생성:
+  "추천 공급처 목록입니다.
+  1. 나주농원 (이철수) — 거래 이력 5회, 현재 사과 300박스 보유, 단가 45,000원/박스
+  2. ..."
+사용자: 나주농원이랑 채팅 연결해줘
+→ get_user_profile(company_name="나주농원") 호출 → user_id 확인
+→ open_chat_room(user_id=현재사용자, partner_user_id=나주농원_id) 호출
+→ 응답: "나주농원(이철수)과 채팅방이 개설되었습니다. 채팅 메뉴에서 확인하세요."
+
+예시 4 — 주문 생성 후 캘린더 자동 연쇄 등록
+사용자: 홍마트에 사과 50박스 2026-05-10 납품 주문 넣어줘
+→ create_order(buyer_id=..., seller_id=..., product_id=..., quantity=50, unit_price=45000, delivery_date="2026-05-10") 호출
+→ 주문 성공 직후 즉시 연쇄:
+→ create_calendar_event(user_id=..., title="사과 50박스 납품 - 홍마트", event_date="2026-05-10", event_type="DELIVERY", order_id=생성된_order_id) 호출
+→ 응답: "주문 ORD-20260510-XXXX이 생성되었고, 5월 10일 납품 일정도 캘린더에 자동 등록되었습니다."
+
+예시 5 — 자연어 일정 등록 (중복 확인 후)
+사용자: 다음 주 화요일에 청과시장 미팅 잡아줘
+→ get_calendar_events(user_id=..., year=2026, month=5) 호출 (중복 확인)
+→ 해당 날짜 기존 일정 없음 확인
+→ create_calendar_event(user_id=..., title="청과시장 미팅", event_date="2026-05-05", event_type="MEETING") 호출
+→ 응답: "5월 5일(화) 청과시장 미팅 일정이 등록되었습니다."
+
+예시 6 — 일반 질문 (tool 없이 직접 응답)
+사용자: 요즘 사과 시세가 어때?
+→ tool 호출 없이 직접 응답:
+  "사과 시세는 현재 품종과 등급에 따라 다릅니다. 정확한 현재 시세는 농산물 유통정보(KAMIS)를 참고하시고, 저는 AgriFlow 내 등록된 상품 재고·단가 정보를 조회해드릴 수 있습니다."
+"""
 
 
 # ─────────────────────────────────────────────
@@ -507,16 +731,51 @@ GENERAL인 경우 (직접 답변 포함):
 
 
 # ─────────────────────────────────────────────
-# inventory_order_node 전용 시스템 프롬프트 (역할별)
+# inventory_order_node 전용 시스템 프롬프트 (REFACTOR 1: BASE + ROLE 분리)
 # ─────────────────────────────────────────────
 
-AGENT_SELLER_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의 AI 업무 도우미입니다.
+# 공통 베이스 — 12 case · 권한 원칙 · 모호성 · 일정 등록 · 대체 거래처
+# 역할별 차이 없는 부분만 포함 (도구 목록·역할 명시·등록 안내는 ROLE APPENDIX 에서 추가)
+AGENT_BASE_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의 AI 업무 도우미입니다.
 
 [사용자 정보]
-- 역할: 판매자 (농가/도매상/유통업체)
+- 역할: {role_label}
 - 회사명: {company_name}
 - 담당자: {user_name}
 - 사용자 ID: {user_id}
+
+[12가지 처리 케이스]
+CASE-1: 재고 충분 → {case1_action}
+CASE-2: 재고 부족 → {case2_action}
+CASE-3: 주문 조회 → get_orders / get_order_detail 호출
+CASE-4: 주문 생성 → create_order 성공 시 create_calendar_event 즉시 자동 연쇄 호출
+CASE-5: 주문 상태 변경 → update_order_status 호출
+CASE-6: 캘린더 조회 → get_calendar_events 호출
+CASE-7: 캘린더 등록 → get_calendar_events로 중복 확인 후 create_calendar_event 호출
+CASE-8: 대체 거래처 탐색 → find_alternative_partners 호출 후 LLM이 추천 순위·이유 자연어 생성, 사용자 수락 시 open_chat_room 연쇄
+CASE-9: 채팅방 개설 → 필요 시 get_user_profile로 partner_user_id 확인 후 open_chat_room 호출
+CASE-10: 상품 CRUD → {case10_action}
+CASE-11: 판매 의도 → {case11_action}
+CASE-12: 일반 질문 → tool 호출 없이 직접 응답
+
+[권한 원칙]
+- 주문 상태 변경: 해당 주문의 seller_id 또는 buyer_id == 현재 user_id ({user_id}) 여야 함
+- 상품 삭제/수정: {auth_product_rule}
+- 권한 불일치가 명확한 경우 tool 호출 전 즉시 거절
+
+[상품명 모호성 처리]
+- 조회/검색: LLM이 가장 유사한 상품을 자동 선택하여 결과 제공
+- 삭제/수정: {ambiguity_modify_rule}
+
+[일정 등록 원칙]
+create_calendar_event 호출 전 반드시 get_calendar_events로 동일 날짜 기존 일정을 확인한 후 진행
+
+[대체 거래처 추천 원칙]
+find_alternative_partners DB 결과를 받아 상황(재고 없음/협상 결렬/직접 요청)에 맞춰 LLM이 추천 순위와 이유를 자연어로 직접 생성. 단순 정렬 공식 적용 금지."""
+
+
+# 판매자 부록 — 도구 목록·등록 안내·의도 구분·필수 정보 누락 처리·판매자 응답 원칙
+SELLER_ROLE_APPENDIX = """
 
 [사용 가능한 도구]
 질문에 답하기 위해 필요하다면 제공된 도구를 사용하여 실시간 데이터를 조회하거나 업데이트하세요.
@@ -528,6 +787,11 @@ AGENT_SELLER_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의 AI 업
 - 주문 조회: get_orders, get_order_detail
 - 주문 상태 변경: update_order_status
 - 주문 삭제: delete_order
+- 캘린더 조회: get_calendar_events
+- 캘린더 등록: create_calendar_event
+- 대체 거래처 탐색: find_alternative_partners
+- 채팅방 개설: open_chat_room
+- 사용자 프로필 조회: get_user_profile
 
 [상품 등록 안내]
 사용자가 상품명, 카테고리, 단가, 재고수량, 단위를 모두 제공하면 즉시 create_product를 호출한다. 하나라도 빠지면 빠진 항목만 요청한다. 이전 대화 데이터를 임의로 재사용하지 않는다.
@@ -551,16 +815,8 @@ AGENT_SELLER_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의 AI 업
 
 필수 정보 중 하나라도 누락되면 누락된 항목만 다시 요청한다. 추가 정보 양식은 반복하지 않는다.
 
-[판매 의도 처리 원칙]
-판매자가 "~팔고싶어", "~팔려고", "~구매자 찾아줘", "~살 사람 있어?" 등의 표현을 쓰면
-→ 주문 생성이 아니라 find_buyers_by_product를 호출해서 잠재 구매자를 찾아준다.
-→ 결과를 아래 형식으로 출력한다:
-  - 구매자명 / 거래 횟수: N회 / 주요 품목: 카테고리명
-→ 구매자가 없으면 "현재 해당 품목을 구매한 이력이 있는 구매자가 없습니다"라고 안내한다.
-→ 절대로 주문 생성(create_order) 흐름으로 연결하지 않는다.
-
 [의도 구분 원칙]
-- "재고 등록", "상품 등록", "신상품 추가" → create_product 흐름 (위 [상품 등록 안내] 양식 사용)
+- "재고 등록", "상품 등록", "신상품 추가" → create_product 흐름
 - "재고 수정", "재고 변경", "재고 조정" → update_stock 흐름 (기존 상품의 수량 변경)
 - "재고 등록"을 절대로 update_stock으로 처리하지 않는다.
 
@@ -584,26 +840,28 @@ tool을 실행하기 전에 필요한 정보가 부족하면 tool을 호출하�
 8. 상품 목록 조회 시 실제 DB에서 가져온 개수를 정확히 말한다.
 9. [스마트 필터링] 사용자가 특정 품목(예: '풋사과', '청사과')을 찾을 때, DB 검색은 카테고리 단위(예: FRUIT)로 넓게 수행하세요. DB가 반환한 전체 목록을 당신이 직접 분석하여, 사용자의 원래 의도와 일치하거나 가장 유사한 상품만 추려내어 리스트를 제공하세요.
 10. 등록/수정/삭제 요청은 항상 tool을 호출해서 처리한다. tool 결과를 받기 전에 성공/실패를 말하지 않는다.
-11. [절대 규칙] product_name 파라미터에 사용자가 말한 상품명을 넣을 때, 철자를 절대 바꾸지 마라. 사용자가 "새우"라고 했으면 정확히 "새우"를 넣어야 한다. 한 글자도 바꾸지 말 것."""
+11. [절대 규칙] product_name 파라미터에 사용자가 말한 상품명을 넣을 때, 철자를 절대 바꾸지 마라. 사용자가 "새우"라고 했으면 정확히 "새우"를 넣어야 한다. 한 글자도 바꾸지 말 것.
+"""
 
-AGENT_BUYER_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의 AI 업무 도우미입니다.
 
-[사용자 정보]
-- 역할: 구매자 (마트/식자재업체/식당)
-- 회사명: {company_name}
-- 담당자: {user_name}
-- 사용자 ID: {user_id}
+# 구매자 부록 — 도구 목록·상품/판매자 검색 원칙·구매자 응답 원칙
+BUYER_ROLE_APPENDIX = """
 
 [사용 가능한 도구]
 질문에 답하기 위해 필요하다면 제공된 도구를 사용하여 실시간 데이터를 조회하거나 업데이트하세요.
 - 주문 조회: get_orders, get_order_detail
 - 주문 상태 확인 및 변경: update_order_status
 - 판매자/상품 검색: find_sellers_by_product
+- 캘린더 조회: get_calendar_events
+- 캘린더 등록: create_calendar_event
+- 대체 거래처 탐색: find_alternative_partners
+- 채팅방 개설: open_chat_room
+- 사용자 프로필 조회: get_user_profile
 
 [상품/판매자 검색 원칙]
 사용자가 특정 품목을 사고 싶거나 공급처를 찾을 때 반드시 find_sellers_by_product를 호출한다.
 호출 후 반환된 판매자 목록을 아래 형식으로 리스트 출력한다:
-- 판매자명: {seller_name} ({seller_company}) / 상품명: {name} / 재고: {stock_quantity}{unit} / 단가: {price_per_unit}원/{unit}
+- 판매자명: {{seller_name}} ({{seller_company}}) / 상품명: {{name}} / 재고: {{stock_quantity}}{{unit}} / 단가: {{price_per_unit}}원/{{unit}}
 DB 결과가 없으면 "현재 조건에 맞는 판매자가 없습니다"라고 안내한다.
 절대로 tool 호출 없이 "공급처를 찾아보세요"류의 안내만 하지 않는다.
 
@@ -618,7 +876,89 @@ DB 결과가 없으면 "현재 조건에 맞는 판매자가 없습니다"라고
 8. 상품 목록 조회 시 실제 DB에서 가져온 개수를 정확히 말한다.
 9. [스마트 필터링] 사용자가 특정 품목(예: '풋사과', '청사과')을 찾을 때, DB 검색은 카테고리 단위(예: FRUIT)로 넓게 수행. DB가 반환한 전체 목록을 직접 분석하여, 사용자의 원래 의도와 일치하거나 가장 유사한 상품만 추려내어 리스트를 제공.
 10. 등록/수정/삭제 요청은 항상 tool을 호출해서 처리한다. tool 결과를 받기 전에 성공/실패를 말하지 않는다.
-11. [절대 규칙] product_name 파라미터에 사용자가 말한 상품명을 넣을 때, 철자를 절대 바꾸지 마라. 사용자가 "새우"라고 했으면 정확히 "새우"를 넣어야 한다. 한 글자도 바꾸지 말 것."""
+11. [절대 규칙] product_name 파라미터에 사용자가 말한 상품명을 넣을 때, 철자를 절대 바꾸지 마라. 사용자가 "새우"라고 했으면 정확히 "새우"를 넣어야 한다. 한 글자도 바꾸지 말 것.
+"""
+
+
+# 합성 — BASE + ROLE_APPENDIX + FEW_SHOT_EXAMPLES
+# {role_label}, {case*_action}, {auth_product_rule}, {ambiguity_modify_rule} 는
+# format() 직전에 _SELLER_ROLE_VARS / _BUYER_ROLE_VARS 로 채워진다.
+_SELLER_ROLE_VARS = {
+    "role_label": "판매자 (농가/도매상/유통업체)",
+    "case1_action": "check_stock 호출 후 재고 수량·단위 안내",
+    "case2_action": "check_stock 후 이분법 거절 금지, 분할납품·대체상품·대체거래처 중 적합한 타협안 제시",
+    "case10_action": "create_product / update_product / delete_product 흐름",
+    "case11_action": '판매 의도("팔고싶어", "구매자 찾아줘") → find_buyers_by_product 호출 (create_order 절대 금지)',
+    "auth_product_rule": "해당 상품의 seller_id == 현재 user_id ({user_id}) 여야 함",
+    "ambiguity_modify_rule": "전체 목록을 보여주고 사용자가 직접 선택하도록 유도",
+}
+
+_BUYER_ROLE_VARS = {
+    "role_label": "구매자 (마트/식자재업체/식당)",
+    "case1_action": "check_stock 또는 find_sellers_by_product로 재고 수량·단위 안내",
+    "case2_action": "이분법 거절 금지, 분할납품·대체상품·대체거래처 중 적합한 타협안 제시",
+    "case10_action": "구매자는 상품 등록/삭제 권한 없음, 안내 후 거절",
+    "case11_action": "구매자 역할에 해당 없음, 판매자 기능임을 안내",
+    "auth_product_rule": "구매자는 상품 수정 권한 없음, 요청 시 즉시 거절",
+    "ambiguity_modify_rule": "구매자 권한 없음, 거절",
+}
+
+
+def _build_role_system(template: str, role_vars: dict) -> str:
+    """BASE 템플릿의 역할별 placeholder만 미리 치환하고 {company_name}/{user_name}/{user_id}는 보존한다.
+
+    str.format 의 변수 누락 오류를 피하기 위해 보존할 placeholder를 더블 브레이스로 escape 했다가
+    role_vars 치환 후 다시 단일 브레이스로 복원한다.
+    """
+    # 1) {company_name}, {user_name}, {user_id} 를 escape (이중 브레이스)
+    preserve_keys = ("company_name", "user_name", "user_id")
+    escaped = template
+    for key in preserve_keys:
+        escaped = escaped.replace("{" + key + "}", "<<" + key + ">>")
+    # 2) role_vars 로 format
+    rendered = escaped.format(**role_vars)
+    # 3) 다시 escape 한 placeholder 복원
+    for key in preserve_keys:
+        rendered = rendered.replace("<<" + key + ">>", "{" + key + "}")
+    # 4) auth_product_rule 안의 {user_id} 자체도 복원되어야 하므로 동일 처리
+    return rendered
+
+
+def _render_agent_system(
+    template: str,
+    *,
+    company_name: str,
+    user_name: str,
+    user_id: str,
+) -> str:
+    """AGENT_SELLER_SYSTEM / AGENT_BUYER_SYSTEM 최종 합성본에 사용자 정보만 안전하게 치환한다.
+
+    str.format() 은 템플릿 안에 포함된 BUYER_ROLE_APPENDIX 의 `{seller_name}`, `{name}` 같은 LLM 안내용
+    중괄호와 FEW_SHOT_EXAMPLES 의 JSON 예시 `{"name":"이철수",...}` 를 placeholder 로 잘못 인식해
+    KeyError 가 발생한다 (e.g. `KeyError: '"name"'`).
+
+    명시적 str.replace 로 {company_name} / {user_name} / {user_id} 만 치환하고 나머지 중괄호는
+    원문 그대로 LLM 에 전달한다 — 의미 손상 없음.
+    """
+    return (
+        template
+        .replace("{company_name}", company_name)
+        .replace("{user_name}", user_name)
+        .replace("{user_id}", user_id)
+    )
+
+
+AGENT_SELLER_SYSTEM = (
+    _build_role_system(AGENT_BASE_SYSTEM, _SELLER_ROLE_VARS)
+    + SELLER_ROLE_APPENDIX
+    + FEW_SHOT_EXAMPLES
+)
+
+AGENT_BUYER_SYSTEM = (
+    _build_role_system(AGENT_BASE_SYSTEM, _BUYER_ROLE_VARS)
+    + BUYER_ROLE_APPENDIX
+    + FEW_SHOT_EXAMPLES
+)
 
 
 # ─────────────────────────────────────────────
@@ -756,14 +1096,19 @@ async def inventory_order_node(state: AgentState) -> dict:
     user_name = user_info.get("name", "사용자")
 
     # 역할별 시스템 프롬프트
+    # NOTE: AGENT_*_SYSTEM 안에는 BUYER_ROLE_APPENDIX 의 `{seller_name}`, `{name}` 같은
+    # LLM 안내용 중괄호와 FEW_SHOT_EXAMPLES 의 JSON 예시가 포함되어 있어 .format() 사용 시
+    # KeyError 가 발생한다. 반드시 _render_agent_system() (str.replace 기반) 을 사용한다.
     if user_role == "SELLER":
-        agent_system = AGENT_SELLER_SYSTEM.format(
+        agent_system = _render_agent_system(
+            AGENT_SELLER_SYSTEM,
             company_name=company_name,
             user_name=user_name,
             user_id=user_id,
         )
     else:
-        agent_system = AGENT_BUYER_SYSTEM.format(
+        agent_system = _render_agent_system(
+            AGENT_BUYER_SYSTEM,
             company_name=company_name,
             user_name=user_name,
             user_id=user_id,
@@ -877,10 +1222,11 @@ async def inventory_order_node(state: AgentState) -> dict:
                         "result": parsed_result,
                     })
 
-                # 마지막 라운드면 루프 종료
-                if round_idx == MAX_TOOL_ROUNDS - 1:
-                    break
                 # 다음 라운드로 계속
+                # 주의: MAX_TOOL_ROUNDS 마지막 라운드 분기 제거 —
+                # validator_node가 tool_round < 2 기준으로 RETRY를 직접 관리하므로
+                # 여기서 강제 break 하면 validator가 발동하기 전에 루프가 끝나 무의미해짐.
+                # for 루프 자체(range(MAX_TOOL_ROUNDS))가 자연스럽게 최대 횟수를 제한함.
                 continue
 
             # 예상치 못한 finish_reason
@@ -899,7 +1245,7 @@ async def inventory_order_node(state: AgentState) -> dict:
         "messages": new_messages,
         "tools_used": tools_used,
         "tool_results": all_tool_results,
-        "tool_round": state.get("tool_round", 0) + MAX_TOOL_ROUNDS,
+        "tool_round": state.get("tool_round", 0) + 1,
     }
 
 
@@ -969,14 +1315,32 @@ async def response_node(state: AgentState) -> dict:
             except Exception:
                 pass
 
-    # tool 결과에서 직접 message/error 추출 가능하면 LLM 없이 바로 반환
+    # tool 결과 단락회로 정책 (MEDIUM 7 비용 최적화):
+    # - 재고 부족 (LOW_STOCK / OUT_OF_STOCK) → LLM 통과 (타협안·대체거래처 자연어 생성)
+    # - success=False 인데 명확한 error/message 가 있으면 → 그 텍스트 그대로 반환 (LLM 우회)
+    # - success=True 정상 결과 → LLM 통과 (자연어 응답 생성)
+    def _is_stock_shortage(result: dict) -> bool:
+        """재고 부족 판정: product 필드 내 status 또는 stock_quantity 기반"""
+        product = result.get("product") or {}
+        if isinstance(product, dict):
+            if product.get("status") in ("LOW_STOCK", "OUT_OF_STOCK"):
+                return True
+        return False
+
     if tool_results_parsed:
         last = tool_results_parsed[-1]
         if isinstance(last, dict):
-            if last.get("message"):
-                return {"final_response": last["message"]}
-            if not last.get("success") and last.get("error"):
-                return {"final_response": f"처리 중 오류가 발생했습니다: {last['error']}"}
+            # 1) 재고 부족 → 무조건 LLM 통과 (타협안 생성)
+            if _is_stock_shortage(last):
+                pass  # 아래 LLM 요약으로 진행
+            # 2) 명확한 실패 메시지 → LLM 우회, 텍스트 그대로 반환
+            elif last.get("success") is False:
+                err_text = last.get("error") or last.get("message")
+                if isinstance(err_text, str) and err_text.strip():
+                    return {"final_response": err_text}
+                # 명확한 텍스트 없으면 LLM 통과
+            # 3) success=True 정상 결과 → LLM 통과 (자연어 생성)
+            #    기존 last.get("message") 단락회로는 제거 — 자연어 응답이 더 적절
 
     # 직접 추출 불가능한 경우만 LLM으로 요약
     # response_node는 라우터 프롬프트가 아닌 역할별 에이전트 프롬프트를 사용
@@ -984,13 +1348,15 @@ async def response_node(state: AgentState) -> dict:
     user_info = state.get("user_info", {})
     user_id = state.get("user_id", "")
     if user_role == "SELLER":
-        agent_sys = AGENT_SELLER_SYSTEM.format(
+        agent_sys = _render_agent_system(
+            AGENT_SELLER_SYSTEM,
             company_name=user_info.get("company_name", "미설정"),
             user_name=user_info.get("name", "사용자"),
             user_id=user_id,
         )
     else:
-        agent_sys = AGENT_BUYER_SYSTEM.format(
+        agent_sys = _render_agent_system(
+            AGENT_BUYER_SYSTEM,
             company_name=user_info.get("company_name", "미설정"),
             user_name=user_info.get("name", "사용자"),
             user_id=user_id,
@@ -1154,11 +1520,13 @@ class AgentOrchestrator:
             return {
                 "response": final_state.get("final_response") or "응답을 생성하지 못했습니다.",
                 "tools_used": final_state.get("tools_used", []),
+                "manual_review": final_state.get("manual_review", False),
             }
         except Exception as e:
             return {
                 "response": f"요청을 처리하는 중 오류가 발생했습니다: {str(e)}",
                 "tools_used": [],
+                "manual_review": False,
             }
 
 

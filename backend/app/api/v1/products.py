@@ -1,7 +1,7 @@
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.dependencies import get_current_user, require_seller
 from app.schemas.common import SuccessResponse
@@ -17,6 +17,8 @@ async def list_products(
     product_status: Optional[str] = None,
     seller_id: Optional[UUID] = None,
     search: Optional[str] = None,
+    max_price: Optional[int] = Query(default=None, ge=0, description="단가 상한 필터 (price_per_unit <= max_price)"),
+    min_stock: Optional[int] = Query(default=None, ge=0, description="재고 하한 필터 (stock_quantity >= min_stock)"),
     page: int = 1,
     limit: int = 20,
     current_user: dict = Depends(get_current_user),
@@ -31,6 +33,8 @@ async def list_products(
         category=category,
         status=product_status,
         search=search,
+        max_price=max_price,
+        min_stock=min_stock,
         page=page,
         limit=limit,
     )
