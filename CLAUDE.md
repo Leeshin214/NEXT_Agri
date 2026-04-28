@@ -88,19 +88,17 @@ curl -s "https://api.github.com/repos/Leeshin214/NEXT_Agri/issues?labels=pm-cycl
 - QA 2회 재시도 후에도 실패 (단 QA_BLOCKED는 아래 자동 처리)
 - public API 응답이 비어있거나 이슈 없음
 
-### QA_BLOCKED 자동 처리 (환경 이슈 fallback)
+### QA Tester 동작 방식
 
-`qa-tester-agent` 가 `QA_BLOCKED` 를 반환하면(Claude in Chrome 미연결, dev server 응답 없음 등 환경 이슈) **사용자에게 묻지 말고** 다음 fallback 순서로 자동 처리:
+`qa-tester-agent` 는 **브라우저 자동화를 사용하지 않고 코드 정적 분석으로만** QA 를 진행한다 (시간 비용·환경 의존성 최소화). 1-2분 안에 변경 영역의 잠재 버그·UX 페인 포인트를 식별해 리포트만 반환하고, 수정은 메인이 frontend/backend-agent 에 분배한다.
 
-1. **dev server 미실행이면 시작 시도**: backend(`uvicorn` background) + frontend(`npm run dev` background) → 30초 대기 후 QA 1회 재시도
-2. **Claude in Chrome 미연결이면 Claude Preview MCP fallback**: `mcp__Claude_Preview__preview_start` 로 자체 브라우저 띄워 같은 시나리오 재시도
-3. **둘 다 실패하면 정적 QA 강화**: 변경된 파일을 Read/Grep로 직접 분석 → 변경 영향을 코드 레벨에서 점검 → "QA_LIMITED" 마크 후 진행
-4. **commit + push 정상 진행**: validator PASS 상태이고 변경 범위가 시각적 요소(표시/토글/색상/라벨)면 자동 commit
-5. **다음 사이클 QA 우선순위 기록**: `qa-reports/<YYYY-MM-DD-HHmm>-pending.md` 에 이번 사이클 변경 영역을 다음 PM 입력으로 남겨, 다음 사이클이 자연스럽게 검증
+QA 결과는 두 가지:
+- **QA_PASSED** → commit + push 진행
+- **QA_FAILED** → 메인이 발견 이슈를 적절 agent 에 수정 위임 → validator → 다시 QA (최대 2회 재시도)
+  - Critical 이슈 → 즉시 수정
+  - Major/Minor 만 → 현재 사이클 commit 진행 + 다음 PM 사이클 후보로 기록
 
-이 절차로 환경 이슈가 사용자를 잡지 않게 한다. 자율 사이클의 핵심은 "사용자가 자리를 비워도 끝까지 진행"이며, QA의 100% 정확성보다 사이클 완결성 + 다음 사이클로의 자연스러운 검증 위임이 우선.
-
-**예외**: 변경 범위가 시각적 요소가 아닌 결제·인증·DB 마이그레이션·외부 API 통합 등 **High 위험도 영역**이면 QA_BLOCKED 시 commit 보류 후 사용자 보고. (PM 단계에서 이미 High는 보류 정책이라 일반적으로 발생 안 함)
+코드만 읽으므로 dev server 나 브라우저가 없어도 동작한다. `QA_BLOCKED` 는 일반적으로 발생하지 않는다 (Read/Grep/Bash 만 의존). 만에 하나 발생하면 사이클 commit 진행 후 다음 사이클로 검증 이월.
 
 ---
 
