@@ -43,6 +43,54 @@
 
 ---
 
+### 자율 사이클 트리거 (필수 자동 수행 절차)
+
+사용자가 **"사이클 실행해" / "사이클 시작해" / "PM 알림 왔어 진행해줘" / "최신 PM 이슈 작업 진행"** 등으로 자율 사이클을 트리거하면, **gh CLI 인증을 시도하지 말고 public API로 즉시 다음 흐름을 끝까지 자동 진행한다.** 사용자에게 추가 확인을 묻지 않는다 (Low 위험도 작업은 자동 진행이 정책).
+
+```bash
+# Step 1 — 워킹트리 정리 (빌드 산출물 등 noise 제거)
+git restore frontend/tsconfig.tsbuildinfo 2>/dev/null || true
+
+# Step 2 — caffeinate 백그라운드 시작 (4시간 sleep 차단)
+caffeinate -i -t 14400 &
+disown
+
+# Step 3 — 최신 PM Report 이슈 조회 (gh CLI 인증 불필요, public API)
+curl -s "https://api.github.com/repos/Leeshin214/NEXT_Agri/issues?labels=pm-cycle&state=open&per_page=1&sort=created&direction=desc"
+```
+
+응답 JSON에서 `body` 필드를 파싱하여 다음 처리:
+
+1. **위험도 Low 작업 추출** — `[Low]` 표시된 추천 작업 모두 자동 진행 대상
+2. **위험도 High 작업 보류** — 진행하지 않고 사이클 끝에 별도 항목으로 사용자에게 보고만
+3. **개발 위임** — 적절한 sub-agent (frontend-agent / backend-agent / ai-agent) 분배
+4. **검증** — validator-agent (VALIDATION_PASSED 까지 최대 3회 재시도)
+5. **QA** — qa-tester-agent (자율 사이클이므로 실행, 최대 2회 재시도)
+   - dev server 가 안 떠 있으면 backend(uvicorn) + frontend(npm run dev) 백그라운드로 시작 후 QA 진행
+6. **commit + push** — dev 브랜치에 변경사항 push
+7. **caffeinate 종료** — `pkill -x caffeinate`
+8. **최종 요약 보고**:
+   - 진행된 작업 목록
+   - QA 발견 이슈 + 수정 결과
+   - High 위험도 보류 항목 (사용자 검토 필요)
+   - 다음 사이클 권장사항 (있으면)
+
+### 자율 사이클 중 사용자 개입 금지 사항
+
+- gh CLI 인증 묻지 않기 (public API 사용)
+- "어느 작업을 진행할까요?" 묻지 않기 (위험도 Low 자동 진행 정책)
+- VALIDATION_FAILED 시 사용자에게 묻지 말고 자동 재시도 (최대 3회)
+- QA_FAILED 시 사용자에게 묻지 말고 자동 수정 위임 (최대 2회)
+- High 위험도 작업은 진행하지 않고 보류 — 묻지 말고 그냥 보류 후 보고만
+
+사용자 개입이 필요한 케이스 (이때만 멈추고 보고):
+- VALIDATION 3회 재시도 후에도 실패
+- QA 2회 재시도 후에도 실패
+- public API 응답이 비어있거나 이슈 없음
+- caffeinate 시작 실패 등 환경 이슈
+
+---
+
 ## 프로젝트 개요
 
 **서비스명**: AgriFlow  
