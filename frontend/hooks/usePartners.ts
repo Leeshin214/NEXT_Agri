@@ -14,6 +14,13 @@ import type {
 interface PartnerFilters {
   partner_status?: string;
   search?: string;
+  /**
+   * PM Report #8 작업 5 (V1.7) — last_trade_date / last_trade_amount 응답에 포함 여부.
+   * 백엔드 GET /partners 는 기본 false (성능 보호) — 거래처 페이지에서만 true 로 호출한다.
+   * 다른 페이지(orders 정기배송 매핑, 회원 검색의 partner status map 등)는 last_trade
+   * 가 필요 없으므로 추가 쿼리 비용을 발생시키지 않도록 false 유지.
+   */
+  include_last_trade?: boolean;
   page?: number;
   limit?: number;
 }

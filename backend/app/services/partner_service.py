@@ -1,6 +1,6 @@
 import asyncio
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -9,6 +9,9 @@ from postgrest.exceptions import APIError as PostgrestAPIError
 
 from app.core.supabase import get_supabase_client
 from app.schemas.common import PaginationMeta
+
+# KST = UTC+9 (DST 없음)
+_KST = timezone(timedelta(hours=9))
 
 
 class PartnerService:
@@ -31,6 +34,7 @@ class PartnerService:
         user_id: UUID,
         status: Optional[str] = None,
         search: Optional[str] = None,
+        include_last_trade: bool = False,
         page: int = 1,
         limit: int = 20,
     ) -> tuple[list[dict], PaginationMeta]:
@@ -73,6 +77,14 @@ class PartnerService:
             p["partner_phone"] = partner_user.get("phone")
             partners.append(p)
 
+        # 최근 거래 정보 채우기 (PM Report #8 작업 5)
+        # N+1 회피 — partners 의 모든 partner_user_id 를 모아 단일 쿼리로 양방향 orders 조회.
+        # include_last_trade=False (default) 면 추가 쿼리 자체를 스킵 → last_trade_* 는
+        # PartnerResponse Optional default(None) 로 응답된다. 거래처 페이지처럼 실제로
+        # 컬럼을 사용하는 화면만 ?include_last_trade=true 로 명시 호출.
+        if include_last_trade:
+            await self._attach_last_trades(partners=partners, my_user_id=str(user_id))
+
         meta = PaginationMeta(
             total=total,
             page=page,
@@ -80,6 +92,134 @@ class PartnerService:
             total_pages=math.ceil(total / limit) if total > 0 else 0,
         )
         return partners, meta
+
+    # ===========================================
+    # 최근 거래 정보 (PM Report #8 작업 5)
+    # ===========================================
+    async def _attach_last_trades(
+        self, *, partners: list[dict], my_user_id: str
+    ) -> None:
+        """partners 각 항목에 last_trade_date / last_trade_amount 를 채워 넣는다.
+
+        N+1 회피 전략:
+          1) partners 의 partner_user_id 들을 set 으로 모은다.
+          2) 단일 supabase 쿼리로 (me ↔ counterpart) 양방향 orders 를 created_at DESC 로 조회.
+             - WHERE deleted_at IS NULL AND status != 'CANCELLED'
+             - WHERE (buyer_id=me AND seller_id IN counterparts)
+                  OR (seller_id=me AND buyer_id IN counterparts)
+          3) 메모리에서 counterpart_id 별 첫 (가장 최근) row 만 픽업.
+          4) partners 리스트에 in-place 로 last_trade_* 필드를 세팅.
+
+        PostgREST 는 DISTINCT ON 을 지원하지 않으므로 ORDER BY DESC 후 메모리 그룹핑이
+        가장 단순하고 안정적. partner 1명당 평균 주문 N 건이라도 단일 쿼리 1회로 끝남.
+
+        - last_trade_date  : delivery_date 가 있으면 그 값, 없으면 created_at 의 KST 날짜.
+        - last_trade_amount: total_amount (KRW). NULL 이면 None.
+        - 거래 이력이 없는 partner 는 두 필드 모두 None 유지.
+        """
+        if not partners:
+            return
+
+        # 1) counterpart 후보 수집 (중복 제거)
+        counterpart_ids = {
+            str(p["partner_user_id"])
+            for p in partners
+            if p.get("partner_user_id")
+        }
+        if not counterpart_ids:
+            return
+
+        counterpart_list = list(counterpart_ids)
+        # PostgREST in.(...) — 콤마 구분, 따옴표 불필요 (UUID 는 안전 문자만 포함)
+        in_clause = f"({','.join(counterpart_list)})"
+
+        # 2) 단일 양방향 orders 쿼리
+        # or_(...) 구조 — me 는 buyer 이거나 seller, 반대편은 IN counterparts.
+        try:
+            orders_result = await asyncio.to_thread(
+                lambda: self.client.table("orders")
+                .select(
+                    "id, buyer_id, seller_id, total_amount, "
+                    "delivery_date, created_at, status"
+                )
+                .is_("deleted_at", None)
+                .neq("status", "CANCELLED")
+                .or_(
+                    f"and(buyer_id.eq.{my_user_id},seller_id.in.{in_clause}),"
+                    f"and(seller_id.eq.{my_user_id},buyer_id.in.{in_clause})"
+                )
+                .order("created_at", desc=True)
+                .execute()
+            )
+        except Exception as e:
+            # 거래 정보 조회 실패는 partners 응답을 막지 않음 — 로그 후 None 유지.
+            print(
+                f"[partner_service._attach_last_trades] orders 조회 실패: "
+                f"{type(e).__name__}: {e}"
+            )
+            return
+
+        orders = orders_result.data or []
+
+        # 3) counterpart_id 별 첫 row 만 픽업 (이미 created_at DESC 로 정렬됨)
+        latest_by_counterpart: dict[str, dict] = {}
+        for o in orders:
+            buyer_id = str(o.get("buyer_id") or "")
+            seller_id = str(o.get("seller_id") or "")
+            # counterpart = me 의 반대편
+            counterpart = seller_id if buyer_id == my_user_id else buyer_id
+            if counterpart in latest_by_counterpart:
+                continue  # 이미 더 최근 row 가 들어가 있음
+            latest_by_counterpart[counterpart] = o
+
+        # 4) partners 에 in-place 세팅
+        for p in partners:
+            counterpart = str(p.get("partner_user_id") or "")
+            order = latest_by_counterpart.get(counterpart)
+            if not order:
+                p["last_trade_date"] = None
+                p["last_trade_amount"] = None
+                continue
+
+            # last_trade_date — delivery_date 우선, 없으면 created_at 의 KST 날짜
+            trade_date_str: Optional[str] = None
+            delivery_date = order.get("delivery_date")
+            if delivery_date:
+                # supabase 는 DATE 컬럼을 ISO 문자열 'YYYY-MM-DD' 로 반환
+                if isinstance(delivery_date, str):
+                    trade_date_str = delivery_date[:10]
+                elif hasattr(delivery_date, "isoformat"):
+                    trade_date_str = delivery_date.isoformat()[:10]
+            else:
+                created_at = order.get("created_at")
+                trade_date_str = self._created_at_to_kst_date_str(created_at)
+
+            p["last_trade_date"] = trade_date_str
+
+            total_amount = order.get("total_amount")
+            p["last_trade_amount"] = (
+                int(total_amount) if total_amount is not None else None
+            )
+
+    @staticmethod
+    def _created_at_to_kst_date_str(created_at) -> Optional[str]:
+        """created_at (ISO 문자열 또는 datetime) 을 KST 기준 YYYY-MM-DD 로 변환."""
+        if not created_at:
+            return None
+        try:
+            if isinstance(created_at, str):
+                # 'Z' suffix → '+00:00' (Python 3.11+ fromisoformat 호환)
+                iso = created_at.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(iso)
+            else:
+                dt = created_at
+            if dt.tzinfo is None:
+                # naive datetime → UTC 로 가정
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(_KST).date().isoformat()
+        except Exception:
+            # 파싱 실패 — 첫 10자 fallback (이미 YYYY-MM-DD 면 그대로)
+            return str(created_at)[:10] if created_at else None
 
     # ===========================================
     # V1.6 — 양방향 승인 모델

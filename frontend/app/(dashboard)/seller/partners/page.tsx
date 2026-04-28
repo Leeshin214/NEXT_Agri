@@ -44,9 +44,13 @@ export default function SellerPartnersPage() {
 
   // 서버 사이드 필터 (search, partner_status)
   // V1.5 Phase 3: is_favorite 필터는 백엔드 list_partners 가 미지원 → 클라이언트 필터링
+  // V1.7 (PM Report #8 작업 5): 거래처 페이지에서만 last_trade_date / last_trade_amount 가
+  // 필요하므로 include_last_trade=true 명시. 다른 페이지의 usePartners() 호출은 추가 쿼리
+  // 비용을 발생시키지 않도록 그대로 둔다.
   const { data, isLoading } = usePartners({
     partner_status: statusFilter || undefined,
     search: search || undefined,
+    include_last_trade: true,
   });
   const partners = data?.data ?? [];
 
@@ -271,6 +275,54 @@ export default function SellerPartnersPage() {
           {formatDate(item.created_at)}
         </span>
       ),
+    },
+    {
+      // PM Report #8 작업 5 — 최근 거래 요약 ("YYYY. MM. DD. · 1,200,000원")
+      // 클릭 시 해당 거래처 필터로 주문 목록 페이지 이동 (행 onClick 차단)
+      key: 'last_trade',
+      header: '최근 거래',
+      render: (item) => {
+        const isPendingOutgoing = item.status === 'PENDING_OUTGOING';
+        const isPreTrade =
+          item.status === 'PENDING_OUTGOING' ||
+          item.status === 'PENDING_INCOMING';
+        const hasTrade =
+          !isPreTrade &&
+          item.last_trade_date != null &&
+          item.last_trade_amount != null;
+
+        if (!hasTrade) {
+          return (
+            <span
+              className={`text-sm text-gray-400 ${
+                isPendingOutgoing ? 'opacity-60' : ''
+              }`}
+            >
+              아직 거래 없음
+            </span>
+          );
+        }
+
+        return (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              router.push(
+                `/seller/orders?partner_user_id=${item.partner_user_id}`
+              );
+            }}
+            className={`text-left text-sm text-gray-700 hover:text-primary-700 hover:underline ${
+              isPendingOutgoing ? 'opacity-60' : ''
+            }`}
+            title="이 거래처의 주문 목록 보기"
+          >
+            {formatDate(item.last_trade_date as string)}
+            {' · '}
+            {(item.last_trade_amount as number).toLocaleString('ko-KR')}원
+          </button>
+        );
+      },
     },
     {
       key: 'status',

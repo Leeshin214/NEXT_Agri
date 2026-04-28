@@ -19,6 +19,12 @@ interface OrderFilters {
    * lib/api.ts 의 paramsSerializer 가 ?status_in=A&status_in=B (repeat) 형태로 직렬화한다.
    */
   status_in?: OrderStatus[];
+  /**
+   * PM Report #8 작업 5 (V1.7) — 양방향 거래처 필터.
+   * 백엔드 GET /orders 가 me ↔ partner_user_id 사이의 주문만 반환하도록 필터링.
+   * 거래처 페이지 "최근 거래" 컬럼 클릭 시 /{role}/orders?partner_user_id=... 로 진입하면 사용된다.
+   */
+  partner_user_id?: string;
   page?: number;
   limit?: number;
 }

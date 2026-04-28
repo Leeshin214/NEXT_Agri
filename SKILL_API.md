@@ -234,6 +234,13 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 # GET /orders - 주문 목록 (역할에 따라 내 주문)
 #   - order_status: Optional[str]                     단일 상태 (backward compat)
 #   - status_in:    Optional[list[str]] = Query(None) 다중 상태 — ?status_in=A&status_in=B
+#   - partner_user_id: Optional[UUID] = Query(None)   특정 거래처 user.id 양방향 OR 매칭
+#                                                      (PM Report #8 작업 5 후속, 2026-04-28)
+#                                                      (me==buyer AND counterpart==seller) OR
+#                                                      (me==seller AND counterpart==buyer)
+#                                                      → 전달 시 역할 기반 자동 필터를 대체.
+#                                                      거래처 페이지 "최근 거래" 셀 클릭 시
+#                                                      `?partner_user_id=...` 라우팅과 1:1 매칭.
 #   - page:  Query(1, ge=1)
 #   - limit: Query(20, ge=1, le=2000)                 프론트가 탭별 전체 조회 시 1000~2000 사용
 #   둘 다 전달 시 status_in 이 우선 적용. 빈 list 면 단일 status fallback 안 함.

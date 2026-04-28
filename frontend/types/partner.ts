@@ -29,6 +29,10 @@ export interface Partner {
   partner_company: string | null;
   partner_role: string | null;
   partner_phone: string | null;
+  // PM Report #8 작업 5 — 거래처 목록의 "최근 거래" 요약
+  // 백엔드 GET /api/v1/partners 응답에 포함됨. 거래 없으면 null.
+  last_trade_date?: string | null;   // ISO date 'YYYY-MM-DD'
+  last_trade_amount?: number | null; // KRW 정수
 }
 
 export interface PartnerCreate {

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { MessageCircle, PackageCheck, Plus } from 'lucide-react';
+import { MessageCircle, PackageCheck, Plus, X } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import DataTable, { type Column } from '@/components/common/DataTable';
 import StatusBadge from '@/components/common/StatusBadge';
@@ -128,10 +128,16 @@ export default function BuyerOrdersPage() {
   const isSubTab = !!activeTabDef?.isSubscription;
   const activeStatuses = activeTabDef?.statuses ?? [];
 
+  // PM Report #8 작업 5 (V1.7) — 거래처 페이지의 "최근 거래" 컬럼이
+  // /buyer/orders?partner_user_id=<uuid> 로 진입하면 해당 거래처 주문만 필터링
+  // (정기배송 탭에는 적용하지 않음 — 정기배송은 useSubscriptions 별도 흐름)
+  const partnerFilter = searchParams.get('partner_user_id') || undefined;
+
   // 일반 주문: 탭별로 백엔드에서 status_in 다중 필터로 받아옴
   // 정기배송 탭이면 useOrders 비활성 (status_in: [])
   const { data: listData, isLoading } = useOrders({
     status_in: isSubTab ? [] : activeStatuses,
+    partner_user_id: isSubTab ? undefined : partnerFilter,
     limit: 2000,
   });
   const filteredOrders = isSubTab ? [] : listData?.data ?? [];
@@ -141,8 +147,19 @@ export default function BuyerOrdersPage() {
   const allSubs: Subscription[] = isSubTab ? subsData.data?.data ?? [] : [];
 
   // 정기배송 탭의 거래처 매핑 — 행 클릭 시 PartnerDetailModal 오픈용
+  // (last_trade 필드는 여기서 불필요하므로 include_last_trade 미지정 → 기본 false)
   const partnersData = usePartners();
   const partners: Partner[] = partnersData.data?.data ?? [];
+
+  // partner_user_id 필터 활성 시 chip 에 표시할 거래처 이름 lookup
+  const filteredPartner = partnerFilter
+    ? partners.find((p) => p.partner_user_id === partnerFilter)
+    : null;
+  const filteredPartnerLabel =
+    filteredPartner?.nickname ||
+    filteredPartner?.partner_company ||
+    filteredPartner?.partner_name ||
+    '특정 거래처';
 
   // 상세는 별도 쿼리로 - 액션 직후 자동 refetch 위해
   const { data: detailData } = useOrder(selectedOrderId ?? '');
@@ -492,6 +509,22 @@ export default function BuyerOrdersPage() {
           );
         })}
       </div>
+
+      {/* PM Report #8 작업 5 — 활성 거래처 필터 chip (정기배송 탭에서는 미노출) */}
+      {!isSubTab && partnerFilter && (
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-gray-500">필터:</span>
+          <button
+            type="button"
+            onClick={() => router.push('/buyer/orders')}
+            className="inline-flex items-center gap-1 rounded-full bg-primary-50 px-3 py-1 text-xs text-primary-700 hover:bg-primary-100"
+            title="필터 해제"
+          >
+            거래처: {filteredPartnerLabel}
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
 
       {isSubTab ? (
         // 정기배송 탭

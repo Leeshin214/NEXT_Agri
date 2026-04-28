@@ -24,6 +24,13 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 async def list_orders(
     order_status: Optional[str] = None,
     status_in: Optional[list[str]] = Query(None),
+    partner_user_id: Optional[UUID] = Query(
+        None,
+        description=(
+            "특정 거래처(partner의 user_id) 와의 주문만 필터. "
+            "내가 buyer이고 상대가 seller, 또는 그 역까지 양방향 매칭."
+        ),
+    ),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=2000),
     current_user: dict = Depends(get_current_user),
@@ -33,6 +40,10 @@ async def list_orders(
     - order_status: 단일 상태 필터 (backward compat)
     - status_in: 다중 상태 필터 — `?status_in=COMPLETED&status_in=CANCELLED`
                  둘 다 전달 시 status_in 이 우선
+    - partner_user_id: 특정 거래처(상대 user.id) 와의 주문만 (양방향 OR 매칭).
+                       역할 기반 자동 필터(buyer_id/seller_id) 와 AND 결합되어
+                       (me==buyer AND counterpart==seller) OR
+                       (me==seller AND counterpart==buyer) 형태로 적용된다.
     - limit: 운영 안전을 위해 최대 2000 으로 제한
     """
     data, meta = await order_service.list_orders(
@@ -40,6 +51,7 @@ async def list_orders(
         role=current_user["role"],
         status=order_status,
         status_in=status_in,
+        partner_user_id=partner_user_id,
         page=page,
         limit=limit,
     )

@@ -512,14 +512,23 @@ class OrderService:
         role: str,
         status: Optional[str] = None,
         status_in: Optional[list[str]] = None,
+        partner_user_id: Optional[UUID] = None,
         page: int = 1,
         limit: int = 20,
     ) -> tuple[list[dict], PaginationMeta]:
         # join 임베딩으로 한 번에 buyer/seller/products 정보까지 가져온다 (N+1 제거)
         query = self.orders.select(ORDER_SELECT_WITH_JOINS, count="exact").is_("deleted_at", None)
 
-        # 역할에 따라 필터
-        if role == "BUYER":
+        # 역할에 따라 필터 (단, partner_user_id 가 있으면 양방향 OR 가 우선)
+        # 양방향 패턴은 partner_service.get_stats / _attach_last_trades 와 동일 — me ↔ counterpart.
+        if partner_user_id is not None:
+            user_id_str = str(user_id)
+            counterpart_str = str(partner_user_id)
+            query = query.or_(
+                f"and(buyer_id.eq.{user_id_str},seller_id.eq.{counterpart_str}),"
+                f"and(seller_id.eq.{user_id_str},buyer_id.eq.{counterpart_str})"
+            )
+        elif role == "BUYER":
             query = query.eq("buyer_id", str(user_id))
         else:
             query = query.eq("seller_id", str(user_id))

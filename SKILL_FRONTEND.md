@@ -954,7 +954,8 @@ const filtered = data?.data ?? [];  // 서버가 필터링한 결과 그대로 �
 // hooks/useOrders.ts
 interface OrderFilters {
   order_status?: OrderStatus;
-  status_in?: OrderStatus[];   // 다중 상태 필터 — 백엔드 GET /orders 의 status_in 다중 query 와 매핑
+  status_in?: OrderStatus[];        // 다중 상태 필터 — 백엔드 GET /orders 의 status_in 다중 query 와 매핑
+  partner_user_id?: string;         // V1.7 — 양방향 거래처 필터 (me ↔ partner_user_id 사이의 주문만)
   page?: number;
   limit?: number;
 }
@@ -973,6 +974,51 @@ const filteredOrders = listData?.data ?? [];   // 서버가 필터링한 결과 
 - 탭 전환 시 React Query `queryKey: ['orders', filters]` 가 `status_in` 배열 변화로 자동 refetch
 - 카운트 뱃지: 활성 탭만 `(N)` 표시 (서버에서 비활성 탭의 카운트를 한 번에 알 수 없으므로 비활성 탭은 카운트 생략)
 - 데이터 테이블은 `<div className="max-h-[calc(100vh-280px)] overflow-y-auto rounded-xl">` 로 감싸서 헤더 위치 고정 + 본문 스크롤
+
+#### orders 페이지 — partner_user_id 필터 chip 패턴 (검증됨, 2026-04-28, V1.7)
+
+거래처 페이지 "최근 거래" 컬럼 클릭 시 `/{role}/orders?partner_user_id=<uuid>` 로 진입한다.
+주문 페이지에서 `searchParams.get('partner_user_id')` 로 읽어 `useOrders({ partner_user_id })` 에 전달.
+
+- **정기배송 탭에는 적용하지 않음** — 정기배송은 `useSubscriptions` 별도 흐름이므로 `isSubTab ? undefined : partnerFilter` 로 가드.
+- 거래처 이름 lookup: `usePartners()` (인자 없음) 결과에서 `partner_user_id` 매칭. fallback 은 `'특정 거래처'`.
+  - 이미 정기배송 탭의 `PartnerDetailModal` 매핑용으로 호출 중이라 별도 호출 불필요.
+- chip UI 는 정기배송 탭에서는 미노출 (`!isSubTab && partnerFilter`), 탭 위에 위치:
+
+```tsx
+{!isSubTab && partnerFilter && (
+  <div className="mb-3 flex flex-wrap items-center gap-2">
+    <span className="text-xs text-gray-500">필터:</span>
+    <button
+      type="button"
+      onClick={() => router.push('/buyer/orders')}   // partner_user_id 빠진 URL 로 이동
+      className="inline-flex items-center gap-1 rounded-full bg-primary-50 px-3 py-1 text-xs text-primary-700 hover:bg-primary-100"
+      title="필터 해제"
+    >
+      거래처: {filteredPartnerLabel}
+      <X className="h-3 w-3" />
+    </button>
+  </div>
+)}
+```
+
+#### usePartners — include_last_trade 옵션 (검증됨, 2026-04-28, V1.7)
+
+`PartnerFilters` 에 `include_last_trade?: boolean` 추가. 백엔드 GET /partners 는 기본 false 로 last_trade_date / last_trade_amount 를 응답에 포함하지 않는다 (집계 비용 보호). 거래처 페이지에서만 명시적으로 true 로 호출.
+
+```typescript
+// 거래처 페이지 (last_trade 컬럼 노출 필요)
+const { data } = usePartners({
+  partner_status: ...,
+  search: ...,
+  include_last_trade: true,
+});
+
+// 다른 페이지 (orders 정기배송 매핑, members, subscriptions, AddPartnerModal 등) — 인자 없이 호출 유지
+const { data } = usePartners();
+```
+
+**주의 — React Query 캐시 분리**: queryKey 가 `['partners', filters]` 라서 `usePartners({ include_last_trade: true })` 와 `usePartners()` 는 별도 캐시 슬롯을 차지한다. 거래처 페이지(last_trade 포함)와 다른 페이지(last_trade 없음)가 같은 사용자 세션에서 두 번 fetch 되는 trade-off 가 발생하지만, 다른 페이지에서 불필요한 집계 비용을 피하는 설계 의도와 일치한다.
 
 #### lib/api.ts 배열 query param 직렬화 (검증됨, 2026-04-27)
 
@@ -1798,12 +1844,55 @@ seller/buyer 양쪽 page.tsx 의 차이는 다음으로만 한정 (diff 검증):
 - 컴포넌트명 (`SellerPartnersPage` vs `BuyerPartnersPage`)
 - 채팅 라우트 (`/seller/chat` vs `/buyer/chat`)
 - 주문 작성 라우트 (`/seller/orders/new?buyer_id=` vs `/buyer/browse?seller_id=`)
+- 최근 거래 컬럼 라우트 (`/seller/orders?partner_user_id=` vs `/buyer/orders?partner_user_id=`)
 - `showCreateOrderAction` (false vs true)
 - log prefix (`[seller/partners]` vs `[buyer/partners]`)
 - copy (`바이어 거래처` vs `공급처`, 검색 placeholder)
 - `myRole` ('SELLER' vs 'BUYER')
 
 즐겨찾기 토글, 삭제 핸들러, useMemo 정렬 로직 등은 양쪽 완전히 동일.
+
+##### 최근 거래 컬럼 (PM Report #8 작업 5)
+
+`partners` 응답에 `last_trade_date` (ISO 'YYYY-MM-DD'), `last_trade_amount` (KRW int) 두 옵션 필드가 포함됨. 거래 없으면 둘 다 null.
+
+거래처 목록 컬럼 순서: `즐겨찾기 / 업체명 / 유형 / 등록일 / 최근 거래 / 상태 / 액션`. 컬럼 위치는 등록일과 상태 사이.
+
+```tsx
+{
+  key: 'last_trade',
+  header: '최근 거래',
+  render: (item) => {
+    // PENDING_OUTGOING/INCOMING 은 거래가 있을 수 없으므로 항상 '아직 거래 없음'
+    const isPreTrade =
+      item.status === 'PENDING_OUTGOING' || item.status === 'PENDING_INCOMING';
+    const hasTrade =
+      !isPreTrade && item.last_trade_date != null && item.last_trade_amount != null;
+
+    if (!hasTrade) return <span className="text-sm text-gray-400">아직 거래 없음</span>;
+
+    return (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation(); // 행 onClick(상세 모달) 차단
+          router.push(`/seller/orders?partner_user_id=${item.partner_user_id}`);
+        }}
+        className="text-left text-sm text-gray-700 hover:text-primary-700 hover:underline"
+      >
+        {formatDate(item.last_trade_date as string)}
+        {' · '}
+        {(item.last_trade_amount as number).toLocaleString('ko-KR')}원
+      </button>
+    );
+  },
+},
+```
+
+- 날짜 포맷은 기존 등록일과 동일하게 `formatDate` 재사용 (ko-KR 'YYYY. MM. DD.').
+- 금액 포맷은 `.toLocaleString('ko-KR')` + '원' (천단위 콤마).
+- 행 onClick 이 거래처 상세 모달을 열기 때문에 셀 내부 버튼은 반드시 `e.stopPropagation()` 호출.
+- `PENDING_OUTGOING` 행은 다른 컬럼들과 동일하게 `opacity-60` 적용.
 
 ---
 

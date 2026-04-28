@@ -551,3 +551,56 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
   - **상태별 동작**: `status='ACTIVE'` 만 캘린더 INSERT/UPDATE. `PENDING`/`PAUSED`/`CANCELLED`/`ENDED`/`REJECTED` 는 `_cleanup_subscription_future_events` 로 미래 일정만 soft-delete (event_date >= today; 이미 회차 주문이 생성된 과거 일정은 이력 보존).
   - **백필 미수행**: 마이그레이션 20260428000003 은 컬럼/인덱스만 추가하고 기존 ACTIVE 정기배송에 대한 backfill 은 수행하지 않는다. 신규 mutation 부터만 동기화. 운영 데이터 양이 적고 사용자 수동 등록 일정과 중복 가능성 때문 — 필요 시 별도 운영 스크립트로 후처리.
   - **응답 스키마**: `CalendarEventResponse.subscription_id: Optional[UUID]` 필드를 추가해 프론트가 정기배송 일정과 일반 일정을 구분할 수 있도록 노출.
+
+- **PostgREST 다건 양방향 N+1 회피 — IN 절 + 메모리 그룹핑 (2026-04-28, PartnerResponse.last_trade_*)**: `partners` 목록 응답에 거래처별 "최근 거래 1건" 을 붙일 때, partner 마다 orders 를 1번씩 조회하면 N+1. PostgREST 는 `DISTINCT ON` 을 지원하지 않으므로 다음 패턴이 검증된 최선책:
+  ```python
+  # 1) counterpart_ids 수집 (set 으로 중복 제거)
+  counterpart_ids = {str(p["partner_user_id"]) for p in partners}
+  in_clause = f"({','.join(counterpart_ids)})"  # UUID 는 안전 문자만 포함, 따옴표 불필요
+
+  # 2) 단일 양방향 쿼리 — me ↔ counterparts (created_at DESC)
+  result = await asyncio.to_thread(lambda: client.table("orders")
+      .select("id, buyer_id, seller_id, total_amount, delivery_date, created_at, status")
+      .is_("deleted_at", None)
+      .neq("status", "CANCELLED")
+      .or_(
+          f"and(buyer_id.eq.{my_user_id},seller_id.in.{in_clause}),"
+          f"and(seller_id.eq.{my_user_id},buyer_id.in.{in_clause})"
+      )
+      .order("created_at", desc=True)
+      .execute()
+  )
+
+  # 3) 메모리에서 counterpart_id 별 첫 row 만 픽업 (이미 DESC 정렬됨)
+  latest_by_counterpart: dict[str, dict] = {}
+  for o in result.data or []:
+      counterpart = o["seller_id"] if o["buyer_id"] == my_user_id else o["buyer_id"]
+      if counterpart not in latest_by_counterpart:
+          latest_by_counterpart[counterpart] = o
+  ```
+  - `get_stats` 의 단건 양방향 패턴 (단일 partner 대상) 을 다건으로 확장한 형태.
+  - PostgREST `in.(...)` 문법 — UUID/숫자처럼 안전 문자만 들어가는 컬럼이면 따옴표 없이 OK. 문자열·검색어를 IN 으로 넣을 때는 PostgREST 의 `or_` PEG 파서가 깨질 수 있어 escape 필요.
+  - partners 1페이지 (limit 20) × 평균 N 건 주문 = 단일 쿼리 1회로 끝. counterpart 가 비어있으면 쿼리 자체를 스킵.
+  - `or_()` 안의 `and(buyer_id.eq.X,seller_id.in.(...))` — PostgREST 는 한 줄 안에 `and(...)` 와 `in.(...)` 를 함께 쓸 수 있지만 인용/공백에 민감. PEP 끊어쓰기 금지.
+
+- **created_at (UTC TIMESTAMPTZ) → KST 날짜 변환 헬퍼 (검증됨, 2026-04-28)**: Supabase 에서 받은 `created_at` 은 보통 ISO 문자열 (`2026-04-28T05:30:00+00:00` 또는 `Z` suffix). KST 날짜 (YYYY-MM-DD) 가 필요할 때 단순 `[:10]` slice 는 자정 부근에서 하루 어긋난다. `Asia/Seoul = UTC+9` 고정 (DST 없음) 이라 `timezone(timedelta(hours=9))` 상수로 충분.
+  ```python
+  _KST = timezone(timedelta(hours=9))
+
+  @staticmethod
+  def _created_at_to_kst_date_str(created_at) -> Optional[str]:
+      if not created_at:
+          return None
+      try:
+          if isinstance(created_at, str):
+              dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+          else:
+              dt = created_at
+          if dt.tzinfo is None:
+              dt = dt.replace(tzinfo=timezone.utc)
+          return dt.astimezone(_KST).date().isoformat()
+      except Exception:
+          return str(created_at)[:10] if created_at else None
+  ```
+  - `Z` suffix 처리 필수 — Python `datetime.fromisoformat` 은 3.11+ 부터만 `Z` 직접 파싱 지원. `replace("Z", "+00:00")` 가 안전하다.
+  - `delivery_date` 같은 DATE 컬럼은 timezone 불필요 — 그대로 `[:10]` slice.
