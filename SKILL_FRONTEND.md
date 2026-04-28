@@ -1804,22 +1804,55 @@ export function usePartnerStatusMap(): Map<string, PartnerStatus> {
 
 PENDING_INCOMING 카드의 수락 버튼은 회원 user_id 가 아닌 **partner row id** 를 사용한다 — `useAcceptPartner.mutate(partnerId)`. 회원 카드 컴포넌트에서는 `partnerIdByUserId.get(member.id)` 로 partner.id 매핑.
 
-##### 거래처 페이지 상단 — 받은 요청 / 보낸 요청 섹션
+##### 거래처 페이지 상단 — 받은 요청 섹션 + 메인 리스트 통합 (PENDING_OUTGOING 비대칭 버그 수정, 2026-04-28)
 
 ```tsx
-// 본인 row.status 기준으로 3분류
+// PENDING_INCOMING 만 별도 섹션 (수락/거절 액션 필요 → 분리 UI 정당)
 const incomingRequests = partners.filter((p) => p.status === 'PENDING_INCOMING');
-const outgoingRequests = partners.filter((p) => p.status === 'PENDING_OUTGOING');
+// PENDING_OUTGOING 은 메인 리스트에 통합 — 본인이 보낸 요청도 자기 거래처 화면에 보이도록
 const mainListPartners = partners.filter(
-  (p) => p.status !== 'PENDING_OUTGOING' && p.status !== 'PENDING_INCOMING'
+  (p) =>
+    p.status === 'ACTIVE' ||
+    p.status === 'INACTIVE' ||
+    p.status === 'PENDING' ||           // deprecated 호환
+    p.status === 'PENDING_OUTGOING'     // 본인이 보낸 요청도 메인 노출
 );
 ```
 
-- 받은 요청 섹션: `bg-blue-50 border border-blue-200 rounded-xl`. 각 행에 [수락] [거절] 버튼.
-- 보낸 요청 섹션: `bg-yellow-50 border border-yellow-200 rounded-xl`. "수락 대기 중" 텍스트 + [요청 회수] 버튼 (window.confirm 후 reject 호출).
-- 메인 데이터 테이블은 `mainListPartners` 만 노출 — PENDING_OUTGOING/INCOMING 은 상단 섹션에서만.
+**버그 배경**: 이전 구조에선 `PENDING_OUTGOING` row 가 메인 리스트에서 제외되고 "보낸 요청" 별도 섹션에만 표시됐다. 그런데 동일한 거래 관계의 반대편(PENDING_INCOMING) 사용자에겐 "받은 요청" 섹션에 정상 노출 → 본인 메인 거래처 리스트에서 자기 보낸 요청을 못 찾는 비대칭이 발생. **수정**: PENDING_OUTGOING 을 메인 테이블에 통합 + 시각적 구분(opacity-60 + "승인 대기 중" 안내) + 빠른 액션(채팅/주문) 비활성. "보낸 요청" 별도 섹션은 제거.
 
-`useAcceptPartner` / `useRejectPartner` 훅은 mutation 성공 시 `['partners']` 만 invalidate. accept 는 양쪽 row 가 ACTIVE 로 전환되므로 자동으로 메인 리스트에 등장.
+- 받은 요청 섹션: `bg-blue-50 border border-blue-200 rounded-xl`. 각 행에 [수락] [거절] 버튼.
+- 메인 테이블의 PENDING_OUTGOING row:
+  - 업체명 셀에 `opacity-60` 적용, 부가 텍스트로 `· 승인 대기 중` (text-yellow-700) 노출
+  - StatusBadge 는 그대로 PARTNER_STATUS_CONFIG 의 "보낸 요청" (yellow) 뱃지 표시
+  - 즐겨찾기 토글 / 채팅 버튼 / 주문 작성 버튼 모두 `disabled + cursor-not-allowed opacity-40` (아직 거래처가 아니므로)
+  - 삭제 버튼은 활성 (라벨/툴팁만 "요청 회수" 로 변경, `aria-label` 도 동일)
+  - `handleDeletePartner` 가 status 검사해서 confirm 메시지를 다르게: `'X' 에게 보낸 거래처 요청을 회수하시겠습니까?` vs `'X' 거래처를 삭제하시겠습니까?\n진행 중인 정기배송이 일시정지됩니다.`
+- 행 클릭 → PartnerDetailModal 진입 가능. 모달 안에서도 동일한 잠금 처리.
+
+##### PartnerDetailModal — PENDING_OUTGOING 잠금 처리
+
+```tsx
+const isPendingOutgoing = partner.status === 'PENDING_OUTGOING';
+
+// 헤더의 즐겨찾기 / 채팅 시작 / 주문 작성 모두 disabled + opacity-40
+// 거래처 삭제 버튼은 활성, 라벨만 "요청 회수" 로
+{isPendingOutgoing ? '요청 회수' : '거래처 삭제'}
+
+// 안내 띠 (헤더 바로 아래)
+{isPendingOutgoing && (
+  <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-yellow-800">
+    <Clock /> 보낸 거래처 요청이 수락되기 전까지 ... 거래 액션을 사용할 수 없습니다.
+  </div>
+)}
+
+// 정기배송 관련 섹션은 전부 isPendingOutgoing 일 때 숨김
+{!isPendingOutgoing && incomingPendingSubs.length > 0 && (...)}
+{!isPendingOutgoing && outgoingPendingSubs.length > 0 && (...)}
+{!isPendingOutgoing && (<section>정기배송 ({sortedSubs.length})</section>)}
+```
+
+`useAcceptPartner` / `useRejectPartner` 훅은 mutation 성공 시 `['partners']` 만 invalidate. accept 는 양쪽 row 가 ACTIVE 로 전환되므로 자동으로 메인 리스트에서 PENDING_OUTGOING → ACTIVE 로 자연 전환된다(opacity-60 / 잠금 해제 자동 적용).
 
 ##### 정기배송 SubscriptionStatus 확장
 

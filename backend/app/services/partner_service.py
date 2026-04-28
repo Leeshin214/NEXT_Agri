@@ -385,21 +385,73 @@ class PartnerService:
         return result.data[0] if result.data else None
 
     async def delete_partner(self, partner_id: UUID, user_id: UUID) -> bool:
-        """soft delete — deleted_at 컬럼에 현재 UTC 시각을 기록한다.
+        """soft delete — V1.6 양방향 동기화.
 
-        다른 서비스(product, order, calendar)와 동일한 패턴.
-        이미 삭제된 행은 .is_("deleted_at", None) 조건에서 제외되어 False 반환.
+        본인 row + 반대편 row(존재 시) 모두 deleted_at 세팅.
+        - 본인 row 가 없거나 이미 삭제됨 → False (router 가 404 처리)
+        - 반대편 row soft-delete 실패는 best-effort (로그만 남기고 본인 결과 유지)
+        - 멱등성: 이미 삭제된 row 는 .is_("deleted_at", None) 필터로 자동 스킵 → False
         시그니처는 기존과 동일 (partner_id: UUID, user_id: UUID) → bool.
+        accept_partner / reject_partner 와 동일한 패턴 (_find_counterpart_row 재사용).
         """
+        user_id_str = str(user_id)
         deleted_at = datetime.now(timezone.utc).isoformat()
-        result = await asyncio.to_thread(
+
+        # 1) 본인 row 조회 (status 무관, 본인 소유 + 미삭제 검증)
+        my_result = await asyncio.to_thread(
+            lambda: self.table.select("id, user_id, partner_user_id, status, deleted_at")
+            .eq("id", str(partner_id))
+            .eq("user_id", user_id_str)
+            .is_("deleted_at", None)
+            .limit(1)
+            .execute()
+        )
+        my_rows = my_result.data or []
+        if not my_rows:
+            # 없거나 이미 삭제됨 → router 가 404 응답
+            return False
+
+        my_row = my_rows[0]
+        partner_user_id_str = str(my_row["partner_user_id"])
+
+        # 2) 반대편 row 조회 (best-effort)
+        counterpart = await self._find_counterpart_row(
+            my_user_id=user_id_str,
+            partner_user_id=partner_user_id_str,
+        )
+
+        # 3) 본인 row soft-delete
+        my_update_result = await asyncio.to_thread(
             lambda: self.table.update({"deleted_at": deleted_at})
             .eq("id", str(partner_id))
-            .eq("user_id", str(user_id))
+            .eq("user_id", user_id_str)
             .is_("deleted_at", None)
             .execute()
         )
-        return bool(result.data)
+
+        # 4) 반대편 row soft-delete (있을 때만, best-effort)
+        if counterpart and counterpart.get("id"):
+            try:
+                await asyncio.to_thread(
+                    lambda: self.table.update({"deleted_at": deleted_at})
+                    .eq("id", counterpart["id"])
+                    .is_("deleted_at", None)
+                    .execute()
+                )
+            except Exception as e:
+                print(
+                    f"[partner_service.delete_partner] 반대편 soft-delete 실패 "
+                    f"counterpart_id={counterpart['id']}: {type(e).__name__}: {e}"
+                )
+        else:
+            # 반대편 row 가 없는 케이스 — 마이그레이션 전 단방향 데이터 등.
+            # 본인 row 만 처리하고 진행 (best-effort).
+            print(
+                f"[partner_service.delete_partner] 반대편 row 없음 "
+                f"my_user={user_id_str} partner_user={partner_user_id_str}"
+            )
+
+        return bool(my_update_result.data)
 
     # ===========================================
     # 거래처 통계 (V1.5 Phase 1)

@@ -180,7 +180,12 @@ export default function PartnerDetailModal({
     return <Modal isOpen={false} onClose={onClose} title="" size="xl">{null}</Modal>;
   }
 
+  // V1.6 — 본인이 보낸 거래처 요청은 아직 거래처가 아님.
+  // 채팅/주문/즐겨찾기/정기배송 등 모든 거래 액션을 잠그고, 요청 회수만 허용한다.
+  const isPendingOutgoing = partner.status === 'PENDING_OUTGOING';
+
   const handleToggleFavorite = () => {
+    if (isPendingOutgoing) return;
     toggleFavorite.mutate({ id: partner.id, is_favorite: !partner.is_favorite });
   };
 
@@ -284,7 +289,13 @@ export default function PartnerDetailModal({
               <button
                 type="button"
                 onClick={handleToggleFavorite}
-                className="text-gray-300 hover:text-yellow-400"
+                disabled={isPendingOutgoing}
+                title={isPendingOutgoing ? '승인 후 사용 가능합니다' : undefined}
+                className={`text-gray-300 ${
+                  isPendingOutgoing
+                    ? 'cursor-not-allowed opacity-40'
+                    : 'hover:text-yellow-400'
+                }`}
                 aria-label={partner.is_favorite ? '즐겨찾기 해제' : '즐겨찾기 등록'}
               >
                 <Star
@@ -299,8 +310,17 @@ export default function PartnerDetailModal({
               <button
                 type="button"
                 onClick={handleStartChat}
-                disabled={chatPending}
-                className="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                disabled={chatPending || isPendingOutgoing}
+                title={
+                  isPendingOutgoing
+                    ? '승인 후 사용 가능합니다'
+                    : undefined
+                }
+                className={`inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 ${
+                  isPendingOutgoing
+                    ? 'cursor-not-allowed opacity-40'
+                    : 'hover:bg-gray-50 disabled:opacity-50'
+                }`}
               >
                 <MessageCircle className="h-3.5 w-3.5" />
                 채팅 시작
@@ -309,13 +329,24 @@ export default function PartnerDetailModal({
                 <button
                   type="button"
                   onClick={handleCreateOrder}
-                  className="inline-flex items-center gap-1 rounded-lg bg-primary-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-700"
+                  disabled={isPendingOutgoing}
+                  title={
+                    isPendingOutgoing
+                      ? '승인 후 사용 가능합니다'
+                      : undefined
+                  }
+                  className={`inline-flex items-center gap-1 rounded-lg bg-primary-600 px-3 py-1.5 text-xs font-medium text-white ${
+                    isPendingOutgoing
+                      ? 'cursor-not-allowed opacity-40'
+                      : 'hover:bg-primary-700'
+                  }`}
                 >
                   <FileText className="h-3.5 w-3.5" />
                   주문 작성
                 </button>
               )}
               {/* V1.5 Phase 3: 거래처 삭제 (페이지 컨테이너 핸들러로 위임) */}
+              {/* V1.6: PENDING_OUTGOING 이면 "요청 회수" 라벨로 표시 */}
               {onDelete && (
                 <button
                   type="button"
@@ -324,11 +355,22 @@ export default function PartnerDetailModal({
                   className="inline-flex items-center gap-1 rounded-lg border border-red-300 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-50"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
-                  거래처 삭제
+                  {isPendingOutgoing ? '요청 회수' : '거래처 삭제'}
                 </button>
               )}
             </div>
           </div>
+
+          {/* V1.6 — 보낸 거래처 요청 안내 */}
+          {isPendingOutgoing && (
+            <div className="flex items-center gap-2 rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-800">
+              <Clock className="h-4 w-4 flex-shrink-0" />
+              <span>
+                보낸 거래처 요청이 수락되기 전까지 채팅 시작·주문 작성·정기배송
+                등록 등의 거래 액션을 사용할 수 없습니다.
+              </span>
+            </div>
+          )}
 
           {/* 섹션 1 — 프로필 */}
           <section>
@@ -514,8 +556,8 @@ export default function PartnerDetailModal({
             </div>
           </section>
 
-          {/* V1.6 — 받은 정기배송 요청 */}
-          {incomingPendingSubs.length > 0 && (
+          {/* V1.6 — 받은 정기배송 요청 (보낸 거래처 요청 상태에선 정기배송 자체를 노출하지 않음) */}
+          {!isPendingOutgoing && incomingPendingSubs.length > 0 && (
             <section className="rounded-lg border border-blue-200 bg-blue-50 p-3">
               <h3 className="flex items-center gap-2 text-sm font-semibold text-blue-900">
                 <Inbox className="h-4 w-4" />
@@ -574,7 +616,7 @@ export default function PartnerDetailModal({
           )}
 
           {/* V1.6 — 보낸 정기배송 요청 (수락 대기 중) */}
-          {outgoingPendingSubs.length > 0 && (
+          {!isPendingOutgoing && outgoingPendingSubs.length > 0 && (
             <section className="rounded-lg border border-yellow-200 bg-yellow-50 p-3">
               <h3 className="flex items-center gap-2 text-sm font-semibold text-yellow-900">
                 <Clock className="h-4 w-4" />
@@ -630,6 +672,8 @@ export default function PartnerDetailModal({
           )}
 
           {/* 섹션 4 — 정기배송 (메인 리스트, ACTIVE/PAUSED/ENDED 등) */}
+          {/* V1.6: PENDING_OUTGOING(승인 대기) 상태에선 정기배송 섹션 자체를 숨김 */}
+          {!isPendingOutgoing && (
           <section>
             <div className="mb-2 flex items-center justify-between">
               <h3 className="text-sm font-semibold text-gray-700">
@@ -798,6 +842,7 @@ export default function PartnerDetailModal({
               </ul>
             )}
           </section>
+          )}
         </div>
       </Modal>
 

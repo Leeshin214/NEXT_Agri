@@ -507,6 +507,30 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 
 - **partners.status — V1 즐겨찾기 모델 (Option A): 등록 즉시 ACTIVE 고정 (2026-04-27)**: `partners` 테이블 status 컬럼의 SQL DEFAULT 는 `'ACTIVE'` (`20260321000003_create_partners.sql`) 이며, V1 에서는 양방향 승인(PENDING → ACTIVE) 플로우를 구현하지 않고 즐겨찾기 모델로 단순화한다. `partner_service.create_partner` 는 INSERT payload 에 `"status": "ACTIVE"` 를 명시적으로 박아 전달한다 (DB default 와 동일하지만, 미래에 default 가 바뀌어도 V1 정책이 깨지지 않도록 방어). `PartnerCreate` schema 는 `status` 필드를 받지 않아 클라이언트가 PENDING 으로 등록할 수 없다. 단, PATCH `/partners/{id}` 는 `PartnerUpdate.status: Optional[str]` 로 사용자가 직접 INACTIVE 등으로 전이 가능 — 이는 즐겨찾기 해제/거래 종료 의미. 추후 양방향 승인 모델 도입 시 `PartnerStatus` enum 의 `PENDING` 을 그대로 재사용할 수 있도록 enum 자체는 유지(`ACTIVE`/`INACTIVE`/`PENDING` 3종 보존).
 
+- **partners 양방향 동기화 — create/accept/reject/delete 모두 두 row 처리 (V1.6, 2026-04-28 delete 버그 수정)**: V1.6 양방향 승인 모델에서는 거래 관계 1건 = 본인 row(`user_id=A, partner_user_id=B`) + 반대편 row(`user_id=B, partner_user_id=A`) 두 row 가 항상 짝으로 존재한다. 이 때문에 status/soft-delete 를 변경하는 모든 서비스 메서드는 양쪽을 함께 처리해야 한다. 단방향만 처리하면 상대방 거래처 목록에서 비대칭 상태로 보이는 정합성 버그가 발생한다 (예: 본인은 삭제했는데 상대 화면에선 ACTIVE 로 계속 보임).
+  ```python
+  # _find_counterpart_row 헬퍼 — partner_service.py
+  async def _find_counterpart_row(self, *, my_user_id: str, partner_user_id: str) -> Optional[dict]:
+      result = await asyncio.to_thread(
+          lambda: self.table.select("*")
+          .eq("user_id", partner_user_id)        # 반대편의 user_id = 본인의 partner_user_id
+          .eq("partner_user_id", my_user_id)     # 반대편의 partner_user_id = 본인의 user_id
+          .is_("deleted_at", None)
+          .limit(1).execute()
+      )
+      return result.data[0] if result.data else None
+
+  # delete_partner — 본인 + 반대편 모두 soft-delete (호출 시그니처는 키워드)
+  counterpart = await self._find_counterpart_row(
+      my_user_id=user_id_str,
+      partner_user_id=partner_user_id_str,
+  )
+  ```
+  - 호출 시그니처는 항상 키워드 인자(`my_user_id=`, `partner_user_id=`) — `accept_partner` / `reject_partner` / `delete_partner` 모두 동일.
+  - 본인 row 처리는 strict (없으면 404), 반대편 row 처리는 best-effort (try/except + 로그) — 마이그레이션 전 단방향 데이터나 이미 정리된 row 가 있을 수 있음.
+  - 멱등성: 본인 row 조회/UPDATE 모두 `.is_("deleted_at", None)` 필터를 거치므로 같은 partner_id 로 두 번째 호출하면 404 반환. 반대편도 마찬가지로 두 번째 호출에서는 `_find_counterpart_row` 가 None 을 반환해 자동 스킵.
+  - return 타입은 기존과 동일 (`bool` for delete, `dict` for accept, `bool` for reject) → router 코드 변경 없음.
+
 - **subscriptions / subscription_items 정합성 — RLS 컨벤션 통일 (2026-04-28)**: 새 마이그레이션의 RLS 정책은 반드시 기존 프로젝트 컨벤션 `id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())` 패턴을 따라야 한다. 외부 명세에 `auth.uid() = buyer_id` 형태가 있더라도 그대로 적용하면 안 된다 — Supabase Auth 의 `auth.uid()` 는 `users.supabase_uid` 이지 `users.id` 가 아니므로 비교가 항상 false 가 되어 모든 SELECT/INSERT/UPDATE 가 차단된다. 백엔드가 service_role 키로 접근하므로 RLS 우회되어 평소엔 문제 없지만, 미래에 anon 키 직접 접근 / Edge Functions / Realtime subscribe 시점에 폭발한다. 적용 위치:
   - `subscriptions_participant_select/insert/update`
   - `subscription_items_participant_select/insert/update/delete`
