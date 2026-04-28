@@ -44,6 +44,13 @@ def safe_subprocess(args: list[str], default: str = "") -> str:
 
 readme = read_text("README.md", "(README.md 없음)")
 
+# 플랫폼 구현 조건 / 제약 (사용자가 시간 지나면서 추가하는 도메인 정책)
+# system_prompt 와 분리되어 변하는 정책만 여기 모음. PM 이 매 사이클 참조.
+platform_constraints = read_text(
+    ".github/scripts/platform-constraints.md",
+    "(플랫폼 구현 조건 파일 없음)",
+)
+
 # 최근 24시간 dev 커밋 (없으면 최근 30개)
 git_log = safe_subprocess(
     ["git", "log", "dev", "--since=24.hours.ago", "--oneline", "--no-merges"]
@@ -76,6 +83,9 @@ prev_cycle = safe_subprocess([
 prev_cycle = prev_cycle.strip()[:3000] if prev_cycle.strip() else "(첫 사이클)"
 
 user_input = f"""
+# 플랫폼 구현 조건 / 제약 (반드시 고려)
+{platform_constraints[:4000]}
+
 # README
 {readme[:6000]}
 
