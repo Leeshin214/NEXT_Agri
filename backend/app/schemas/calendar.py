@@ -7,6 +7,9 @@ from pydantic import BaseModel
 
 class CalendarEventCreate(BaseModel):
     order_id: Optional[UUID] = None
+    # 정기배송 자동 등록 일정 식별. 일반적으로는 백엔드 내부 mutation 으로만 채워지지만
+    # 프론트가 직접 지정하지 않더라도 응답에서는 노출되어야 하므로 Create 에도 추가.
+    subscription_id: Optional[UUID] = None
     title: str
     event_type: str
     event_date: date
@@ -30,6 +33,9 @@ class CalendarEventResponse(BaseModel):
     id: UUID
     user_id: UUID
     order_id: Optional[UUID] = None
+    # 정기배송으로 자동 등록된 일정이면 subscription id 가 채워진다 (2026-04-28 추가).
+    # 프론트는 이 필드로 "정기배송 일정" 라벨/배지/색상 구분이 가능하다.
+    subscription_id: Optional[UUID] = None
     title: str
     event_type: str
     event_date: date

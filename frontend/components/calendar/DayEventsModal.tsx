@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, Repeat } from 'lucide-react';
 import Modal from '@/components/common/Modal';
 import {
   getCalendarEventColorClass,
@@ -100,12 +100,18 @@ export default function DayEventsModal({
             const sub = ev.order_number;
             const typeLabel = getCalendarEventLabel(ev);
             const timeText = getEventTimeText(ev);
+            const isSubscription = !!ev.subscription_id;
             return (
               <button
                 key={ev.id}
                 type="button"
                 onClick={() => onSelectEvent(ev)}
-                className="block w-full rounded-lg border border-gray-200 p-3 text-left transition-colors hover:bg-gray-50"
+                className={cn(
+                  'block w-full rounded-lg border p-3 text-left transition-colors hover:bg-gray-50',
+                  isSubscription
+                    ? 'border-purple-200 bg-purple-50/30'
+                    : 'border-gray-200'
+                )}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
@@ -116,6 +122,12 @@ export default function DayEventsModal({
                           getCalendarEventColorClass(ev)
                         )}
                       />
+                      {isSubscription && (
+                        <Repeat
+                          className="h-3.5 w-3.5 flex-shrink-0 text-purple-600"
+                          aria-hidden="true"
+                        />
+                      )}
                       <span className="truncate text-sm font-medium text-gray-900">
                         {main}
                       </span>
@@ -127,7 +139,14 @@ export default function DayEventsModal({
                     )}
                   </div>
                   {typeLabel && (
-                    <span className="flex-shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[10px] text-gray-600">
+                    <span
+                      className={cn(
+                        'flex-shrink-0 rounded-full px-2 py-0.5 text-[10px]',
+                        isSubscription
+                          ? 'bg-purple-100 text-purple-700'
+                          : 'bg-gray-100 text-gray-600'
+                      )}
+                    >
                       {typeLabel}
                     </span>
                   )}

@@ -144,21 +144,28 @@ CREATE TABLE order_items (
 ### calendar_events 테이블
 ```sql
 CREATE TABLE calendar_events (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id     UUID NOT NULL REFERENCES users(id),
-  order_id    UUID REFERENCES orders(id),
-  title       TEXT NOT NULL,
-  event_type  TEXT NOT NULL CHECK (event_type IN (
-                'SHIPMENT', 'DELIVERY', 'MEETING', 'QUOTE_DEADLINE', 'ORDER', 'OTHER'
-              )),
-  event_date  DATE NOT NULL,
-  start_time  TIME,
-  end_time    TIME,
-  description TEXT,
-  is_allday   BOOLEAN DEFAULT true,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID NOT NULL REFERENCES users(id),
+  order_id        UUID REFERENCES orders(id),
+  -- 정기배송 자동 등록 일정 식별 (2026-04-28 추가, 마이그레이션 20260428000003)
+  subscription_id UUID REFERENCES subscriptions(id) ON DELETE SET NULL,
+  title           TEXT NOT NULL,
+  event_type      TEXT NOT NULL CHECK (event_type IN (
+                    'SHIPMENT', 'DELIVERY', 'MEETING', 'QUOTE_DEADLINE', 'ORDER', 'OTHER'
+                  )),
+  event_date      DATE NOT NULL,
+  start_time      TIME,
+  end_time        TIME,
+  description     TEXT,
+  is_allday       BOOLEAN DEFAULT true,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at      TIMESTAMPTZ
 );
+-- 정기배송-유저-날짜 활성 행 1개 보장
+CREATE UNIQUE INDEX uniq_calendar_events_active_subscription_user_date
+  ON calendar_events (subscription_id, user_id, event_date)
+  WHERE subscription_id IS NOT NULL AND deleted_at IS NULL;
 ```
 
 ### chat_rooms 테이블
@@ -538,3 +545,9 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 - **soft delete 컬럼 보유 테이블 갱신 (2026-04-28 마이그레이션 후)**: 운영 Supabase 기준 `deleted_at` 컬럼 보유 테이블 = `users, products, partners, orders, calendar_events, messages, subscriptions` (7개). `deleted_at` 미보유 = `order_items, chat_rooms, ai_conversations, subscription_items, negotiation_history`. subscription_items 는 부모 subscriptions 의 soft delete + ON DELETE CASCADE FK 로 간접 관리되어 자체 deleted_at 컬럼 불필요.
 
 - **subscriptions.next_delivery_date 계산 정책 (2026-04-28)**: 첫 회차의 `next_delivery_date` 는 `start_date` 와 동일하게 시작 (즉 최초 INSERT 시점에 `next_delivery_date = start_date`). `generate_order_for_round` 호출 시 주문 생성 후 `compute_next_date` 로 다음 회차 갱신. PAUSED → ACTIVE 전환 시 `update_subscription` 안에서 오늘 이후가 될 때까지 `compute_next_date` 를 반복 호출해 재계산 (max 520회 = 약 10년치 주간 회차로 무한 루프 차단). MONTHLY 의 1/31 → 2/28 clamp 도 `calendar.monthrange()` 로 처리 — 검증 완료.
+
+- **calendar_events ↔ subscriptions 자동 동기화 (2026-04-28, 마이그레이션 20260428000003)**: 정기배송 등록·수락 시 첫 배송일이 양 당사자 캘린더에 자동 등록되도록 `calendar_events.subscription_id UUID REFERENCES subscriptions(id) ON DELETE SET NULL` 컬럼 추가. 한 정기배송 = 양 당사자 각 1건씩 두 row (seller=`SHIPMENT`, buyer=`DELIVERY`, `order_id IS NULL`). 멱등성 보장은 partial unique index `uniq_calendar_events_active_subscription_user_date ON (subscription_id, user_id, event_date) WHERE subscription_id IS NOT NULL AND deleted_at IS NULL` 로 처리. 기존 `uniq_calendar_events_active_order_user_date` 는 `WHERE order_id IS NOT NULL` 조건이라 두 인덱스가 독립적으로 공존한다.
+  - **호출 시점**: `subscription_service.accept_subscription` (PENDING→ACTIVE INSERT), `update_subscription` (frequency/next_delivery_date 변경 시 UPDATE; CANCELLED/ENDED/PAUSED/REJECTED 시 cleanup), `delete_subscription` (미래 일정 cleanup), `generate_order_for_round` (다음 회차로 UPSERT — 회차 주문 자체의 order-linked 일정은 별도로 INSERT 됨).
+  - **상태별 동작**: `status='ACTIVE'` 만 캘린더 INSERT/UPDATE. `PENDING`/`PAUSED`/`CANCELLED`/`ENDED`/`REJECTED` 는 `_cleanup_subscription_future_events` 로 미래 일정만 soft-delete (event_date >= today; 이미 회차 주문이 생성된 과거 일정은 이력 보존).
+  - **백필 미수행**: 마이그레이션 20260428000003 은 컬럼/인덱스만 추가하고 기존 ACTIVE 정기배송에 대한 backfill 은 수행하지 않는다. 신규 mutation 부터만 동기화. 운영 데이터 양이 적고 사용자 수동 등록 일정과 중복 가능성 때문 — 필요 시 별도 운영 스크립트로 후처리.
+  - **응답 스키마**: `CalendarEventResponse.subscription_id: Optional[UUID]` 필드를 추가해 프론트가 정기배송 일정과 일반 일정을 구분할 수 있도록 노출.

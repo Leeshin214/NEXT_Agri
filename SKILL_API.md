@@ -257,6 +257,12 @@ router = APIRouter(prefix="/calendar", tags=["calendar"])
 # PATCH /calendar/{id} - 일정 수정
 # DELETE /calendar/{id} - 일정 삭제 (soft)
 #
+# 응답 (CalendarEventResponse) — 정기배송 일정 식별 (2026-04-28):
+#   - subscription_id: Optional[UUID]
+#     정기배송으로 자동 등록된 일정이면 채워짐. 프론트는 이 필드로
+#     "정기배송 일정" 라벨/배지/색상 구분 가능.
+#   - subscription-only 일정은 order_id=NULL, event_type=SHIPMENT(seller)/DELIVERY(buyer)
+#
 # 호출 예:
 #   GET /api/v1/calendar                      → 전체 active 일정
 #   GET /api/v1/calendar?year=2026&month=5    → 5월만
@@ -323,6 +329,17 @@ router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 #   3) calendar_events INSERT (양쪽 user; 실패해도 주문 살림)
 #   4) subscription.next_delivery_date 갱신 (compute_next_date)
 #   5) end_date 도달 시 status=ENDED 자동 전환
+#   6) subscription-linked calendar_events UPSERT (새 next_delivery_date 로)
+
+# 캘린더 자동 동기화 (2026-04-28, 마이그레이션 20260428000003):
+#   - calendar_events.subscription_id 컬럼으로 정기배송 일정 식별.
+#   - accept_subscription   : seller=SHIPMENT, buyer=DELIVERY 신규 INSERT
+#   - update_subscription   : ACTIVE 면 next_delivery_date 동기화, 비활성이면 미래 일정 cleanup
+#   - delete_subscription   : 미래 일정만 soft-delete (event_date >= today)
+#   - reject_subscription   : 방어적 cleanup (정상 흐름엔 일정 없음)
+#   - 멱등성: partial unique index uniq_calendar_events_active_subscription_user_date 로
+#            (subscription_id, user_id, event_date) 활성 행 1개 보장.
+#   - 실패 정책: best-effort, 주문/정기배송 자체는 막지 않고 로그만 남김.
 ```
 
 ### partners.py (거래처 API — V1.6 양방향 승인 모델 2026-04-28)

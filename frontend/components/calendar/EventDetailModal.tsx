@@ -1,7 +1,7 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
-import { ExternalLink, Trash2 } from 'lucide-react';
+import { ExternalLink, Repeat, Trash2 } from 'lucide-react';
 import Modal from '@/components/common/Modal';
 import { useDeleteCalendarEvent } from '@/hooks/useCalendar';
 import {
@@ -50,6 +50,11 @@ export default function EventDetailModal({
   const sub = event.order_number;
   const typeLabel = getCalendarEventLabel(event);
 
+  // 정기배송 일정 식별 — DB 에 저장된 동기 일정(subscription_id 존재) 또는
+  // 프론트에서 합성한 가상 이벤트(event_type === 'SUBSCRIPTION') 모두 포함.
+  const isSubscription =
+    !!event.subscription_id || event.event_type === 'SUBSCRIPTION';
+
   // 정기배송 가상 이벤트(`sub-virtual-...`)는 DB row 가 없으므로 삭제 불가.
   // 캘린더 페이지에서 합성한 가상 이벤트는 event_type === 'SUBSCRIPTION' 또는 id prefix 로 식별.
   const isVirtual =
@@ -81,6 +86,15 @@ export default function EventDetailModal({
       role === 'buyer'
         ? `/buyer/orders/${event.order_id}`
         : `/seller/orders/${event.order_id}`;
+    router.push(path);
+  };
+
+  const handleOpenSubscription = () => {
+    // 정기배송 관리는 주문 페이지의 'subscription' 탭으로 이동.
+    const path =
+      role === 'buyer'
+        ? '/buyer/orders?tab=subscription'
+        : '/seller/orders?tab=subscription';
     router.push(path);
   };
 
@@ -116,12 +130,20 @@ export default function EventDetailModal({
       <div className="space-y-4">
         {/* 헤더: 메인 + 서브 */}
         <div>
-          <h3 className="text-lg font-semibold text-gray-900">{main}</h3>
+          <div className="flex items-center gap-1.5">
+            {isSubscription && (
+              <Repeat
+                className="h-4 w-4 flex-shrink-0 text-purple-600"
+                aria-hidden="true"
+              />
+            )}
+            <h3 className="text-lg font-semibold text-gray-900">{main}</h3>
+          </div>
           {sub && <p className="mt-0.5 text-xs text-gray-500">{sub}</p>}
         </div>
 
-        {/* 유형 뱃지 + 색상 점 */}
-        <div className="flex items-center gap-2">
+        {/* 유형 뱃지 + 색상 점 + 정기배송 식별 라벨 */}
+        <div className="flex flex-wrap items-center gap-2">
           <span
             className={cn(
               'inline-block h-2.5 w-2.5 rounded-full',
@@ -129,8 +151,21 @@ export default function EventDetailModal({
             )}
           />
           {typeLabel && (
-            <span className="rounded-full bg-gray-100 px-2.5 py-0.5 text-xs text-gray-700">
+            <span
+              className={cn(
+                'rounded-full px-2.5 py-0.5 text-xs',
+                isSubscription
+                  ? 'bg-purple-100 text-purple-700'
+                  : 'bg-gray-100 text-gray-700'
+              )}
+            >
               {typeLabel}
+            </span>
+          )}
+          {isSubscription && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-purple-100 px-2.5 py-0.5 text-xs font-medium text-purple-700">
+              <Repeat className="h-3 w-3" aria-hidden="true" />
+              정기배송
             </span>
           )}
         </div>
@@ -168,6 +203,18 @@ export default function EventDetailModal({
           >
             <ExternalLink className="h-4 w-4" aria-hidden="true" />
             주문 상세 보기
+          </button>
+        )}
+
+        {/* 정기배송 관리로 이동 — subscription_id 가 있는 동기 일정 또는 가상 SUBSCRIPTION 이벤트 모두 적용 */}
+        {isSubscription && (
+          <button
+            type="button"
+            onClick={handleOpenSubscription}
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-purple-200 bg-purple-50 px-4 py-2 text-sm font-medium text-purple-700 hover:bg-purple-100"
+          >
+            <ExternalLink className="h-4 w-4" aria-hidden="true" />
+            정기배송 관리로 이동
           </button>
         )}
       </div>

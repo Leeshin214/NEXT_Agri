@@ -13,6 +13,7 @@ import {
 import PageHeader from '@/components/common/PageHeader';
 import SummaryCard from '@/components/common/SummaryCard';
 import StatusBadge from '@/components/common/StatusBadge';
+import TodayTasksWidget from '@/components/dashboard/TodayTasksWidget';
 import { useOrders } from '@/hooks/useOrders';
 import { useProducts } from '@/hooks/useProducts';
 import { useChatRooms } from '@/hooks/useChat';
@@ -39,6 +40,9 @@ export default function SellerDashboardPage() {
   return (
     <div>
       <PageHeader title="대시보드" description="판매 현황을 한눈에 확인하세요" />
+
+      {/* 오늘 할 일 위젯 — PageHeader 직후 상단 노출 */}
+      <TodayTasksWidget role="seller" />
 
       {/* 요약 카드 */}
       <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">

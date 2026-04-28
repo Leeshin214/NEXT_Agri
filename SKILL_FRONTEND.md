@@ -39,14 +39,16 @@ frontend/
 │   │   ├── Sidebar.tsx
 │   │   ├── TopBar.tsx              ← 프로필 드롭다운 포함
 │   │   └── AIChatPanel.tsx         ← 우측 고정 AI 패널 (모든 페이지 공통)
-│   └── common/
-│       ├── PageHeader.tsx
-│       ├── StatusBadge.tsx
-│       ├── SummaryCard.tsx
-│       ├── DataTable.tsx
-│       ├── SearchFilterBar.tsx
-│       ├── EmptyState.tsx
-│       └── Modal.tsx
+│   ├── common/
+│   │   ├── PageHeader.tsx
+│   │   ├── StatusBadge.tsx
+│   │   ├── SummaryCard.tsx
+│   │   ├── DataTable.tsx
+│   │   ├── SearchFilterBar.tsx
+│   │   ├── EmptyState.tsx
+│   │   └── Modal.tsx
+│   └── dashboard/
+│       └── TodayTasksWidget.tsx     ← role='seller'|'buyer' — 오늘 할 일 요약
 ├── hooks/
 │   ├── useAuth.ts
 │   ├── useAIStream.ts
@@ -1516,57 +1518,118 @@ useEffect(() => {
 - 검증: 모든 항목 product_id 선택, quantity ≥ 1, unit_price ≥ 0, start_date ≥ today, end_date ≥ start_date, MONTHLY는 day_of_month 1~31, WEEKLY/BIWEEKLY는 day_of_week 0~6
 - 날짜는 timezone-safe 문자열 조합 — `defaultStartDate()`는 오늘+7일을 `YYYY-MM-DD` 로 직접 생성 (ISO 변환 금지)
 
-##### EventType 'SUBSCRIPTION' 추가 — 캘린더 가상 이벤트
-`types/calendar.ts`의 `EventType` union에 `'SUBSCRIPTION'` 추가. 단 **백엔드는 이 값을 송출하지 않음** — 프론트에서만 `useSubscriptions({ status: 'ACTIVE' })`의 결과로부터 향후 3개월(약 12회) 분량의 가상 이벤트를 합성한다.
+##### EventType 'SUBSCRIPTION' + subscription_id 동기 일정 (검증됨, 2026-04-28)
+`types/calendar.ts`의 `EventType` union 에 `'SUBSCRIPTION'` 포함, `CalendarEvent` 인터페이스에 `subscription_id: string | null` 필드 포함.
+
+정기배송 일정은 두 경로로 들어온다:
+- **백엔드 동기 일정** — 정기배송 ACTIVE 시 백엔드가 양 당사자 캘린더에 INSERT. `event_type = 'SHIPMENT'`(판매자) / `'DELIVERY'`(구매자), `subscription_id != null`, `order_id = null`
+- **프론트 가상 이벤트** — `useSubscriptions({ status: 'ACTIVE' })` 로부터 향후 3개월(약 12회) 분량 합성. `event_type = 'SUBSCRIPTION'`, id prefix `sub-virtual-`, `subscription_id = sub.id`
+
+**중요 — Dedupe 필수 (검증됨, 2026-04-28)**: 두 경로가 동시에 존재하므로 같은 `(subscription_id, event_date)` 가 백엔드 응답에 이미 있으면 가상 이벤트 합성을 skip 해야 셀/리스트에 정기배송이 두 번 노출되지 않는다. 백엔드 backfill 안 된 기존 ACTIVE 정기배송에 대해서는 가상 이벤트 fallback 을 유지하여 점진적 전환을 보장한다.
 
 ```typescript
-// seller|buyer/calendar/page.tsx
+// seller|buyer/calendar/page.tsx — 가상 이벤트 합성 + dedupe
+// 백엔드가 이미 INSERT 한 (subscription_id, event_date) Set 만들기
+const backendSubKeys = useMemo(() => {
+  const keys = new Set<string>();
+  for (const ev of [...baseMonthEvents, ...baseAllEvents]) {
+    if (ev.subscription_id) keys.add(`${ev.subscription_id}|${ev.event_date}`);
+  }
+  return keys;
+}, [baseMonthEvents, baseAllEvents]);
+
 const subscriptionVirtualEvents: CalendarEvent[] = useMemo(() => {
   const events: CalendarEvent[] = [];
-  const now = new Date();
-  const horizon = new Date(now.getFullYear(), now.getMonth() + 3, 0);
-
   for (const sub of activeSubs) {
-    const cur = new Date(sub.next_delivery_date);
+    let cur = new Date(sub.next_delivery_date);
     let round = 1;
     while (cur <= horizon && round <= 50) {
-      events.push({
-        id: `sub-virtual-${sub.id}-${round}`,
-        user_id: '', order_id: null,
-        title: '정기배송 예정',
-        event_type: 'SUBSCRIPTION',
-        event_date: `${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`,
-        start_time: null, end_time: null,
-        description: `정기배송 ${round}회차 — ${sub.items[0]?.product_name ?? '상품'}`,
-        is_allday: true, created_at: '',
-        order_number: null,
-        product_name: sub.items[0]?.product_name ?? '정기배송',
-        order_status: null,
-      });
-      // 다음 회차 계산 — 백엔드 compute_next_date 와 동일 로직
-      if (sub.frequency === 'WEEKLY') cur.setDate(cur.getDate() + 7);
-      else if (sub.frequency === 'BIWEEKLY') cur.setDate(cur.getDate() + 14);
-      else if (sub.frequency === 'MONTHLY') {
-        cur.setMonth(cur.getMonth() + 1);
-        if (sub.day_of_month) {
-          const lastDay = new Date(cur.getFullYear(), cur.getMonth()+1, 0).getDate();
-          cur.setDate(Math.min(sub.day_of_month, lastDay));
-        }
+      const dateStr = `${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`;
+      // Dedupe — 백엔드 동기 INSERT 된 (subscription_id, date) 면 가상 이벤트 skip
+      if (!backendSubKeys.has(`${sub.id}|${dateStr}`)) {
+        events.push({
+          id: `sub-virtual-${sub.id}-${round}`,
+          user_id: '', order_id: null,
+          subscription_id: sub.id,  // ← 동기 일정과 일관된 식별자, color/label 분기 트리거
+          title: '정기배송 예정',
+          event_type: 'SUBSCRIPTION',
+          // ...나머지 필드
+        });
       }
+      // 다음 회차 계산 — 백엔드 compute_next_date 와 동일 로직 (생략)
       round += 1;
     }
   }
   return events;
-}, [activeSubs]);
-
-const visibleMonthEvents = useMemo(() => [...baseMonthEvents, ...subscriptionVirtualEvents], ...);
-const visibleAllEvents   = useMemo(() => [...baseAllEvents,   ...subscriptionVirtualEvents], ...);
+}, [activeSubs, backendSubKeys]);
 ```
 
-`constants/status.ts`의 `EVENT_TYPE_COLOR_CLASS` / `EVENT_TYPE_LABEL`에 `SUBSCRIPTION: 'bg-purple-400'` / `'정기배송'` 추가. 일정 추가 모달의 `EVENT_TYPE_OPTIONS`에는 추가하지 **않음** (사용자가 수동 등록할 수 없는 가상 타입).
+##### 정기배송 일정 색상/라벨 — subscription_id 우선 (필수 패턴)
+`constants/status.ts`의 `getCalendarEventColorClass` / `getCalendarEventLabel` 은 **`subscription_id` 가 가장 먼저** 분기된다. 백엔드 동기 일정은 `event_type` 이 `SHIPMENT`/`DELIVERY` 라 일반 출하/입고와 색이 같아져 정기배송을 구분할 수 없기 때문이다.
 
-##### EventDetailModal — 가상 이벤트 삭제 버튼 숨김 (함정)
-`event.id`가 `'sub-virtual-'` 로 시작하거나 `event_type === 'SUBSCRIPTION'` 인 경우 DB row가 없으므로 `useDeleteCalendarEvent.mutate(event.id)`가 404를 던진다. 푸터의 삭제 버튼을 조건부로 숨겨야 한다.
+```typescript
+// constants/status.ts
+export function getCalendarEventColorClass(event) {
+  if (event.subscription_id) return EVENT_TYPE_COLOR_CLASS.SUBSCRIPTION; // bg-purple-500
+  if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
+    return ORDER_STATUS_CONFIG[event.order_status].solidClassName;
+  }
+  return EVENT_TYPE_COLOR_CLASS[event.event_type] ?? EVENT_TYPE_COLOR_CLASS.OTHER;
+}
+
+export function getCalendarEventLabel(event) {
+  if (event.subscription_id) return EVENT_TYPE_LABEL.SUBSCRIPTION; // '정기배송'
+  if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
+    return ORDER_STATUS_CONFIG[event.order_status].label;
+  }
+  return EVENT_TYPE_LABEL[event.event_type] ?? '기타';
+}
+```
+
+`EVENT_TYPE_COLOR_CLASS.SUBSCRIPTION = 'bg-purple-500'` / `EVENT_TYPE_LABEL.SUBSCRIPTION = '정기배송'`. 다른 화면(주문 페이지 정기배송 출처 뱃지)의 `bg-purple-100/text-purple-700` 톤과 통일.
+
+##### 정기배송 시각적 식별 — Repeat 아이콘 + 보라 뱃지
+모든 캘린더 진입 지점에서 `subscription_id` 존재 시 lucide `Repeat` 아이콘과 `bg-purple-100 text-purple-700` 뱃지로 일관 표시:
+
+| 위치 | 시각 표시 |
+|------|---------|
+| 그리드 셀 일정 칩 | `<Repeat className="h-2.5 w-2.5" />` + main 텍스트 (셀 안 좁음) |
+| 우측 "전체 일정" 리스트 카드 | 색상 점 → `<Repeat className="h-3 w-3 text-purple-600" />` → 제목 + 우측에 보라 라벨(`정기배송`) |
+| `DayEventsModal` 카드 | 카드 자체 `border-purple-200 bg-purple-50/30` + Repeat 아이콘 + 보라 라벨 |
+| `EventDetailModal` 헤더 | 제목 옆 `<Repeat className="h-4 w-4 text-purple-600" />` |
+| `EventDetailModal` 메타 영역 | `정기배송` 보라 pill + Repeat 아이콘 |
+
+```tsx
+// 패턴 — 어느 위치든 동일
+const isSubscription = !!ev.subscription_id;  // 가상 이벤트도 subscription_id 채워졌으므로 동일 분기
+{isSubscription && <Repeat className="h-3 w-3 text-purple-600" />}
+<span className={cn('rounded-full px-2 py-0.5 text-[10px]',
+  isSubscription ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-600'
+)}>{typeLabel}</span>
+```
+
+##### EventDetailModal — 정기배송 일정 → "정기배송 관리로 이동" 링크
+`subscription_id` 가 있는 일정 또는 가상 SUBSCRIPTION 이벤트는 모달 본문 하단에 보라 톤 링크 버튼 노출. 클릭 시 역할별 주문 페이지의 `subscription` 탭으로 이동.
+
+```tsx
+const isSubscription = !!event.subscription_id || event.event_type === 'SUBSCRIPTION';
+
+const handleOpenSubscription = () => {
+  router.push(role === 'buyer' ? '/buyer/orders?tab=subscription' : '/seller/orders?tab=subscription');
+};
+
+{isSubscription && (
+  <button onClick={handleOpenSubscription}
+    className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-purple-200 bg-purple-50 px-4 py-2 text-sm font-medium text-purple-700 hover:bg-purple-100">
+    <ExternalLink className="h-4 w-4" /> 정기배송 관리로 이동
+  </button>
+)}
+```
+
+`order_id` 가 있는 일정에는 기존 "주문 상세 보기" 버튼 그대로 유지 — 정기배송 일정은 `order_id == null` 이므로 두 버튼이 동시에 뜨지 않는다.
+
+##### EventDetailModal — 가상 이벤트 삭제 버튼 숨김 (함정 유지)
+`event.id`가 `'sub-virtual-'` 로 시작하거나 `event_type === 'SUBSCRIPTION'` 인 경우 DB row가 없으므로 `useDeleteCalendarEvent.mutate(event.id)`가 404를 던진다. 푸터의 삭제 버튼을 조건부로 숨겨야 한다. (백엔드 동기 정기배송 일정은 DB row 가 있으므로 삭제 가능 — 가상 이벤트만 차단)
 
 ```tsx
 const isVirtual = event.event_type === 'SUBSCRIPTION' || event.id.startsWith('sub-virtual-');
@@ -1578,6 +1641,8 @@ footer={
   </>
 }
 ```
+
+`EVENT_TYPE_OPTIONS` (일정 추가 모달의 select) 에는 `SUBSCRIPTION` 추가하지 **않음** — 사용자가 수동 등록할 수 없는 시스템 타입.
 
 ##### 정기배송 출처 뱃지 — 주문/견적 페이지
 `Order.subscription_id`가 있으면 상품 컬럼에 보라색 pill `정기 N회차`(N = `subscription_round`) 표시. 상세 슬라이드 헤더에도 같은 뱃지를 주문번호 아래에 노출.

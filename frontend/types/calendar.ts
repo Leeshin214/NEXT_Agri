@@ -13,6 +13,13 @@ export interface CalendarEvent {
   id: string;
   user_id: string;
   order_id: string | null;
+  /**
+   * V1.6 — 정기배송 동기 일정 식별자.
+   * - 정기배송 자동 등록 일정: subscription_id 존재, order_id null
+   * - 일반 주문 일정: subscription_id null, order_id 존재
+   * - 수동/기타 일정: 둘 다 null
+   */
+  subscription_id: string | null;
   title: string;
   event_type: EventType;
   event_date: string;

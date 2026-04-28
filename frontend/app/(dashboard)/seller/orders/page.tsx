@@ -184,12 +184,18 @@ export default function SellerOrdersPage() {
     if (idParam) setSelectedOrderId(idParam);
   }, [searchParams]);
 
-  const handleOpenChat = async () => {
-    if (!selectedOrder) return;
+  /**
+   * 주어진 주문에 대한 채팅방을 생성/조회 후 채팅 페이지로 이동.
+   * - 인자가 없으면 selectedOrder 기준 (상세 패널 "채팅으로 대화" 버튼)
+   * - 인자가 있으면 그 주문 기준 (목록 행 빠른 액션 버튼)
+   */
+  const handleOpenChat = async (order?: Order) => {
+    const target = order ?? selectedOrder;
+    if (!target) return;
     try {
       const res = await createChatRoom.mutateAsync({
-        partner_user_id: selectedOrder.buyer_id,
-        order_id: selectedOrder.id,
+        partner_user_id: target.buyer_id,
+        order_id: target.id,
       });
       router.push(`/seller/chat?room_id=${res.data.id}`);
     } catch (e) {
@@ -294,20 +300,39 @@ export default function SellerOrdersPage() {
       className: 'text-right',
       render: (item) => {
         const next = sellerNextStatusMap[item.status];
-        if (!next) return null;
-        const nextLabel = ORDER_STATUS_OPTIONS.find(
-          (o) => o.value === next
-        )?.label;
+        const nextLabel = next
+          ? ORDER_STATUS_OPTIONS.find((o) => o.value === next)?.label
+          : undefined;
+        const showChat = item.status !== 'CANCELLED';
         return (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              handleNextStatus(item);
-            }}
-            className="rounded-lg bg-primary-50 px-3 py-1 text-xs font-medium text-primary-700 hover:bg-primary-100"
-          >
-            {nextLabel} 처리
-          </button>
+          <div className="flex items-center justify-end gap-1.5">
+            {showChat && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleOpenChat(item);
+                }}
+                disabled={createChatRoom.isPending}
+                title="채팅으로 이동"
+                aria-label="채팅으로 이동"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-primary-600 hover:bg-primary-50 disabled:opacity-50"
+              >
+                <MessageCircle className="h-4 w-4" />
+              </button>
+            )}
+            {next && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleNextStatus(item);
+                }}
+                className="rounded-lg bg-primary-50 px-3 py-1 text-xs font-medium text-primary-700 hover:bg-primary-100"
+              >
+                {nextLabel} 처리
+              </button>
+            )}
+          </div>
         );
       },
     },
@@ -670,7 +695,7 @@ export default function SellerOrdersPage() {
               <div className="flex flex-wrap gap-2">
                 {selectedOrder.status !== 'CANCELLED' && (
                   <button
-                    onClick={handleOpenChat}
+                    onClick={() => handleOpenChat()}
                     disabled={createChatRoom.isPending}
                     className="inline-flex items-center gap-1 rounded-lg border border-primary-600 bg-white px-3 py-2 text-xs font-medium text-primary-700 hover:bg-primary-50 disabled:opacity-50"
                   >

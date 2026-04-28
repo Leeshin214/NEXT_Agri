@@ -689,9 +689,23 @@ const handleAccept = () => {
 - 상품명 첫 항목 + "외 N건"
 - StatusBadge
 - 주문번호 + 총액
+- 우측 "이력" 토글 버튼 → 펼치면 `<NegotiationHistory orderId={...} />` (`components/chat/NegotiationHistory.tsx`) 협상 이력 타임라인 노출
 - 우측 "주문 상세 보기" 버튼 → `onOpenOrder(id)` 콜백 (페이지에서 `router.push('/{role}/orders?id=...')`)
 
-주문이 없거나 fetch 실패 시 배너 자동 숨김 (요구사항).
+이력 토글 상태는 컴포넌트 내부 `useState(false)` (전역 X). 모바일/데스크톱 모두 기본 접힘 → 닫힌 상태에서는 기존 1줄 layout 유지. 모바일 작은 폭에서는 버튼 라벨 ("이력"/"주문 상세 보기")이 `sm:` 미만에서 자동 축약.
+
+주문이 없거나 fetch 실패 시 배너 자동 숨김 (요구사항). props 시그니처는 `(orderId, role, onOpenOrder)` 그대로 — 호출부 (seller/chat/page.tsx, buyer/chat/page.tsx) 변경 불필요.
+
+#### NegotiationHistory — 채팅 배너 안 협상 타임라인 (components/chat/NegotiationHistory.tsx)
+
+`OrderContextBanner` 의 이력 토글이 펼쳐졌을 때만 렌더되는 **읽기 전용** 타임라인.
+`components/common/NegotiationHistory.tsx` 와 별도 — common 버전은 주문 상세 슬라이드 패널의 액션(수락/거절) 포함 풀 버전, **chat 버전은 액션 없음** (채팅 메시지의 `COUNTER_OFFER` 카드 = `MessageBubble` 가 동일 액션을 이미 제공하므로 중복 회피).
+
+- 동일 훅 `useNegotiationHistory(orderId)` 재사용 — 캐시 공유 (queryKey: `['negotiation', orderId]`)
+- 시간 역순. 빈 배열이면 미니 placeholder ("협상 이력이 없습니다.")
+- 에러 시 `null` 반환 (조용히 숨김 — UX 우선)
+- 좌측 세로 라인 + 상태별 색 dot (PENDING=노랑 / ACCEPTED=녹색 / REJECTED=빨강 / SUPERSEDED=회색) + 상대시간 표시 (`방금 전 / N분 전 / N시간 전 / N일 전`)
+- 컴포넌트 내부 padding (`px-4 pb-3`) 만 적용 → 부모(배너) 가 외곽 컨테이너 책임
 
 #### PriceOfferPopover — 채팅 입력창 가격 제시 버튼 (components/chat/PriceOfferPopover.tsx)
 

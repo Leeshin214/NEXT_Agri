@@ -1,11 +1,12 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { ChevronLeft, ChevronRight, Plus } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Plus, Repeat, Sparkles } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import Modal from '@/components/common/Modal';
 import EventDetailModal from '@/components/calendar/EventDetailModal';
 import DayEventsModal from '@/components/calendar/DayEventsModal';
+import ScheduleAgentPanel from '@/components/calendar/ScheduleAgentPanel';
 import { useCalendarEvents, useCreateCalendarEvent } from '@/hooks/useCalendar';
 import { useSubscriptions } from '@/hooks/useSubscriptions';
 import { EVENT_TYPE_OPTIONS } from '@/constants/options';
@@ -25,6 +26,8 @@ export default function SellerCalendarPage() {
   const [selectedEvent, setSelectedEvent] = useState<CalendarEvent | null>(null);
   const [dayModalDate, setDayModalDate] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
+  // AI 일정 추천 패널 펼침 상태 — 기본 펼침. 사용자가 직접 숨길 수 있음.
+  const [agentPanelOpen, setAgentPanelOpen] = useState(true);
 
   // 캘린더 그리드 — 현재 월에 한정
   const { data: monthData } = useCalendarEvents(year, month);
@@ -47,7 +50,20 @@ export default function SellerCalendarPage() {
     [allEvents]
   );
 
-  // 정기배송 가상 이벤트 — 향후 3개월 분량 (회당 12회 안전상한)
+  // V1.6 — 백엔드가 정기배송 ACTIVE 시 양 당사자 calendar_events 에 자동 INSERT 한다.
+  // 같은 (subscription_id, event_date) 가 백엔드 응답에 이미 있으면 가상 이벤트 합성을 skip 하여 중복 노출 방지.
+  // 백엔드 backfill 안 된 기존 ACTIVE 정기배송에 대해서는 가상 이벤트를 fallback 으로 유지한다.
+  const backendSubKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const ev of [...baseMonthEvents, ...baseAllEvents]) {
+      if (ev.subscription_id) {
+        keys.add(`${ev.subscription_id}|${ev.event_date}`);
+      }
+    }
+    return keys;
+  }, [baseMonthEvents, baseAllEvents]);
+
+  // 정기배송 가상 이벤트 — 향후 3개월 분량 (회당 50회 안전상한)
   // event_id 는 'sub-virtual-{subId}-{round}' 로 충돌 회피.
   // user_id/order_id 는 빈 문자열/null — 가상 이벤트라 식별 불필요.
   const subscriptionVirtualEvents: CalendarEvent[] = useMemo(() => {
@@ -62,24 +78,29 @@ export default function SellerCalendarPage() {
         const dateStr = `${cur.getFullYear()}-${String(
           cur.getMonth() + 1
         ).padStart(2, '0')}-${String(cur.getDate()).padStart(2, '0')}`;
-        events.push({
-          id: `sub-virtual-${sub.id}-${round}`,
-          user_id: '',
-          order_id: null,
-          title: '정기배송 예정',
-          event_type: 'SUBSCRIPTION',
-          event_date: dateStr,
-          start_time: null,
-          end_time: null,
-          description: `정기배송 ${round}회차 — ${
-            sub.items[0]?.product_name ?? '상품'
-          }${sub.items.length > 1 ? ` 외 ${sub.items.length - 1}건` : ''}`,
-          is_allday: true,
-          created_at: '',
-          order_number: null,
-          product_name: sub.items[0]?.product_name ?? '정기배송',
-          order_status: null,
-        });
+
+        // Dedupe — 백엔드가 이미 동기 INSERT 한 (subscription_id, date) 면 skip.
+        if (!backendSubKeys.has(`${sub.id}|${dateStr}`)) {
+          events.push({
+            id: `sub-virtual-${sub.id}-${round}`,
+            user_id: '',
+            order_id: null,
+            subscription_id: sub.id,
+            title: '정기배송 예정',
+            event_type: 'SUBSCRIPTION',
+            event_date: dateStr,
+            start_time: null,
+            end_time: null,
+            description: `정기배송 ${round}회차 — ${
+              sub.items[0]?.product_name ?? '상품'
+            }${sub.items.length > 1 ? ` 외 ${sub.items.length - 1}건` : ''}`,
+            is_allday: true,
+            created_at: '',
+            order_number: null,
+            product_name: sub.items[0]?.product_name ?? '정기배송',
+            order_status: null,
+          });
+        }
 
         if (sub.frequency === 'WEEKLY') cur.setDate(cur.getDate() + 7);
         else if (sub.frequency === 'BIWEEKLY') cur.setDate(cur.getDate() + 14);
@@ -98,7 +119,7 @@ export default function SellerCalendarPage() {
       }
     }
     return events;
-  }, [activeSubs]);
+  }, [activeSubs, backendSubKeys]);
 
   const visibleMonthEvents = useMemo(
     () => [...baseMonthEvents, ...subscriptionVirtualEvents],
@@ -268,6 +289,7 @@ export default function SellerCalendarPage() {
                     */}
                     {dayEvents.slice(0, 3).map((ev) => {
                       const { main, sub } = getEventLabels(ev);
+                      const isSubscription = !!ev.subscription_id;
                       return (
                         <div
                           key={ev.id}
@@ -276,7 +298,15 @@ export default function SellerCalendarPage() {
                             getCalendarEventColorClass(ev)
                           )}
                         >
-                          <div className="truncate font-medium">{main}</div>
+                          <div className="flex items-center gap-1">
+                            {isSubscription && (
+                              <Repeat
+                                className="h-2.5 w-2.5 flex-shrink-0"
+                                aria-hidden="true"
+                              />
+                            )}
+                            <span className="truncate font-medium">{main}</span>
+                          </div>
                           {sub && (
                             <div className="truncate text-[9px] text-white/80">
                               {sub}
@@ -297,8 +327,30 @@ export default function SellerCalendarPage() {
           </div>
         </div>
 
-        {/* 전체 일정 — 모든 월, 날짜별 그룹 */}
-        <div className="rounded-xl bg-white p-6 shadow-sm">
+        {/* 우측 1열 — AI 일정 추천 + 전체 일정 */}
+        <div className="space-y-4">
+          {/* AI 일정 추천 토글 */}
+          <button
+            type="button"
+            onClick={() => setAgentPanelOpen((v) => !v)}
+            className="flex w-full items-center justify-between rounded-xl border border-gray-200 bg-white px-4 py-2.5 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50"
+            aria-expanded={agentPanelOpen}
+          >
+            <span className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-purple-600" />
+              AI 일정 도우미
+            </span>
+            <span className="text-xs text-gray-400">
+              {agentPanelOpen ? '숨기기' : '보기'}
+            </span>
+          </button>
+
+          {agentPanelOpen && (
+            <ScheduleAgentPanel year={year} month={month} />
+          )}
+
+          {/* 전체 일정 — 모든 월, 날짜별 그룹 */}
+          <div className="rounded-xl bg-white p-6 shadow-sm">
           <div className="mb-4 flex items-center justify-between">
             <h3 className="font-semibold text-gray-900">전체 일정</h3>
             <button
@@ -333,6 +385,7 @@ export default function SellerCalendarPage() {
                     {events.map((ev) => {
                       const { main, sub } = getEventLabels(ev);
                       const typeLabel = getCalendarEventLabel(ev);
+                      const isSubscription = !!ev.subscription_id;
                       return (
                         <li key={ev.id}>
                           <button
@@ -354,6 +407,12 @@ export default function SellerCalendarPage() {
                                       getCalendarEventColorClass(ev)
                                     )}
                                   />
+                                  {isSubscription && (
+                                    <Repeat
+                                      className="h-3 w-3 flex-shrink-0 text-purple-600"
+                                      aria-hidden="true"
+                                    />
+                                  )}
                                   <span className="truncate text-sm font-medium text-gray-900">
                                     {main}
                                   </span>
@@ -365,7 +424,14 @@ export default function SellerCalendarPage() {
                                 )}
                               </div>
                               {typeLabel && (
-                                <span className="flex-shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[10px] text-gray-600">
+                                <span
+                                  className={cn(
+                                    'flex-shrink-0 rounded-full px-2 py-0.5 text-[10px]',
+                                    isSubscription
+                                      ? 'bg-purple-100 text-purple-700'
+                                      : 'bg-gray-100 text-gray-600'
+                                  )}
+                                >
                                   {typeLabel}
                                 </span>
                               )}
@@ -384,6 +450,7 @@ export default function SellerCalendarPage() {
                 </div>
               ))
             )}
+          </div>
           </div>
         </div>
       </div>
