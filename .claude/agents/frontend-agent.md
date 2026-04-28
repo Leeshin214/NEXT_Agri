@@ -2,7 +2,7 @@
 name: frontend-agent
 description: AgriFlow 프론트엔드 작업 전담. Next.js 14 App Router 페이지/컴포넌트 구현, Tailwind CSS 스타일링, Zustand 상태관리, React Query 서버 상태, 레이아웃 수정, 라우팅 구조 변경 등 frontend/ 디렉토리 내 모든 작업에 사용. 컴포넌트 생성·수정, 훅 작성, 타입 정의, 상수 추가 등 UI/UX 관련 모든 요청에 자동 위임.
 tools: Read, Write, Edit, Glob, Grep, Bash
-model: sonnet
+model: opus
 ---
 
 # AgriFlow Frontend Agent

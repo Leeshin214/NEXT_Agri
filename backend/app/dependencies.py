@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Callable, Optional
 
 from fastapi import Depends, HTTPException, status
@@ -7,6 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.core.security import verify_supabase_jwt
 from app.core.supabase import get_supabase_client
 
+logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 
 
@@ -15,12 +17,13 @@ async def get_current_user(
 ) -> dict:
     """JWT에서 현재 사용자 정보를 조회한다."""
     if credentials is None:
-        print("[AUTH] credentials is None → 401 (토큰 미전송)")
+        logger.debug("[AUTH] credentials is None → 401 (토큰 미전송)")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="인증이 필요합니다.",
         )
-    print(f"[AUTH] token received: {credentials.credentials[:30]}...")
+    # 토큰 자체는 로그에 남기지 않는다 (보안). 디버그 시에만 prefix 일부 노출.
+    logger.debug("[AUTH] token received (len=%d)", len(credentials.credentials))
     payload = await verify_supabase_jwt(credentials.credentials)
     supabase_uid = payload.get("sub")
 

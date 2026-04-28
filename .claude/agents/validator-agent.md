@@ -2,7 +2,7 @@
 name: validator-agent
 description: AgriFlow 코드 검증 전담. frontend/backend/ai-agent 작업 완료 후 자동 실행. TypeScript 컴파일 오류, Python 문법 오류, 프론트-백 API 계약 불일치(엔드포인트 URL·요청/응답 타입)를 탐지하고 구조화된 오류 리포트를 반환한다. 에러 없으면 "VALIDATION_PASSED"를 반환한다.
 tools: Read, Glob, Grep, Bash
-model: sonnet
+model: opus
 ---
 
 # AgriFlow Validator Agent

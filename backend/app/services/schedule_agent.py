@@ -25,13 +25,14 @@ class ScheduleAgentService:
         month_start = f"{year}-{month:02d}-01"
         month_end = f"{year}-{month:02d}-{last_day:02d}"
 
-        # 1. calendar_events 조회 (calendar_events에는 deleted_at 없음 — SKILL_DB.md 확인)
+        # 1. calendar_events 조회 (deleted_at 컬럼 존재 — 마이그레이션 20260322000001)
         calendar_result = await asyncio.to_thread(
             lambda: self.client.table("calendar_events")
             .select("title, event_type, event_date, start_time, end_time")
             .eq("user_id", user_id)
             .gte("event_date", month_start)
             .lte("event_date", month_end)
+            .is_("deleted_at", None)
             .limit(30)
             .execute()
         )

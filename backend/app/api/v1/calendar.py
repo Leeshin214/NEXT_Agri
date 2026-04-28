@@ -1,6 +1,7 @@
+from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.dependencies import get_current_user
 from app.schemas.calendar import (
@@ -16,11 +17,15 @@ router = APIRouter(prefix="/calendar", tags=["calendar"])
 
 @router.get("", response_model=SuccessResponse[list[CalendarEventResponse]])
 async def list_events(
-    year: int,
-    month: int,
     current_user: dict = Depends(get_current_user),
+    year: Optional[int] = Query(None, ge=1900, le=2200),
+    month: Optional[int] = Query(None, ge=1, le=12),
 ):
-    """월별 일정 조회"""
+    """일정 조회.
+
+    - year + month 가 모두 전달되면 해당 월 범위로 필터.
+    - 둘 중 하나라도 없으면 전체 active 일정 반환 (프론트 우측 패널 "전체 일정" 용).
+    """
     events = await calendar_service.list_events(
         user_id=current_user["id"],
         year=year,
@@ -35,9 +40,11 @@ async def create_event(
     current_user: dict = Depends(get_current_user),
 ):
     """일정 생성"""
+    # mode="json": event_date(date), start_time/end_time(time), order_id(UUID)
+    # → ISO 문자열로 직렬화. supabase-py(httpx) 호환.
     event = await calendar_service.create_event(
         user_id=current_user["id"],
-        data=data.model_dump(),
+        data=data.model_dump(mode="json"),
     )
     return {"data": event}
 
@@ -49,10 +56,11 @@ async def update_event(
     current_user: dict = Depends(get_current_user),
 ):
     """일정 수정"""
+    # mode="json": event_date(date), start_time/end_time(time) ISO 직렬화.
     event = await calendar_service.update_event(
         event_id=event_id,
         user_id=current_user["id"],
-        data=data.model_dump(exclude_none=True),
+        data=data.model_dump(exclude_none=True, mode="json"),
     )
     if not event:
         raise HTTPException(

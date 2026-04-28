@@ -2,13 +2,29 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { MessageCircle, Phone, Building2, Calendar } from 'lucide-react';
+import {
+  MessageCircle,
+  Phone,
+  Building2,
+  Calendar,
+  UserPlus,
+  Check,
+  Clock,
+  Inbox,
+} from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import SearchFilterBar from '@/components/common/SearchFilterBar';
 import Modal from '@/components/common/Modal';
 import { useMembers, useMemberProfile } from '@/hooks/useMembers';
 import { useCreateChatRoom } from '@/hooks/useChat';
-import type { UserPublicProfile } from '@/types';
+import {
+  useAcceptPartner,
+  useCreatePartner,
+  usePartnerStatusMap,
+  usePartners,
+} from '@/hooks/usePartners';
+import { useAuthStore } from '@/store/authStore';
+import type { PartnerStatus, UserPublicProfile, UserRole } from '@/types';
 
 type SearchRole = 'BUYER' | 'SELLER';
 
@@ -68,12 +84,36 @@ function RoleTabBar({ selected, onChange }: RoleTabBarProps) {
 
 interface MemberCardProps {
   member: UserPublicProfile;
+  myRole: UserRole;
+  /** 상대 user 와의 거래처 관계 상태 (없으면 undefined) */
+  partnerStatus: PartnerStatus | undefined;
+  /** PENDING_INCOMING 일 때 수락에 필요한 partner row id */
+  partnerId: string | undefined;
   onCardClick: (userId: string) => void;
   onChat: (userId: string) => void;
+  onAddPartner: (userId: string) => void;
+  onAcceptPartner: (partnerId: string) => void;
   isChatPending: boolean;
+  isAddingPartner: boolean;
+  isAcceptingPartner: boolean;
 }
 
-function MemberCard({ member, onCardClick, onChat, isChatPending }: MemberCardProps) {
+function MemberCard({
+  member,
+  myRole,
+  partnerStatus,
+  partnerId,
+  onCardClick,
+  onChat,
+  onAddPartner,
+  onAcceptPartner,
+  isChatPending,
+  isAddingPartner,
+  isAcceptingPartner,
+}: MemberCardProps) {
+  // 본인과 같은 역할 또는 ADMIN 인 경우 거래처 액션 자체를 숨김
+  const canAddPartner = member.role !== myRole && member.role !== 'ADMIN';
+
   return (
     <div
       onClick={() => onCardClick(member.id)}
@@ -127,18 +167,79 @@ function MemberCard({ member, onCardClick, onChat, isChatPending }: MemberCardPr
         </div>
       </div>
 
-      {/* 하단: 채팅하기 버튼 */}
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onChat(member.id);
-        }}
-        disabled={isChatPending}
-        className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50 transition-colors"
-      >
-        <MessageCircle className="h-4 w-4" />
-        채팅하기
-      </button>
+      {/* 하단: 액션 버튼 영역 — V1.6 양방향 승인 */}
+      <div className="flex flex-col gap-2">
+        {canAddPartner && (
+          <>
+            {/* ACTIVE / PENDING (deprecated) → 거래처 등록됨 (회색) */}
+            {(partnerStatus === 'ACTIVE' || partnerStatus === 'PENDING') && (
+              <span className="flex w-full items-center justify-center gap-1 rounded-lg bg-gray-100 px-4 py-2 text-sm font-medium text-gray-500">
+                <Check className="h-4 w-4" />
+                거래처 등록됨
+              </span>
+            )}
+            {/* PENDING_OUTGOING → 보낸 요청 (노란색, 비활성) */}
+            {partnerStatus === 'PENDING_OUTGOING' && (
+              <span className="flex w-full items-center justify-center gap-1 rounded-lg bg-yellow-50 border border-yellow-200 px-4 py-2 text-sm font-medium text-yellow-700">
+                <Clock className="h-4 w-4" />
+                요청 보냄
+              </span>
+            )}
+            {/* PENDING_INCOMING → 받은 요청 (수락 버튼) */}
+            {partnerStatus === 'PENDING_INCOMING' && partnerId && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAcceptPartner(partnerId);
+                }}
+                disabled={isAcceptingPartner}
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 transition-colors"
+              >
+                <Inbox className="h-4 w-4" />
+                {isAcceptingPartner ? '수락 중...' : '요청 받음 — 수락'}
+              </button>
+            )}
+            {/* INACTIVE 또는 (없음) → 거래처 추가 */}
+            {!partnerStatus && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAddPartner(member.id);
+                }}
+                disabled={isAddingPartner}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-primary-600 bg-white px-4 py-2 text-sm font-medium text-primary-700 hover:bg-primary-50 disabled:opacity-50 transition-colors"
+              >
+                <UserPlus className="h-4 w-4" />
+                {isAddingPartner ? '추가 중...' : '거래처 추가'}
+              </button>
+            )}
+            {partnerStatus === 'INACTIVE' && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAddPartner(member.id);
+                }}
+                disabled={isAddingPartner}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-primary-600 bg-white px-4 py-2 text-sm font-medium text-primary-700 hover:bg-primary-50 disabled:opacity-50 transition-colors"
+              >
+                <UserPlus className="h-4 w-4" />
+                {isAddingPartner ? '추가 중...' : '거래처 추가'}
+              </button>
+            )}
+          </>
+        )}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onChat(member.id);
+          }}
+          disabled={isChatPending}
+          className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50 transition-colors"
+        >
+          <MessageCircle className="h-4 w-4" />
+          채팅하기
+        </button>
+      </div>
     </div>
   );
 }
@@ -235,9 +336,15 @@ function ProfileModalContent({
 
 export default function BuyerMembersPage() {
   const router = useRouter();
+  const { user } = useAuthStore();
+  const myRole: UserRole = user?.role ?? 'BUYER';
   const [search, setSearch] = useState('');
   const [selectedRole, setSelectedRole] = useState<SearchRole>('SELLER');
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [addingPartnerId, setAddingPartnerId] = useState<string | null>(null);
+  const [acceptingPartnerId, setAcceptingPartnerId] = useState<string | null>(
+    null
+  );
 
   const { data, isLoading } = useMembers({
     search: search || undefined,
@@ -246,6 +353,20 @@ export default function BuyerMembersPage() {
   const members = data?.data ?? [];
 
   const createChatRoom = useCreateChatRoom();
+  const createPartner = useCreatePartner();
+  const acceptPartner = useAcceptPartner();
+  const partnerStatusMap = usePartnerStatusMap();
+
+  // PENDING_INCOMING 인 카드에서 "수락" 누를 때 partner row id 가 필요하므로
+  // 같은 데이터(usePartners 의 캐시)에서 partner_user_id → partner.id 맵을 만든다.
+  const partnersData = usePartners();
+  const partnerIdByUserId = (() => {
+    const m = new Map<string, string>();
+    for (const p of partnersData.data?.data ?? []) {
+      m.set(p.partner_user_id, p.id);
+    }
+    return m;
+  })();
 
   const handleChat = (userId: string) => {
     createChatRoom.mutate(
@@ -257,6 +378,25 @@ export default function BuyerMembersPage() {
         },
       }
     );
+  };
+
+  const handleAddPartner = (userId: string) => {
+    if (addingPartnerId || partnerStatusMap.has(userId)) return;
+    setAddingPartnerId(userId);
+    createPartner.mutate(
+      { partner_user_id: userId },
+      {
+        onSettled: () => setAddingPartnerId(null),
+      }
+    );
+  };
+
+  const handleAcceptPartner = (partnerId: string) => {
+    if (acceptingPartnerId) return;
+    setAcceptingPartnerId(partnerId);
+    acceptPartner.mutate(partnerId, {
+      onSettled: () => setAcceptingPartnerId(null),
+    });
   };
 
   const handleRoleChange = (role: SearchRole) => {
@@ -284,15 +424,28 @@ export default function BuyerMembersPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {members.map((member) => (
-            <MemberCard
-              key={member.id}
-              member={member}
-              onCardClick={setSelectedUserId}
-              onChat={handleChat}
-              isChatPending={createChatRoom.isPending}
-            />
-          ))}
+          {members.map((member) => {
+            const partnerStatus = partnerStatusMap.get(member.id);
+            const partnerId = partnerIdByUserId.get(member.id);
+            return (
+              <MemberCard
+                key={member.id}
+                member={member}
+                myRole={myRole}
+                partnerStatus={partnerStatus}
+                partnerId={partnerId}
+                onCardClick={setSelectedUserId}
+                onChat={handleChat}
+                onAddPartner={handleAddPartner}
+                onAcceptPartner={handleAcceptPartner}
+                isChatPending={createChatRoom.isPending}
+                isAddingPartner={addingPartnerId === member.id}
+                isAcceptingPartner={
+                  !!partnerId && acceptingPartnerId === partnerId
+                }
+              />
+            );
+          })}
         </div>
       )}
 

@@ -1,12 +1,15 @@
-from datetime import date
-from typing import Optional
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Optional
 from uuid import uuid4
 
-from sqlalchemy import Date, ForeignKey, Integer, String, Text
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.models.negotiation import NegotiationHistory
 
 
 class Order(Base, SoftDeleteMixin):
@@ -29,6 +32,19 @@ class Order(Base, SoftDeleteMixin):
     delivery_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     delivery_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cancellation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelled_by: Mapped[Optional[UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+
+    negotiations: Mapped[list["NegotiationHistory"]] = relationship(
+        "NegotiationHistory",
+        primaryjoin="Order.id == foreign(NegotiationHistory.order_id)",
+        order_by="NegotiationHistory.created_at.desc()",
+    )
 
 
 class OrderItem(Base, TimestampMixin):

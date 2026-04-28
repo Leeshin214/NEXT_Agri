@@ -14,11 +14,17 @@ import PageHeader from '@/components/common/PageHeader';
 import SummaryCard from '@/components/common/SummaryCard';
 import StatusBadge from '@/components/common/StatusBadge';
 import { useOrders } from '@/hooks/useOrders';
+import { useChatRooms } from '@/hooks/useChat';
+import type { ChatRoom } from '@/types';
 
 export default function BuyerDashboardPage() {
   const router = useRouter();
   const { data: ordersData } = useOrders({ limit: 5 });
+  const { data: roomsData } = useChatRooms();
+
   const orders = ordersData?.data ?? [];
+  const rooms: ChatRoom[] = roomsData?.data ?? [];
+  const unreadTotal = rooms.reduce((sum, r) => sum + (r.unread_count ?? 0), 0);
 
   const activeOrders = orders.filter(
     (o) => !['COMPLETED', 'CANCELLED'].includes(o.status)
@@ -59,7 +65,7 @@ export default function BuyerDashboardPage() {
         />
         <SummaryCard
           title="미확인 채팅"
-          value={0}
+          value={unreadTotal}
           subtitle="읽지 않은 메시지"
           icon={MessageCircle}
           iconColor="text-purple-600 bg-purple-100"

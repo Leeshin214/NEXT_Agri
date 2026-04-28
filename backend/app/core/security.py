@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -8,6 +9,7 @@ from jwt.algorithms import ECAlgorithm
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
 _jwks_cache: dict | None = None
 
 
@@ -61,5 +63,5 @@ async def verify_supabase_jwt(token: str) -> dict:
     except HTTPException:
         raise
     except jwt.InvalidTokenError as e:
-        print(f"[AUTH] JWT 검증 실패: {str(e)}")
+        logger.debug("[AUTH] JWT 검증 실패: %s", str(e))
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {str(e)}")

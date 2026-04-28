@@ -18,13 +18,14 @@ class AIContextBuilder:
         """판매자 컨텍스트: 오늘 출하, 재고 부족, 미응답 견적"""
         today_str = date.today().isoformat()
 
-        # 오늘 출하 일정
+        # 오늘 출하 일정 (soft-deleted 제외)
         shipments = await asyncio.to_thread(
             lambda: self.client.table("calendar_events")
             .select("title, event_type")
             .eq("user_id", user_id)
             .eq("event_type", "SHIPMENT")
             .eq("event_date", today_str)
+            .is_("deleted_at", None)
             .execute()
         )
         shipment_list = shipments.data or []
@@ -80,13 +81,14 @@ class AIContextBuilder:
         )
         active_count = active.count or 0
 
-        # 오늘 납품 예정
+        # 오늘 납품 예정 (soft-deleted 제외)
         deliveries = await asyncio.to_thread(
             lambda: self.client.table("calendar_events")
             .select("title, event_type")
             .eq("user_id", user_id)
             .eq("event_type", "DELIVERY")
             .eq("event_date", today_str)
+            .is_("deleted_at", None)
             .execute()
         )
         delivery_list = deliveries.data or []

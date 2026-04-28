@@ -11,6 +11,8 @@ interface ProductFilters {
   search?: string;
   page?: number;
   limit?: number;
+  max_price?: number;
+  min_stock?: number;
 }
 
 export function useProducts(filters?: ProductFilters) {

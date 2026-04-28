@@ -47,5 +47,6 @@ class ProductResponse(BaseModel):
     image_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    deleted_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}

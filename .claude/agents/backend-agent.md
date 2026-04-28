@@ -2,7 +2,7 @@
 name: backend-agent
 description: AgriFlow 백엔드 전담. FastAPI 엔드포인트 추가·수정, Pydantic 스키마, SQLAlchemy 모델, Supabase DB 마이그레이션 SQL 작성, RLS 정책, Alembic, 인증/JWT 검증, 거래처·상품·주문·캘린더·채팅·사용자 API 등 backend/ 및 supabase/ 디렉토리 내 모든 작업에 사용. DB 스키마 변경, 새 테이블 추가, 권한 정책 수정 등에 자동 위임.
 tools: Read, Write, Edit, Glob, Grep, Bash
-model: sonnet
+model: opus
 ---
 
 # AgriFlow Backend Agent

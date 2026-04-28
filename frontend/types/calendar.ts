@@ -1,9 +1,12 @@
+import type { OrderStatus } from './order';
+
 export type EventType =
   | 'SHIPMENT'
   | 'DELIVERY'
   | 'MEETING'
   | 'QUOTE_DEADLINE'
   | 'ORDER'
+  | 'SUBSCRIPTION'  // V1.5 Phase 2 — 정기배송 가상 이벤트 (프론트에서만 합성)
   | 'OTHER';
 
 export interface CalendarEvent {
@@ -18,6 +21,9 @@ export interface CalendarEvent {
   description: string | null;
   is_allday: boolean;
   created_at: string;
+  order_number: string | null;
+  product_name: string | null;
+  order_status: OrderStatus | null;
 }
 
 export interface CalendarEventCreate {

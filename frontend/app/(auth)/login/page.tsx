@@ -4,9 +4,9 @@ import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/client';
-import { useAuthStore } from '@/store/authStore';
+import { useAuthStore, LOGIN_DURATION_MS } from '@/store/authStore';
 import { api } from '@/lib/api';
-import type { SuccessResponse, User } from '@/types';
+import type { SuccessResponse, User, UserRole } from '@/types';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -37,34 +37,62 @@ export default function LoginPage() {
       return;
     }
 
-    // 역할 확인 후 리다이렉트
+    // 세션 확인 (Supabase는 storageKey에 세션 저장 완료 상태)
     const {
-      data: { user },
-    } = await supabase.auth.getUser();
+      data: { session },
+    } = await supabase.auth.getSession();
 
-    if (user) {
-      // 백엔드 API로 프로필 조회 (service_role → RLS 우회, 올바른 users.id 보장)
-      try {
-        const result = await api.get<SuccessResponse<User>>('/users/me');
-        useAuthStore.getState().setUser(result.data);
-        const redirectPath =
-          result.data.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
-        router.push(redirectPath);
-      } catch (e) {
-        console.error('[Login] 백엔드 API 프로필 조회 실패, Supabase fallback 시도:', e);
+    if (!session) {
+      setError('세션을 생성하지 못했습니다. 다시 시도해주세요.');
+      setIsLoading(false);
+      return;
+    }
 
-        // fallback: Supabase 직접 조회
-        const { data: profile } = await supabase
-          .from('users')
-          .select('role')
-          .eq('supabase_uid', user.id)
-          .single();
+    const expiresAt = Date.now() + LOGIN_DURATION_MS;
 
-        const redirectPath =
-          profile?.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
-        router.push(redirectPath);
+    // 백엔드 API로 프로필 조회 (service_role → RLS 우회, 올바른 users.id 보장)
+    let profile: User | null = null;
+    try {
+      const result = await api.get<SuccessResponse<User>>('/users/me');
+      profile = result.data;
+    } catch (e) {
+      console.error('[Login] 백엔드 API 프로필 조회 실패, Supabase fallback 시도:', e);
+
+      // fallback: Supabase 직접 조회
+      const { data: row } = await supabase
+        .from('users')
+        .select('*')
+        .eq('supabase_uid', session.user.id)
+        .single();
+
+      if (row) {
+        profile = row as User;
+      } else {
+        // 메타데이터 폴백
+        profile = {
+          id: '',
+          supabase_uid: session.user.id,
+          email: session.user.email ?? '',
+          name: (session.user.user_metadata?.name as string) ?? '',
+          role: (session.user.user_metadata?.role as UserRole) ?? 'BUYER',
+          company_name:
+            (session.user.user_metadata?.company_name as string) ?? null,
+          phone: null,
+          profile_image: null,
+          is_active: true,
+          created_at: session.user.created_at ?? '',
+          updated_at: session.user.created_at ?? '',
+          deleted_at: null,
+        };
       }
     }
+
+    // setSession으로 user + 만료 시각을 한 번에 저장
+    useAuthStore.getState().setSession(profile, expiresAt);
+
+    const redirectPath =
+      profile.role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard';
+    router.replace(redirectPath);
   };
 
   return (

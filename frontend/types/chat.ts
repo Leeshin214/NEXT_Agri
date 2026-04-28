@@ -11,6 +11,55 @@ export interface ChatRoom {
   unread_count: number;
 }
 
+/**
+ * 주문 협상 ↔ 채팅 양방향 연결을 위한 메시지 타입.
+ * 백엔드 chat_service.ALLOWED_MESSAGE_TYPES 와 동기화된다.
+ *
+ * - TEXT             : 일반 사용자 메시지 (기본)
+ * - SYSTEM           : 시스템 안내 (견적 요청 자동 알림 등). 가운데 회색 안내 박스로 렌더
+ * - COUNTER_OFFER    : 협상가 제시 — 카드형 강조 박스 + 수락/거절 버튼
+ * - OFFER_ACCEPTED   : 협상가 수락 — 초록 카드
+ * - OFFER_REJECTED   : 협상가 거절 — 회색 카드
+ * - ORDER_STATUS     : 주문 상태 변경 — 가운데 박스 (StatusBadge 활용)
+ * - ORDER_CANCELLED  : 주문 취소 — 빨간 카드
+ */
+export type MessageType =
+  | 'TEXT'
+  | 'SYSTEM'
+  | 'COUNTER_OFFER'
+  | 'OFFER_ACCEPTED'
+  | 'OFFER_REJECTED'
+  | 'ORDER_STATUS'
+  | 'ORDER_CANCELLED';
+
+/**
+ * 메시지의 metadata 필드는 message_type 별로 형태가 다르다.
+ * 모든 키는 optional 로 선언해 서버 응답을 그대로 받을 수 있게 한다.
+ * 페이지/컴포넌트 단계에서 message_type 으로 좁힌 뒤 사용한다.
+ */
+export interface MessageMetadata {
+  // SYSTEM (견적 요청 알림)
+  order_id?: string;
+  order_number?: string;
+  total_amount?: number;
+  // COUNTER_OFFER
+  offer_id?: string;
+  proposed_total_amount?: number;
+  from_role?: 'SELLER' | 'BUYER';
+  notes?: string;
+  status?: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'SUPERSEDED';
+  // OFFER_ACCEPTED
+  accepted_amount?: number;
+  // ORDER_STATUS
+  from_status?: string;
+  to_status?: string;
+  // ORDER_CANCELLED
+  reason?: string;
+  cancelled_by?: string;
+  // 향후 확장 필드
+  [key: string]: unknown;
+}
+
 export interface Message {
   id: string;
   room_id: string;
@@ -19,4 +68,27 @@ export interface Message {
   is_read: boolean;
   created_at: string;
   deleted_at?: string | null;
+  // 주문 협상 ↔ 채팅 양방향 연결 (2026-04-27 추가)
+  message_type?: MessageType;
+  metadata?: MessageMetadata | null;
+}
+
+// 백엔드 services/agent_tools.py find_alternative_partners 의 alternatives 항목과 매칭
+// 필드 이름은 백엔드 dict 그대로 유지 — name/company_name/trade_count 등
+export interface AlternativePartner {
+  user_id: string;
+  name: string;
+  company_name?: string;
+  // 거래 이력 관련
+  trade_count?: number;
+  last_trade_date?: string | null;
+  // 대표 상품 정보 (BUYER 호출 시 채워짐)
+  stock_quantity?: number | null;
+  price_per_unit?: number | null;
+  unit?: string;
+  product_name?: string;
+  category?: string;
+  // 연락처 (있을 때만)
+  phone?: string;
+  email?: string;
 }
