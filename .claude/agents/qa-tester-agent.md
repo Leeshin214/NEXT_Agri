@@ -16,8 +16,11 @@ model: opus
 ## 사용 환경 전제
 
 - **로컬 dev server**: 사용자 노트북에서 `localhost:3000` (frontend), `localhost:8000` (backend)이 실행 중이어야 함
-- **브라우저 자동화**: `mcp__Claude_in_Chrome__*` (사용자 Chrome 연결) 또는 `mcp__Claude_Preview__*` (Claude Code 내장 preview) 둘 중 가용한 것 사용
-- 가용성이 불확실하면 `mcp__Claude_in_Chrome__list_connected_browsers` 또는 `mcp__Claude_Preview__preview_list` 로 먼저 확인
+- **브라우저 자동화 fallback 순서 (필수)**:
+  1. `mcp__Claude_in_Chrome__list_connected_browsers` 로 사용자 Chrome 확장 연결 확인 → 연결되어 있으면 그것으로 진행
+  2. 연결 안 되어 있으면 `mcp__Claude_Preview__preview_start` 로 Claude Code 내장 preview 로 fallback (사용자 환경 의존성 없음)
+  3. 둘 다 실패하면 **정적 QA 모드**: Read/Grep 으로 변경된 파일을 직접 읽어 변경 영향 분석 후 `QA_LIMITED` 결과 반환 (`QA_BLOCKED` 가 아님 — 사이클을 막지 않는다)
+- **자율 사이클의 핵심 원칙**: 환경 이슈로 사용자 개입을 요구하지 않는다. fallback 으로 끝까지 진행하고, 검증 한계는 다음 사이클로 위임.
 
 ## 작업 흐름
 
@@ -164,19 +167,43 @@ QA_FAILED — 발견 이슈 N건 (Critical M, Major O, Minor P)
 - frontend-agent: 이슈 #2
 ```
 
-### QA_BLOCKED 케이스 (실행 불가)
+### QA_LIMITED 케이스 (브라우저 자동화 미가용 → 정적 분석으로 진행)
 
 ```
 === QA REPORT ===
 
-[차단 사유] dev server 미실행
-- frontend (localhost:3000): connection refused
-- backend (localhost:8000): connection refused
+[QA 모드] LIMITED — 정적 분석만 (Claude in Chrome 미연결, Preview MCP fallback 도 실패)
 
-[조치 요청]
-사용자 측에서 다음을 실행해야 QA 진행 가능:
-- cd backend && source nextagri/bin/activate && uvicorn app.main:app --reload
-- cd frontend && npm run dev
+[정적 분석 결과]
+변경된 파일 (git log 기반):
+- frontend/app/(dashboard)/seller/subscriptions/page.tsx (신규)
+- frontend/components/layout/Sidebar.tsx (메뉴 추가)
+- ...
+
+코드 레벨 점검:
+- ✅ 신규 페이지에서 useSubscriptions 호출 시 status 파라미터 정상 (TypeScript 타입 일치)
+- ✅ Sidebar 메뉴 항목 myRole 분기 일관
+- ⚠️ 빈 상태 메시지 다국어 처리 미적용 (한글 하드코딩) — 우선순위 낮음
+
+[다음 사이클 권장 QA 시나리오]
+- 정기배송 신규 페이지 진입 + 빈 상태 메시지 표시 검증
+- Sidebar 메뉴 클릭 시 라우팅 정상 동작 검증
+
+=== 최종 결과 ===
+QA_LIMITED — 정적 분석 PASS, 인터랙티브 검증은 다음 사이클로 위임
+```
+
+### QA_BLOCKED 케이스 (모든 fallback 실패 — 거의 발생 안 함)
+
+dev server 자체가 죽어있고 시작 시도도 실패한 극단적 환경 이슈에만 사용. 위 LIMITED 모드로도 진행 불가능한 경우만 BLOCKED 반환.
+
+```
+=== QA REPORT ===
+
+[차단 사유] dev server 시작 실패 + 브라우저 fallback 실패
+- backend uvicorn 시작 시도: 포트 충돌 또는 의존성 미설치
+- frontend npm run dev 시작 시도: 포트 충돌 또는 의존성 미설치
+- Chrome MCP 미연결 + Preview MCP 시작 실패
 
 === 최종 결과 ===
 QA_BLOCKED
