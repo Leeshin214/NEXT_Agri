@@ -1993,3 +1993,82 @@ seller/buyer 양쪽 orders/page.tsx 차이는 기존과 동일하게 한정:
 - 컴포넌트명 / 페이지 description / role-specific 컬럼명 (구매자 vs 판매자) / 채팅 라우트 / `myRole` ('SELLER' vs 'BUYER')
 - 정기배송 탭 컬럼은 양쪽이 거의 동일하지만 "구매자" vs "판매자" 라벨과 buyer_name/seller_name 필드만 다름
 - 액션 동작(수락/거절/회차 생성)은 양쪽 동일
+
+---
+
+#### 정기배송 전용 페이지 (`/{role}/subscriptions`) (검증됨, 2026-04-28)
+
+V1.6 이전엔 정기배송 마스터 자체 관리는 `PartnerDetailModal` 에서만 가능했고, 주문/견적 페이지의 "정기배송" 탭은 보조 진입점일 뿐이었다. 사용자가 정기배송을 한눈에 보고 관리할 페이지가 없어 신규 추가:
+- `frontend/app/(dashboard)/seller/subscriptions/page.tsx`
+- `frontend/app/(dashboard)/buyer/subscriptions/page.tsx`
+
+##### 사이드바 메뉴 추가 (`constants/menus.ts`)
+
+거래처 다음 위치에 추가 (거래처 → 정기배송 흐름이 자연스러움):
+```ts
+{ label: '정기배송', href: '/{role}/subscriptions', icon: Repeat },
+```
+아이콘은 `lucide-react` 의 `Repeat` 사용 — `RefreshCw` 보다 "반복 일정" 의미에 적합.
+
+##### 페이지 구조 — 카드 펼침 패턴 (Modal 대체)
+
+별도 SubscriptionDetailModal 이 아직 없어 인라인 펼침으로 구현. DataTable 대신 카드 리스트로 작성:
+```tsx
+const [expandedId, setExpandedId] = useState<string | null>(null);
+// 카드 헤더 클릭 → 토글
+// 펼침 영역에 모든 액션(회차 생성/일시정지/재개/수락/거절/해지/거래처 점프) 표시
+```
+탭/필터 변경 시 `setExpandedId(null)` 로 명시적으로 닫아야 다른 탭에서 잔존 펼침 상태 노출 안 됨.
+
+##### 상태 필터 — 백엔드 단일 status + 클라이언트 묶음 처리 (함정)
+
+백엔드 `GET /subscriptions?status=...` 는 단일 status 만 받음. "종료" 처럼 ENDED/CANCELLED/REJECTED 를 묶어 보여주려면 전체 fetch 후 클라이언트 필터링:
+```ts
+interface FilterDef {
+  key: string;
+  label: string;
+  status?: SubscriptionStatus;          // 서버 필터 (단일)
+  clientStatuses?: SubscriptionStatus[];// 클라이언트 묶음 필터
+}
+const useServerStatus = !!def?.status && !def.clientStatuses;
+useSubscriptions({ status: useServerStatus ? def.status : undefined });
+```
+
+정렬은 `STATUS_PRIORITY` 로 ACTIVE > PENDING > PAUSED > ENDED > CANCELLED > REJECTED, 동일 status 내부에서는 `next_delivery_date asc`.
+
+##### 조건부 액션 노출 규칙
+
+- `showAcceptReject = status === 'PENDING' && !isMyRequest` — created_by null 또는 본인이면 본인이 보낸 요청 (수락 불가)
+- `showGenerate = status === 'ACTIVE'` — 회차 생성 액션
+- `showPauseResume = status === 'ACTIVE' || status === 'PAUSED'`
+- `showDelete = status !== 'ENDED' && status !== 'CANCELLED' && status !== 'REJECTED'` — 종결 상태는 해지 버튼 숨김
+
+##### 거래처로 이동 — 모달 점프 + fallback 라우팅
+
+행 액션 "거래처로 이동" 클릭 시:
+1. `partners` 목록에서 `partner_user_id === counterpartUserId` 매칭
+2. 매칭되면 `setSelectedPartner(partner)` → PartnerDetailModal 오픈
+3. 매칭 실패 시 (거래처 미등록 등) `router.push(PARTNERS_ROUTE)` 로 fallback
+
+##### byte-identical 유지 규칙 (정기배송 페이지)
+
+seller/buyer 차이는 다음 4개 상수로만 한정 (diff 검증 완료):
+```ts
+const PAGE_ROLE: 'SELLER' | 'BUYER' = 'SELLER';  // or 'BUYER'
+const PARTNERS_ROUTE = '/seller/partners';        // or '/buyer/partners'
+const PAGE_DESCRIPTION = '거래처별 정기배송 일정을 관리하세요';  // or 공급처별...
+const COUNTERPART_LABEL = '구매자';                // or '판매자'
+```
+
+##### TypeScript strict — `as const` 함정 (중요)
+
+`PAGE_ROLE = 'SELLER' as const` 로 좁히면 같은 파일 내에서 `PAGE_ROLE === 'BUYER'` 비교가 TS2367 에러로 잡힌다 (literal 타입 narrowing). byte-identical 정책상 양쪽 페이지 본문이 똑같이 `PAGE_ROLE === 'SELLER' ? buyer_name : seller_name` 같은 분기를 써야 하므로 **반드시 union 타입 명시**:
+```ts
+// ✅ OK — 분기 비교가 양쪽 페이지에서 모두 컴파일 통과
+const PAGE_ROLE: 'SELLER' | 'BUYER' = 'SELLER';
+
+// ❌ NO — 'as const' 는 byte-identical 페이지의 분기 비교를 깨뜨림
+const PAGE_ROLE = 'SELLER' as const;
+```
+
+이 패턴은 다른 byte-identical 페이지에도 동일하게 적용 — myRole 류 상수는 항상 union 타입으로 선언.
