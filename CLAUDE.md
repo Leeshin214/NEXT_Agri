@@ -15,14 +15,31 @@
    ↓
 2. validator-agent 실행 (개발 agent 완료 직후 항상 실행)
    ↓
-3A. VALIDATION_PASSED → 사용자에게 결과 답변
+3A. VALIDATION_PASSED → 4단계로 진행
 3B. VALIDATION_FAILED → 리포트의 "수정 필요 agent 목록" 을 보고
                         해당 agent에 수정 지시 → 2번으로 돌아감
                         (최대 3회 재시도, 이후에도 실패 시 사용자에게 오류 상황 보고)
+   ↓
+4. QA Tester 게이트 (자율 PM 사이클일 때만 적용)
+   - 사용자가 "사이클 시작해" / "PM 작업 진행해줘" 같은 자율 사이클 모드일 때만 진입
+   - 단발 요청(예: "이 버그 고쳐줘")은 4단계 건너뛰고 사용자에게 답변
+   - 컨텍스트 사용량(`/context` 또는 추정)이 50% 미만이면 qa-tester-agent 실행
+   - QA_PASSED → commit + push + 사용자에게 결과 보고
+   - QA_FAILED → 발견 이슈를 적절한 agent(frontend/backend)에 수정 위임 → 1단계로 돌아감
+                 (최대 2회 QA 재실행, 이후에도 실패하면 이슈를 다음 PM 사이클로 이월하고 종료)
+   - QA_BLOCKED → dev server 시작 후 재시도 또는 사용자에게 보고
 ```
 
 - validator-agent는 TypeScript 컴파일, Python 문법, 프론트↔백 API 계약 불일치, 타입 불일치를 검사한다
-- 사용자에게 답변할 때는 반드시 `VALIDATION_PASSED` 상태에서만 답변한다
+- qa-tester-agent는 실제 브라우저로 사용자 시나리오를 진행하며 UX 페인 포인트·런타임 버그를 발견한다 (코드 미수정)
+- 사용자에게 답변할 때는 반드시 `VALIDATION_PASSED` 상태에서만 답변한다 (QA는 자율 사이클일 때만 추가 게이트)
+
+### 자율 사이클 식별
+
+다음 상황을 "자율 사이클"로 본다:
+- 사용자가 GitHub Issue (`pm-cycle` 라벨)의 PM Report 작업을 진행하라고 명시한 경우
+- 사용자가 "사이클 시작해", "다음 PM 작업 진행해줘" 같은 자율 모드 명령을 내린 경우
+- 그 외 단발 작업·디버깅·질문·정보 조회는 자율 사이클이 아님 → QA tester 미실행
 
 ---
 
@@ -230,6 +247,7 @@ DATABASE_URL=postgresql+asyncpg://...
 | backend-agent | `.claude/agents/backend-agent.md` | FastAPI, SQLAlchemy, Pydantic, DB 마이그레이션, RLS, Auth |
 | ai-agent | `.claude/agents/ai-agent.md` | Claude API 연동, 스트리밍, 프롬프트 설계, AI 기능 확장 |
 | validator-agent | `.claude/agents/validator-agent.md` | 코드 수정 후 자동 검증 — TS 컴파일, Python 문법, API 계약 불일치 탐지 |
+| qa-tester-agent | `.claude/agents/qa-tester-agent.md` | 자율 PM 사이클의 마지막 게이트. 실제 브라우저로 사용자 시나리오 진행, UX 페인 포인트·런타임 버그 발견 (코드 수정 X) |
 
 ### SKILL 파일 역할 (상세 스펙 문서)
 각 SKILL_*.md 파일은 sub-agent가 작업 시 참조하는 상세 스펙 문서다. Agent 파일 내에서 명시적으로 참조한다.
