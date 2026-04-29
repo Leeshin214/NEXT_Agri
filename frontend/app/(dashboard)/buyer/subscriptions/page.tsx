@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
+  CalendarDays,
   ChevronDown,
   ChevronUp,
   ExternalLink,
@@ -12,6 +13,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
+import NextDeliveryLabel from '@/components/subscriptions/NextDeliveryLabel';
 import PartnerDetailModal from '@/components/partners/PartnerDetailModal';
 import {
   useAcceptSubscription,
@@ -347,15 +349,19 @@ export default function SubscriptionsPage() {
                         {cfg.label}
                       </span>
                     </div>
-                    <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-gray-500">
+                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-gray-500">
                       <span>
                         {COUNTERPART_LABEL}: {counterpartName ?? '-'}
                         {counterpartCompany ? ` (${counterpartCompany})` : ''}
                       </span>
                       <span>주기: {formatScheduleLabel(sub)}</span>
-                      <span>
-                        다음 배송일: {formatDate(sub.next_delivery_date)}
-                      </span>
+                      {/*
+                        카드 헤더는 행 펼침 토글용 <button> 이므로 그 안에 <a>(=<Link>)를
+                        넣으면 HTML invalid (validateDOMNesting 경고). calendarHref 를
+                        전달하지 않아 <span> 으로만 렌더하고, 캘린더 점프는 펼침 영역의
+                        별도 "캘린더에서 보기" 버튼으로 분리한다.
+                      */}
+                      <NextDeliveryLabel date={sub.next_delivery_date} />
                       <span>
                         회당 {sub.total_amount.toLocaleString('ko-KR')}원
                       </span>
@@ -499,6 +505,23 @@ export default function SubscriptionsPage() {
                         <ExternalLink className="h-3.5 w-3.5" />
                         거래처로 이동
                       </button>
+                      {/*
+                        다음 배송일이 있을 때 캘린더로 점프 — 카드 헤더의 NextDeliveryLabel
+                        에서 nested <a> 문제로 제거된 동선을 펼침 영역에서 대체.
+                      */}
+                      {sub.next_delivery_date && (
+                        <button
+                          onClick={() =>
+                            router.push(
+                              `/buyer/calendar?date=${sub.next_delivery_date}`
+                            )
+                          }
+                          className="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50"
+                        >
+                          <CalendarDays className="h-3.5 w-3.5" />
+                          캘린더에서 보기
+                        </button>
+                      )}
                       {showDelete && (
                         <button
                           onClick={() => handleDelete(sub)}

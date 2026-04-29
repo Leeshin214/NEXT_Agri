@@ -23,7 +23,6 @@ export type {
   AlternativePartner,
 } from './chat';
 export type { SuccessResponse, PaginationMeta, ErrorResponse } from './api';
-export type { ScheduleRecommendation, ScheduleRecommendResponse } from './scheduleAgent';
 export type {
   Subscription,
   SubscriptionItem,

@@ -8,7 +8,7 @@
 - 주문 / 견적 워크플로우
 - 재고 및 출하 관리
 - 실시간 채팅
-- AI 업무 보조 (Claude API 기반)
+- AI 업무 보조 (OpenAI API 기반)
 
 ## 기술 스택
 
@@ -18,7 +18,7 @@
 | Backend | FastAPI, SQLAlchemy, Pydantic v2, asyncpg |
 | Database | Supabase (PostgreSQL 15) |
 | Auth | Supabase Auth (JWT) |
-| AI | Anthropic Claude API |
+| AI | OpenAI API (gpt-4o-mini) |
 | Infra | Vercel (FE), Railway/Fly.io (BE), Redis |
 
 ## 프로젝트 구조
@@ -64,7 +64,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_JWT_SECRET=
-ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
 REDIS_URL=redis://localhost:6379
 DATABASE_URL=postgresql+asyncpg://...
 ```

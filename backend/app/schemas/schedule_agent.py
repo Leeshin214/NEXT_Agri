@@ -2,11 +2,6 @@ from pydantic import BaseModel
 from typing import Optional
 
 
-class ScheduleRecommendRequest(BaseModel):
-    year: int
-    month: int
-
-
 class ScheduleRecommendation(BaseModel):
     recommended_date: str
     product_name: Optional[str] = None

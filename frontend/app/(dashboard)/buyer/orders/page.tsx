@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { MessageCircle, PackageCheck, Plus, X } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
+import NextDeliveryLabel from '@/components/subscriptions/NextDeliveryLabel';
 import DataTable, { type Column } from '@/components/common/DataTable';
 import StatusBadge from '@/components/common/StatusBadge';
 import NegotiationHistory from '@/components/common/NegotiationHistory';
@@ -373,9 +374,12 @@ export default function BuyerOrdersPage() {
       key: 'next',
       header: '다음 배송일',
       render: (sub) => (
-        <span className="text-sm text-gray-700">
-          {formatDate(sub.next_delivery_date)}
-        </span>
+        <NextDeliveryLabel
+          date={sub.next_delivery_date}
+          calendarHref={`/buyer/calendar?date=${sub.next_delivery_date}`}
+          prefix=""
+          className="text-sm"
+        />
       ),
     },
     {

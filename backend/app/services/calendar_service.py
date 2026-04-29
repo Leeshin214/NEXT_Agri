@@ -20,24 +20,36 @@ CALENDAR_SELECT_WITH_JOINS = (
     "*,"
     "order:orders!order_id("
     "order_number,status,deleted_at,"
+    "buyer:users!buyer_id(name,company_name),"
+    "seller:users!seller_id(name,company_name),"
     "items:order_items(product:products(name,deleted_at))"
     ")"
 )
 
 
 def _flatten_event_row(row: dict) -> dict:
-    """orders/order_items/products 임베딩을 flatten 하여 order_number, product_name, order_status 부여.
+    """orders/users/order_items/products 임베딩을 flatten.
 
-    - order_id 가 None  → order_number / product_name / order_status = None
-    - 주문이 soft-deleted → 세 필드 모두 None
+    부여 필드:
+    - order_number, product_name, order_status
+    - buyer_name / buyer_company / seller_name / seller_company
+
+    규칙:
+    - order_id 가 None  → 위 필드 모두 None
+    - 주문이 soft-deleted → 위 필드 모두 None
     - 첫 활성 아이템 product 가 있으면 product_name 사용
     - 활성 아이템이 2개 이상이면 "{첫 상품명} 외 N건"
     - order_status: orders.status 값을 그대로 (QUOTE_REQUESTED, CONFIRMED, ... CANCELLED)
+    - buyer/seller: users 임베딩이 None 이면 (사용자 hard-delete 등) 해당 필드만 None
     """
     order_payload = row.pop("order", None)
     row["order_number"] = None
     row["product_name"] = None
     row["order_status"] = None
+    row["buyer_name"] = None
+    row["buyer_company"] = None
+    row["seller_name"] = None
+    row["seller_company"] = None
 
     if not order_payload:
         return row
@@ -46,6 +58,13 @@ def _flatten_event_row(row: dict) -> dict:
 
     row["order_number"] = order_payload.get("order_number")
     row["order_status"] = order_payload.get("status")
+
+    buyer = order_payload.get("buyer") or {}
+    seller = order_payload.get("seller") or {}
+    row["buyer_name"] = buyer.get("name")
+    row["buyer_company"] = buyer.get("company_name")
+    row["seller_name"] = seller.get("name")
+    row["seller_company"] = seller.get("company_name")
 
     items = order_payload.get("items") or []
     product_names: list[str] = []
@@ -158,12 +177,14 @@ class CalendarService:
         if not order_ids:
             return [_attach_order_payload(row, {}) for row in events]
 
-        # 3. 해당 주문들을 한 번의 쿼리로 가져오되 order_items + products 임베딩만 사용
+        # 3. 해당 주문들을 한 번의 쿼리로 가져오되 order_items + products + users 임베딩 사용
         #    (calendar_events RLS 위에 orders RLS 한 번만 누적 → 3-depth 보다 빠름)
         orders_result = await asyncio.to_thread(
             lambda: self.client.table("orders")
             .select(
                 "id,order_number,status,deleted_at,"
+                "buyer:users!buyer_id(name,company_name),"
+                "seller:users!seller_id(name,company_name),"
                 "items:order_items(product:products(name,deleted_at))"
             )
             .in_("id", order_ids)

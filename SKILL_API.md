@@ -71,8 +71,7 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_JWT_SECRET: str
-    ANTHROPIC_API_KEY: str
-    OPENAI_API_KEY: str = ""   # GPT 스케줄 에이전트용
+    OPENAI_API_KEY: str = ""   # 백엔드 LLM 호출 전부 OpenAI 통일 (gpt-4o-mini)
     DATABASE_URL: str
     REDIS_URL: str = "redis://localhost:6379"
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
@@ -276,21 +275,6 @@ router = APIRouter(prefix="/calendar", tags=["calendar"])
 #   GET /api/v1/calendar?year=2026            → year 만 단독은 전체 반환 (month 없으면 year 무시)
 ```
 
-### schedule_agent.py (GPT 스케줄 조율 에이전트 API)
-```python
-router = APIRouter(prefix="/schedule-agent", tags=["schedule-agent"])
-
-# POST /schedule-agent/recommend
-# Request:  { year: int, month: int }
-# Response: SuccessResponse[ScheduleRecommendResponse]
-#   - has_recommendation: bool
-#   - recommendations: list[ScheduleRecommendation]  (최대 3개)
-#   - message: str
-# 인증 필요 (get_current_user), 역할 무관 (SELLER/BUYER 모두 사용)
-# 내부적으로 calendar_events, products, orders를 조회해 GPT-4o-mini에게 전달
-# OPENAI_API_KEY 환경변수 필요
-```
-
 ### ai_assistant.py (AI 도우미 API)
 ```python
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -306,6 +290,21 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 # - DB에서 최근 대화 10개 조회 후 history로 전달
 # - 응답: SuccessResponse[dict] — { response: str, tools_used: list[str] }
 # - 대화 후 ai_conversations 테이블에 저장 (prompt_type = ",".join(tools_used))
+#
+# 라우터(orchestrator_node) 분류 4종 (2026-04-29 CALENDAR 분기 추가):
+#   - INVENTORY / ORDER → inventory_order_node (16개 tool)
+#   - CALENDAR + DATA   → calendar_data_node (TOOLS_CALENDAR 2개만 노출)
+#                          단순 일정 조회/등록 처리
+#   - CALENDAR + REASON → calendar_reason_node
+#                          schedule_agent.get_recommendation 으로 추천 데이터 받고 자연어화
+#   - GENERAL           → response_node
+# 라우터 응답 스키마 (LLM JSON):
+#   {"intent":"INVENTORY"} | {"intent":"ORDER"}
+#   {"intent":"CALENDAR","subtype":"DATA","target_year":YYYY,"target_month":MM}
+#   {"intent":"CALENDAR","subtype":"REASON","target_year":YYYY,"target_month":MM}
+#   {"intent":"GENERAL","response":"..."}
+# target_year/month 폴백: DATA=이번달, REASON=다음달 (라우터 LLM 추출 실패 시 datetime.now() 기준)
+# 응답 스키마는 변경 없음 — 프론트엔드 수정 불필요
 ```
 
 ### subscriptions.py (정기배송 API — V1.5 Phase 1, V1.6 양방향 승인 2026-04-28)
@@ -462,8 +461,7 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 celery==5.4.0
 redis==5.2.1
-anthropic==0.42.0
-openai>=1.58.0
+openai>=1.0.0
 pytest==8.3.4
 pytest-asyncio==0.24.0
 pytest-cov==6.0.0
@@ -493,6 +491,13 @@ pytest-cov==6.0.0
 > 가설이나 일반적인 FastAPI 지식은 추가하지 않는다.
 
 ### 검증된 패턴
+
+- **응답 표기 정책 — 상품·거래처·날짜·상태 메인, 주문번호는 부가 (2026-04-29)**: 주문/배송/일정 응답에서 LLM·프론트 모두 `[상품명] · [거래처명(company_name 우선, name 폴백)] · [날짜] · [상태]` 를 메인으로 쓰고 `order_number` 는 부가 식별자다. AGENT_BASE_SYSTEM 안의 `[응답 표기 정책 — 중요]` 단락 + `calendar_data_node` / `calendar_reason_node` 시스템 프롬프트 끝부분의 "응답 형식: 상품명 · 거래처명 · 날짜 · 상태 순으로 자연스럽게 풀어 쓰고, 주문번호는 끝에 작게 부연한다." 한 줄로 LLM 가이드. 백엔드 응답 데이터 측에서는 다음 3 위치에 buyer/seller/product 평탄화 필드를 일관 추가:
+  - `CalendarEventResponse` (`schemas/calendar.py`) — `buyer_name/buyer_company/seller_name/seller_company` Optional 추가 (기존 `order_number/product_name/order_status` 옆).
+  - `calendar_service._flatten_event_row` + `CALENDAR_SELECT_WITH_JOINS` + `list_events` 의 batch orders select — `users!buyer_id(name,company_name)` / `users!seller_id(name,company_name)` 임베딩 추가.
+  - `agent_tools.get_orders` / `get_order_detail` / `get_calendar_events` — 동일 임베딩 + 평탄화. `get_orders` 는 `product_summary` ("{첫 상품명}" 또는 "{첫 상품명} 외 N건") + `items_count` 추가, `get_order_detail` items 는 `product_name`/`product_unit` 평탄화. LLM 토큰 절약을 위해 nested 임베딩 객체는 응답에서 제거하고 평탄화된 필드만 남긴다.
+
+- **OpenAI 클라이언트는 `app/core/llm.py` 헬퍼 통해서만 생성 (2026-04-29 통일)**: 백엔드의 모든 LLM 호출은 `get_openai_client()` (비동기) / `get_openai_sync_client()` (동기) 싱글톤을 사용한다. 다른 모듈에서 `AsyncOpenAI` / `openai.OpenAI` 를 직접 인스턴스화하지 않는다. 이유는 (1) 키/모델 정책 변경 시 한 곳만 고치면 됨, (2) `AsyncOpenAI` 의 내부 httpx 클라이언트가 첫 호출 시점의 이벤트 루프에 바인딩되므로 lazy 싱글톤이 안전. 기본 모델은 `DEFAULT_MODEL = "gpt-4o-mini"`. requirements.txt 는 `openai>=1.0.0` 만 두고 `anthropic` 패키지는 더 이상 사용하지 않음.
 
 - **HTTPBearer(auto_error=False)**: CORS preflight(OPTIONS) 요청은 Authorization 헤더를 보내지 않는다.
   기본값 `auto_error=True`이면 FastAPI가 OPTIONS 요청을 바로 400/403으로 차단한다.
@@ -559,6 +564,13 @@ pytest-cov==6.0.0
       messages=messages,
   )
   ```
+
+- **LangGraph 노드별 TOOLS 분리 시 시스템 프롬프트 동기화 필수 (2026-04-29 검증)**: 한 노드가 보유하던 도구를 별도 노드로 옮길 때(예: `inventory_order_node` 의 캘린더 도구 2개를 `calendar_data_node` 의 `TOOLS_CALENDAR` 로 이동), 도구 정의만 옮기고 원래 노드의 시스템 프롬프트를 그대로 두면 LLM 이 존재하지 않는 도구를 호출 시도해서 OpenAI API 가 tool 이름을 모른다고 거부하거나, 가이드와 실제 도구 노출이 어긋나 답변이 어색해진다. 반드시 다음 4 영역을 동시에 정리한다.
+  - 시스템 프롬프트 안의 `[사용 가능한 도구]` 목록에서 옮긴 도구 이름 삭제
+  - CASE 매트릭스에서 해당 도구 호출 케이스 통째 삭제 (CASE 번호 재정렬 권장)
+  - FEW_SHOT_EXAMPLES 의 시나리오 예시에서 해당 도구 호출 라인 삭제 또는 시나리오 자체 삭제
+  - "별도 분기로 라우팅된다" 한 줄을 추가해 LLM 이 옮긴 도구를 책임지지 않음을 명시
+  검증: `grep -n "<도구이름>" orchestrator.py` 결과가 `TOOLS_<NEW>` 정의·새 노드 docstring·새 노드 시스템 프롬프트 외에 남으면 안 된다. 또한 백엔드 자동 sync(예: `_sync_calendar_events_for_order_id`) 가 이미 도구 호출을 대체하고 있다면 시스템 프롬프트에 "백엔드 자동 sync 처리" 한 줄을 남겨 LLM 이 직접 등록하지 않도록 명시.
 
 ### 주의사항 & 함정
 

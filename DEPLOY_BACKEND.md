@@ -62,7 +62,7 @@ railway variables set SUPABASE_URL=https://vcvpeagywpsrdjaprxqr.supabase.co
 railway variables set SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 railway variables set SUPABASE_JWT_SECRET=your-jwt-secret
 railway variables set DATABASE_URL=postgresql+asyncpg://postgres.vcvpeagywpsrdjaprxqr:[password]@aws-0-ap-northeast-2.pooler.supabase.com:6543/postgres
-railway variables set ANTHROPIC_API_KEY=sk-ant-...
+railway variables set OPENAI_API_KEY=sk-...
 railway variables set FRONTEND_URL=https://your-app.vercel.app
 ```
 
@@ -99,7 +99,7 @@ curl https://[your-service].railway.app/health
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service_role 키 (RLS 우회) | 필수 |
 | `SUPABASE_JWT_SECRET` | JWT 서명 검증용 secret | 필수 |
 | `DATABASE_URL` | Supabase connection pooler asyncpg URL | 필수 |
-| `ANTHROPIC_API_KEY` | Claude API 키 | 필수 |
+| `OPENAI_API_KEY` | OpenAI API 키 | 필수 |
 | `REDIS_URL` | Railway Redis addon URL (자동 주입) | 필수 |
 | `FRONTEND_URL` | Vercel 프론트엔드 URL (CORS 허용) | 권장 |
 | `PORT` | 서버 포트 (Railway 자동 주입, 기본 8000) | 자동 |

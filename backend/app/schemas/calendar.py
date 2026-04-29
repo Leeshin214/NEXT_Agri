@@ -53,5 +53,12 @@ class CalendarEventResponse(BaseModel):
     # 프론트가 색상/배지 구분용으로 사용한다.
     # QUOTE_REQUESTED | NEGOTIATING | CONFIRMED | PREPARING | SHIPPING | COMPLETED | CANCELLED
     order_status: Optional[str] = None
+    # 거래처(buyer/seller) 평탄화 필드 — orders → users 임베딩에서 추출.
+    # order_id 가 없거나 사용자가 soft-delete 된 경우 모두 None.
+    # 프론트/AI 답변이 "주문번호" 대신 거래처명을 메인으로 쓰기 위함.
+    buyer_name: Optional[str] = None
+    buyer_company: Optional[str] = None
+    seller_name: Optional[str] = None
+    seller_company: Optional[str] = None
 
     model_config = {"from_attributes": True}

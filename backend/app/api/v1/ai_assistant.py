@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.core.config import settings
+from app.core.llm import get_openai_client
 from app.core.supabase import get_supabase_client
 from app.dependencies import get_current_user
 from app.schemas.ai import (
@@ -10,7 +10,6 @@ from app.schemas.ai import (
     AIConversationResponse,
 )
 from app.schemas.common import SuccessResponse
-from app.services.ai_context import ai_context_builder
 from app.services.orchestrator import agent_orchestrator
 
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -25,67 +24,31 @@ async def summarize_chat(
     current_user: dict = Depends(get_current_user),
 ):
     """채팅 대화 AI 요약"""
-    from anthropic import AsyncAnthropic
-
-    client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+    client = get_openai_client()
 
     context_info = request.context or "농산물 유통 거래 채팅"
 
-    response = await client.messages.create(
-        model="claude-3-5-sonnet-20241022",
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
         max_tokens=512,
-        system=(
-            "당신은 농산물 유통업 B2B 플랫폼의 대화 요약 도우미입니다.\n"
-            "아래 채팅 대화를 읽고 핵심 내용을 한국어로 간결하게 요약해주세요.\n"
-            "주요 합의 사항, 가격, 수량, 납품일 등 중요한 정보를 빠짐없이 포함하세요."
-        ),
         messages=[
+            {
+                "role": "system",
+                "content": (
+                    "당신은 농산물 유통업 B2B 플랫폼의 대화 요약 도우미입니다.\n"
+                    "아래 채팅 대화를 읽고 핵심 내용을 한국어로 간결하게 요약해주세요.\n"
+                    "주요 합의 사항, 가격, 수량, 납품일 등 중요한 정보를 빠짐없이 포함하세요."
+                ),
+            },
             {
                 "role": "user",
                 "content": f"[{context_info}]\n\n{request.messages}\n\n위 대화를 요약해주세요.",
-            }
+            },
         ],
     )
 
-    summary_text = response.content[0].text
+    summary_text = response.choices[0].message.content or ""
     return {"data": {"summary": summary_text}}
-
-
-@router.post(
-    "/daily-summary",
-    response_model=SuccessResponse[dict],
-)
-async def daily_summary(
-    current_user: dict = Depends(get_current_user),
-):
-    """오늘의 업무 자동 요약"""
-    from anthropic import AsyncAnthropic
-
-    client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-    role = current_user.get("role", "BUYER")
-    user_id = current_user["id"]
-
-    if role == "SELLER":
-        context = await ai_context_builder.build_seller_context(user_id)
-    else:
-        context = await ai_context_builder.build_buyer_context(user_id)
-
-    response = await client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=512,
-        system="농산물 유통 플랫폼의 업무 요약 도우미입니다. 한국어로 간결하게 요약하세요.",
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"다음 업무 현황을 바탕으로 오늘의 업무 요약과 우선순위를 알려주세요:\n\n{context}"
-                ),
-            }
-        ],
-    )
-
-    return {"data": {"summary": response.content[0].text}}
 
 
 @router.post(
@@ -99,7 +62,7 @@ async def agent_chat(
     """
     tool_use 오케스트레이터 기반 AI 에이전트 채팅.
 
-    기존 /chat과 달리 Claude가 DB를 직접 조회/수정하는 tool을 선택해서
+    기존 /chat과 달리 LLM 이 DB를 직접 조회/수정하는 tool 을 선택해서
     실시간 데이터를 바탕으로 답변한다.
 
     응답에 response(최종 텍스트)와 tools_used(사용한 tool 목록)를 포함한다.

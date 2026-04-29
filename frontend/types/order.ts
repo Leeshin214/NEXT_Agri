@@ -72,6 +72,8 @@ export interface Order {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  /** 백엔드가 제공하는 상품 요약 (예: "사과 외 2건"). 미제공 시 items[0].product_name 으로 폴백. */
+  product_summary?: string | null;
 }
 
 export interface OrderCreate {

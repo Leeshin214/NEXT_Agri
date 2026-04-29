@@ -1,9 +1,9 @@
 # SKILL_AI.md — AI Assistant Agent
 
-> **마지막 동기화**: 2026-03-22 | 실제 코드 기준으로 작성됨
+> **마지막 동기화**: 2026-04-29 | 실제 코드 기준으로 작성됨 (OpenAI 통일 후)
 
 ## 역할
-Anthropic Claude API를 활용한 AI 업무 도우미 기능을 구현한다.  
+OpenAI API 를 활용한 AI 업무 도우미 기능을 구현한다.
 판매자/구매자 각각의 업무 맥락에 맞는 AI 응답을 스트리밍으로 제공한다.
 
 ---
@@ -13,11 +13,32 @@ Anthropic Claude API를 활용한 AI 업무 도우미 기능을 구현한다.
 | 기능 | 엔드포인트 / 위치 | 설명 |
 |------|-----------|------|
 | 일반 대화 | POST /ai/chat | 프롬프트 자유 입력, 스트리밍 응답 |
-| 업무 요약 | POST /ai/daily-summary | 오늘의 업무 자동 요약 |
 | 채팅 요약 | POST /ai/summarize-chat | 채팅 내용 요약 |
 | 메시지 초안 | POST /ai/draft-message | 상황에 맞는 메시지 초안 작성 |
 | 재고 분석 | POST /ai/inventory-alert | 재고 현황 분석 및 경고 |
 | 채팅 합의 감지 | agent_tools.analyze_chat_consensus | 채팅 메시지 → 합의/협상/거절/일반 분류, 합의 시 주문·캘린더 자동 생성 (AgenticPay) |
+| 메인 오케스트레이터 | POST /ai/agent/chat | tool_use 기반 — DB 조회/수정 도구 자체 선택 |
+
+---
+
+## LLM 클라이언트 헬퍼 (필수 사용)
+
+백엔드의 모든 OpenAI 호출은 `app/core/llm.py` 의 헬퍼를 통해 만든다.
+다른 모듈에서 `AsyncOpenAI` / `openai.OpenAI` 를 직접 인스턴스화하지 않는다.
+
+```python
+# app/core/llm.py 사용 예시
+from app.core.llm import get_openai_client, get_openai_sync_client, DEFAULT_MODEL
+
+# 비동기 컨텍스트 (FastAPI 라우터 등)
+client = get_openai_client()  # AsyncOpenAI 싱글톤
+
+# 동기 컨텍스트 (asyncio.to_thread 안에서 호출 시)
+sync_client = get_openai_sync_client()  # openai.OpenAI 싱글톤
+```
+
+- 싱글톤은 lazy 초기화 (첫 호출 시점에 생성) — `AsyncOpenAI` 의 내부 httpx 클라이언트가 첫 사용 시점의 이벤트 루프에 바인딩되기 때문.
+- 모델은 `DEFAULT_MODEL = "gpt-4o-mini"` 사용.
 
 ---
 
@@ -156,12 +177,11 @@ async def build_buyer_context(user: User, db: AsyncSession) -> str:
 # app/api/v1/ai_assistant.py
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
-from anthropic import AsyncAnthropic
 from pydantic import BaseModel
+from app.core.llm import get_openai_client, DEFAULT_MODEL
 from app.dependencies import get_current_user, get_db
 
 router = APIRouter(prefix="/ai", tags=["ai"])
-client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 class AIChatRequest(BaseModel):
     prompt: str
@@ -190,20 +210,33 @@ async def ai_chat(
             context=context
         )
 
+    client = get_openai_client()
+    accumulated = []  # 대화 기록 저장용
+
     async def generate():
-        async with client.messages.stream(
-            model="claude-3-5-sonnet-20241022",
+        # OpenAI: system 은 messages 배열의 첫 항목으로 넣음
+        stream = await client.chat.completions.create(
+            model=DEFAULT_MODEL,
             max_tokens=1024,
-            system=system,
-            messages=[{"role": "user", "content": request.prompt}]
-        ) as stream:
-            async for text in stream.text_stream:
-                yield f"data: {text}\n\n"
+            stream=True,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": request.prompt},
+            ],
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                accumulated.append(delta)
+                yield f"data: {delta}\n\n"
         yield "data: [DONE]\n\n"
 
-        # 대화 기록 저장 (비동기)
-        final_response = await stream.get_final_text()
-        await save_ai_conversation(current_user.id, request.prompt, final_response, request.prompt_type, db)
+        # 대화 기록 저장
+        final_response = "".join(accumulated)
+        await save_ai_conversation(
+            current_user.id, request.prompt, final_response,
+            request.prompt_type, db,
+        )
 
     return StreamingResponse(
         generate(),
@@ -211,6 +244,11 @@ async def ai_chat(
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
 ```
+
+> **응답 파싱 핵심**:
+> - 비스트리밍: `response.choices[0].message.content`
+> - 스트리밍: `chunk.choices[0].delta.content` (None 일 수 있으니 falsy 체크)
+> - `system` 은 별도 인자가 아니라 `messages` 배열의 첫 항목 (`role: "system"`)으로 넣는다.
 
 ---
 
@@ -372,7 +410,8 @@ export default function AIChatPanel() {
 
 ## 작업 체크리스트
 
-- [ ] Anthropic SDK 설치 (`pip install anthropic`)
+- [ ] OpenAI SDK 설치 (`pip install openai`)
+- [ ] `app/core/llm.py` 헬퍼 사용 (직접 `AsyncOpenAI` 인스턴스화 금지)
 - [ ] System Prompt 판매자/구매자 분리 작성
 - [ ] 컨텍스트 빌더 (seller/buyer 각각)
 - [ ] AI 스트리밍 엔드포인트
@@ -459,7 +498,7 @@ find_alternative_partners, get_user_profile
 - find_alternative_partners에 단순 정렬 공식 추가 금지 — DB 결과 그대로 반환, 추천 순위는 LLM(response_node)이 자연어로 생성
 
 #### analyze_chat_consensus 구현 패턴 (Phase 3 검증)
-- 동기 함수로 구현 (`openai.OpenAI(...)` 동기 클라이언트) — `asyncio.run` 절대 사용 금지 (이벤트루프 충돌)
+- 동기 함수로 구현 (`get_openai_sync_client()` 동기 클라이언트) — `asyncio.run` 절대 사용 금지 (이벤트루프 충돌)
 - `chat_ws.py`에서 반드시 `await asyncio.to_thread(analyze_chat_consensus, room_id)` 로 호출
 - `response_format={"type": "json_object"}` + temperature=0 → 안정적인 JSON 반환
 - LLM이 buyer_id/seller_id를 모를 수 있으므로 chat_rooms 조회 결과로 항상 덮어씀

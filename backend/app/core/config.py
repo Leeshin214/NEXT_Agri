@@ -21,14 +21,8 @@ class Settings(BaseSettings):
     # Redis
     REDIS_URL: str = "redis://localhost:6379"
 
-    # Anthropic
-    ANTHROPIC_API_KEY: str = ""
-
     # OpenAI (gpt-4o-mini — orchestrator tool_use)
     OPENAI_API_KEY: str = ""
-
-    # Groq (레거시, 필요 시 유지)
-    GROQ_API_KEY: str = ""
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:3001"]

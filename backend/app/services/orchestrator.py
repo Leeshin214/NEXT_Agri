@@ -2,13 +2,22 @@
 orchestrator.py — LangGraph StateGraph 기반 오케스트레이터 (TEA 방식)
 
 동작 흐름 (AgentOrchestra 논문 방식):
-  1. orchestrator_node: tools 없이 순수 LLM으로 intent만 분류 (INVENTORY / ORDER / GENERAL)
-  2. inventory_order_node: 자체 LLM + TOOLS를 보유하여 직접 tool 선택·실행·반복 (최대 3회)
-  3. response_node: tool 결과를 바탕으로 최종 답변 생성
+  1. orchestrator_node: tools 없이 순수 LLM으로 intent만 분류
+     (INVENTORY / ORDER / CALENDAR / GENERAL)
+     CALENDAR 는 subtype(DATA/REASON) + target_year/month 도 함께 추출
+  2. inventory_order_node: 자체 LLM + TOOLS 보유, tool 선택·실행 (최대 3회)
+  3. calendar_data_node: 캘린더 조회/등록 두 tool 만 노출 (최대 2회 루프)
+  4. calendar_reason_node: schedule_agent.get_recommendation 으로 추천 후 자연어화
+  5. response_node: tool 결과를 바탕으로 최종 답변 생성
 
 라우팅:
-  - orchestrator_node 후: INVENTORY/ORDER → inventory_order_node, GENERAL → response_node
-  - inventory_order_node 후: response_node (자체 루프 완료 후)
+  - orchestrator_node 후:
+      INVENTORY/ORDER → inventory_order_node
+      CALENDAR + DATA → calendar_data_node
+      CALENDAR + REASON → calendar_reason_node
+      GENERAL → response_node
+  - inventory_order_node 후: validator_node → response_node
+  - calendar_data_node / calendar_reason_node 후: response_node 직행
 
 프롬프트 구조 (REFACTOR 1):
   AGENT_BASE_SYSTEM (공통 12 case·권한·응답 원칙·일정 등록 원칙·모호성 처리)
@@ -20,14 +29,15 @@ orchestrator.py — LangGraph StateGraph 기반 오케스트레이터 (TEA 방�
 
 import json
 import operator
+from datetime import datetime
 from typing import Any, Annotated
 
-from openai import AsyncOpenAI
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional
 
-from app.core.config import settings
+from app.core.llm import get_openai_client
 from app.services.agent_tools import TOOL_FUNCTION_MAP
+from app.services.schedule_agent import schedule_agent
 
 
 # ─────────────────────────────────────────────
@@ -39,7 +49,10 @@ class AgentState(TypedDict):
     user_role: str           # SELLER / BUYER
     user_info: dict          # name, company_name
     message: str             # 사용자 입력
-    intent: str              # INVENTORY / ORDER / GENERAL
+    intent: str              # INVENTORY / ORDER / CALENDAR / GENERAL
+    subtype: str             # CALENDAR 분기에서 DATA / REASON, 그 외엔 ""
+    target_year: int         # CALENDAR 분기에서만 사용, 기본 0
+    target_month: int        # CALENDAR 분기에서만 사용, 기본 0
     messages: Annotated[list, operator.add]  # LLM 메시지 히스토리
     tool_results: list       # 실행된 tool 결과들
     tools_used: list         # 사용된 tool 이름들
@@ -505,76 +518,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_calendar_events",
-            "description": (
-                "특정 연월의 캘린더 일정 목록을 조회한다. "
-                "해당 월 1일부터 말일까지의 일정을 반환한다."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {
-                        "type": "string",
-                        "description": "조회할 사용자의 UUID",
-                    },
-                    "year": {
-                        "type": "integer",
-                        "description": "조회할 연도 (예: 2026)",
-                    },
-                    "month": {
-                        "type": "integer",
-                        "description": "조회할 월 (1~12)",
-                    },
-                },
-                "required": ["user_id", "year", "month"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_calendar_event",
-            "description": (
-                "캘린더에 새 일정을 등록한다. "
-                "create_calendar_event 호출 전 반드시 get_calendar_events로 동일 날짜 중복 여부를 확인한다. "
-                "주문 생성(create_order) 성공 직후에도 연쇄 호출하여 납품일을 자동 등록한다."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {
-                        "type": "string",
-                        "description": "일정 소유자의 UUID",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "일정 제목 (예: '사과 납품 - 홍마트')",
-                    },
-                    "event_date": {
-                        "type": "string",
-                        "description": "일정 날짜 (YYYY-MM-DD 형식)",
-                    },
-                    "event_type": {
-                        "type": "string",
-                        "description": "일정 유형: SHIPMENT(출하) | DELIVERY(납품) | MEETING(미팅) | QUOTE_DEADLINE(견적 마감) | ORDER(주문)",
-                        "enum": ["SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER"],
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "일정 상세 설명 (선택)",
-                    },
-                    "order_id": {
-                        "type": "string",
-                        "description": "연관된 주문 UUID (선택, 없으면 빈 문자열)",
-                    },
-                },
-                "required": ["user_id", "title", "event_date", "event_type"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "find_alternative_partners",
             "description": (
                 "재고 부족·협상 결렬·직접 요청 등의 상황에서 대체 거래처를 탐색한다. "
@@ -676,21 +619,12 @@ FEW_SHOT_EXAMPLES = """
 → open_chat_room(user_id=현재사용자, partner_user_id=나주농원_id) 호출
 → 응답: "나주농원(이철수)과 채팅방이 개설되었습니다. 채팅 메뉴에서 확인하세요."
 
-예시 4 — 주문 생성 후 캘린더 자동 연쇄 등록
+예시 4 — 주문 생성 (캘린더 동기화는 백엔드 자동 처리)
 사용자: 홍마트에 사과 50박스 2026-05-10 납품 주문 넣어줘
 → create_order(buyer_id=..., seller_id=..., product_id=..., quantity=50, unit_price=45000, delivery_date="2026-05-10") 호출
-→ 주문 성공 직후 즉시 연쇄:
-→ create_calendar_event(user_id=..., title="사과 50박스 납품 - 홍마트", event_date="2026-05-10", event_type="DELIVERY", order_id=생성된_order_id) 호출
-→ 응답: "주문 ORD-20260510-XXXX이 생성되었고, 5월 10일 납품 일정도 캘린더에 자동 등록되었습니다."
+→ 응답: "주문 ORD-20260510-XXXX이 생성되었습니다. 납품 일정은 캘린더에 자동 동기화됩니다."
 
-예시 5 — 자연어 일정 등록 (중복 확인 후)
-사용자: 다음 주 화요일에 청과시장 미팅 잡아줘
-→ get_calendar_events(user_id=..., year=2026, month=5) 호출 (중복 확인)
-→ 해당 날짜 기존 일정 없음 확인
-→ create_calendar_event(user_id=..., title="청과시장 미팅", event_date="2026-05-05", event_type="MEETING") 호출
-→ 응답: "5월 5일(화) 청과시장 미팅 일정이 등록되었습니다."
-
-예시 6 — 일반 질문 (tool 없이 직접 응답)
+예시 5 — 일반 질문 (tool 없이 직접 응답)
 사용자: 요즘 사과 시세가 어때?
 → tool 호출 없이 직접 응답:
   "사과 시세는 현재 품종과 등급에 따라 다릅니다. 정확한 현재 시세는 농산물 유통정보(KAMIS)를 참고하시고, 저는 AgriFlow 내 등록된 상품 재고·단가 정보를 조회해드릴 수 있습니다."
@@ -701,9 +635,23 @@ FEW_SHOT_EXAMPLES = """
 # orchestrator_node 전용 라우터 프롬프트
 # ─────────────────────────────────────────────
 
-ORCHESTRATOR_ROUTER_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의 요청 라우터입니다.
+def _build_router_system() -> str:
+    """라우터 시스템 프롬프트를 현재 시각 기준으로 동적 생성한다.
 
-사용자 메시지를 분석하여 아래 세 가지 intent 중 하나로 분류하고, 반드시 JSON 형식으로만 응답하십시오. 다른 텍스트는 절대 포함하지 마십시오.
+    CALENDAR 분기에서 LLM 이 target_year / target_month 를 추출하려면
+    오늘 날짜와 다음 달 정보가 명시되어 있어야 한다.
+    """
+    today = datetime.now()
+    next_year = today.year + (1 if today.month == 12 else 0)
+    next_month = 1 if today.month == 12 else today.month + 1
+    return f"""당신은 AgriFlow 농산물 유통 플랫폼의 요청 라우터입니다.
+
+사용자 메시지를 분석하여 아래 네 가지 intent 중 하나로 분류하고, 반드시 JSON 형식으로만 응답하십시오. 다른 텍스트는 절대 포함하지 마십시오.
+
+[현재 시각]
+- 오늘: {today.year}년 {today.month}월 {today.day}일
+- 이번 달: {today.year}년 {today.month}월
+- 다음 달: {next_year}년 {next_month}월
 
 [분류 기준]
 - INVENTORY: 상품, 재고, 품목 관련 모든 요청
@@ -711,23 +659,146 @@ ORCHESTRATOR_ROUTER_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의
         "재고 확인해줘", "상품 등록", "상품 수정/삭제", "판매자 찾아줘", "공급처 찾아줘"
   → 특정 품목을 사거나 찾거나 확인하려는 의도가 조금이라도 있으면 무조건 INVENTORY
 - ORDER: 주문, 견적, 발주, 납품 관련 요청 (주문 조회, 상태 변경, 주문 생성/삭제 등)
-  예시: "주문 넣어줘", "발주 확인해줘", "납품 일정", "주문 취소"
-- GENERAL: 인사, 날씨, 농산물 시세 일반 질문 등 INVENTORY/ORDER와 완전히 무관한 경우만
+  예시: "주문 넣어줘", "발주 확인해줘", "주문 취소"
+- CALENDAR: 캘린더/일정 관련 요청. 두 가지 subtype 으로 세분.
+  - DATA: 단순 일정 데이터 조회·생성·확인. 답이 데이터 그 자체이면 DATA.
+    예시: "내일 일정 뭐 있어?", "이번 주 캘린더 보여줘", "5월 일정 알려줘",
+          "내일 미팅 일정 등록해줘", "이번 달 출하 예정 일정 다 보여줘"
+  - REASON: 일정 추천·우선순위 정리·계획 수립처럼 LLM 의 판단/추론이 필요한 경우.
+    예시: "다음 달 출하 일정 추천해줘", "이번 주 우선순위 정리해줘",
+          "거래처별 배송 일정 짜줘", "최적 출하일 알려줘"
+- GENERAL: 인사, 날씨, 농산물 시세 일반 질문 등 위 세 가지와 완전히 무관한 경우만
   예시: "안녕", "오늘 날씨", "AgriFlow가 뭐야"
   → 품목명이 하나라도 언급되면 GENERAL이 아닌 INVENTORY로 분류할 것
 
-[응답 형식]
-INVENTORY 또는 ORDER인 경우:
-{"intent": "INVENTORY"}
-{"intent": "ORDER"}
+[모호성 해결]
+- 품목 명이 있으면 INVENTORY 가 우선이다.
+  단, "사과 5월 출하 일정 추천해줘"처럼 캘린더 행위(조회/추천)가 명시되면 CALENDAR.
+- "출하 일정", "납품 일정", "배송 일정" 단독 표현이 있으면 CALENDAR 우선.
 
-GENERAL인 경우 (직접 답변 포함):
-{"intent": "GENERAL", "response": "한국어로 작성된 답변 내용"}
+[CALENDAR 시점 추출 (target_year, target_month)]
+- 사용자가 시점을 명시하면 그 값 사용 (예: "5월" → 현재 연도의 5월).
+- 명시하지 않은 경우:
+  - DATA → 이번 달: target_year={today.year}, target_month={today.month}
+  - REASON → 다음 달: target_year={next_year}, target_month={next_month}
+- "내일", "이번 주", "이번 달" 등 이번 달 안의 시점은 모두 이번 달 ({today.year}, {today.month}).
+- "다음 달" 표현은 다음 달 ({next_year}, {next_month}).
+
+[응답 형식]
+INVENTORY:
+{{"intent": "INVENTORY"}}
+
+ORDER:
+{{"intent": "ORDER"}}
+
+CALENDAR (DATA):
+{{"intent": "CALENDAR", "subtype": "DATA", "target_year": YYYY, "target_month": MM}}
+
+CALENDAR (REASON):
+{{"intent": "CALENDAR", "subtype": "REASON", "target_year": YYYY, "target_month": MM}}
+
+GENERAL (직접 답변 포함):
+{{"intent": "GENERAL", "response": "한국어로 작성된 답변 내용"}}
+
+[Few-shot 예시]
+사용자: 내일 일정 뭐 있어?
+응답: {{"intent":"CALENDAR","subtype":"DATA","target_year":{today.year},"target_month":{today.month}}}
+
+사용자: 5월 일정 다 보여줘
+응답: {{"intent":"CALENDAR","subtype":"DATA","target_year":{today.year},"target_month":5}}
+
+사용자: 다음 달 출하 일정 추천해줘
+응답: {{"intent":"CALENDAR","subtype":"REASON","target_year":{next_year},"target_month":{next_month}}}
+
+사용자: 이번 주 우선순위 정리해줘
+응답: {{"intent":"CALENDAR","subtype":"REASON","target_year":{today.year},"target_month":{today.month}}}
 
 [주의사항]
 - tool을 직접 호출하지 않는다. intent 분류와 GENERAL 답변만 담당한다.
 - JSON 외의 텍스트, 마크다운 코드블록, 설명 문구를 절대 출력하지 않는다.
 - GENERAL 답변은 농산물 유통 업무 맥락에 맞게 한국어로 작성한다."""
+
+
+# 호환용 모듈 변수 — AgentOrchestrator.run() 호출 시점마다 새로 빌드된다.
+ORCHESTRATOR_ROUTER_SYSTEM = _build_router_system()
+
+
+# ─────────────────────────────────────────────
+# calendar_data_node 전용 TOOLS — 캘린더 조회/등록만 노출
+# (inventory_order_node TOOLS 에서 분리, ORDER 처리 중 캘린더 오용 방지)
+# ─────────────────────────────────────────────
+
+TOOLS_CALENDAR = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calendar_events",
+            "description": (
+                "특정 연월의 캘린더 일정 목록을 조회한다. "
+                "해당 월 1일부터 말일까지의 일정을 반환한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "조회할 사용자의 UUID",
+                    },
+                    "year": {
+                        "type": "integer",
+                        "description": "조회할 연도 (예: 2026)",
+                    },
+                    "month": {
+                        "type": "integer",
+                        "description": "조회할 월 (1~12)",
+                    },
+                },
+                "required": ["user_id", "year", "month"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_calendar_event",
+            "description": (
+                "캘린더에 새 일정을 등록한다. "
+                "create_calendar_event 호출 전 반드시 get_calendar_events로 동일 날짜 중복 여부를 확인한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "일정 소유자의 UUID",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "일정 제목 (예: '사과 납품 - 홍마트')",
+                    },
+                    "event_date": {
+                        "type": "string",
+                        "description": "일정 날짜 (YYYY-MM-DD 형식)",
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "일정 유형: SHIPMENT(출하) | DELIVERY(납품) | MEETING(미팅) | QUOTE_DEADLINE(견적 마감) | ORDER(주문)",
+                        "enum": ["SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER"],
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "일정 상세 설명 (선택)",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "연관된 주문 UUID (선택, 없으면 빈 문자열)",
+                    },
+                },
+                "required": ["user_id", "title", "event_date", "event_type"],
+            },
+        },
+    },
+]
 
 
 # ─────────────────────────────────────────────
@@ -744,19 +815,20 @@ AGENT_BASE_SYSTEM = """당신은 AgriFlow 농산물 유통 플랫폼의 AI 업�
 - 담당자: {user_name}
 - 사용자 ID: {user_id}
 
-[12가지 처리 케이스]
+[처리 케이스]
 CASE-1: 재고 충분 → {case1_action}
 CASE-2: 재고 부족 → {case2_action}
 CASE-3: 주문 조회 → get_orders / get_order_detail 호출
-CASE-4: 주문 생성 → create_order 성공 시 create_calendar_event 즉시 자동 연쇄 호출
+CASE-4: 주문 생성 → create_order 호출 (캘린더 등록은 백엔드 자동 sync 또는 별도 캘린더 분기에서 처리)
 CASE-5: 주문 상태 변경 → update_order_status 호출
-CASE-6: 캘린더 조회 → get_calendar_events 호출
-CASE-7: 캘린더 등록 → get_calendar_events로 중복 확인 후 create_calendar_event 호출
-CASE-8: 대체 거래처 탐색 → find_alternative_partners 호출 후 LLM이 추천 순위·이유 자연어 생성, 사용자 수락 시 open_chat_room 연쇄
-CASE-9: 채팅방 개설 → 필요 시 get_user_profile로 partner_user_id 확인 후 open_chat_room 호출
-CASE-10: 상품 CRUD → {case10_action}
-CASE-11: 판매 의도 → {case11_action}
-CASE-12: 일반 질문 → tool 호출 없이 직접 응답
+CASE-6: 대체 거래처 탐색 → find_alternative_partners 호출 후 LLM이 추천 순위·이유 자연어 생성, 사용자 수락 시 open_chat_room 연쇄
+CASE-7: 채팅방 개설 → 필요 시 get_user_profile로 partner_user_id 확인 후 open_chat_room 호출
+CASE-8: 상품 CRUD → {case10_action}
+CASE-9: 판매 의도 → {case11_action}
+CASE-10: 일반 질문 → tool 호출 없이 직접 응답
+
+[캘린더 라우팅 안내]
+캘린더 일정 조회/등록/추천 요청은 라우터가 자동으로 CALENDAR 분기로 보낸다. 이 노드(inventory_order_node)는 INVENTORY/ORDER 처리만 담당하므로 캘린더 도구를 직접 호출하지 않는다.
 
 [권한 원칙]
 - 주문 상태 변경: 해당 주문의 seller_id 또는 buyer_id == 현재 user_id ({user_id}) 여야 함
@@ -767,11 +839,16 @@ CASE-12: 일반 질문 → tool 호출 없이 직접 응답
 - 조회/검색: LLM이 가장 유사한 상품을 자동 선택하여 결과 제공
 - 삭제/수정: {ambiguity_modify_rule}
 
-[일정 등록 원칙]
-create_calendar_event 호출 전 반드시 get_calendar_events로 동일 날짜 기존 일정을 확인한 후 진행
-
 [대체 거래처 추천 원칙]
-find_alternative_partners DB 결과를 받아 상황(재고 없음/협상 결렬/직접 요청)에 맞춰 LLM이 추천 순위와 이유를 자연어로 직접 생성. 단순 정렬 공식 적용 금지."""
+find_alternative_partners DB 결과를 받아 상황(재고 없음/협상 결렬/직접 요청)에 맞춰 LLM이 추천 순위와 이유를 자연어로 직접 생성. 단순 정렬 공식 적용 금지.
+
+[응답 표기 정책 — 중요]
+- 주문/배송/일정 정보를 답변할 때 메인 정보는 [상품명] · [거래처명(구매자 또는 판매자 회사명)] · [날짜] · [상태] 이다.
+- 주문번호(order_number, 예: ORD-2026-MMDD-XXXX)는 부가 식별자다. 답변의 첫머리에 강조하지 말고, 필요한 경우에만 끝에 작게 덧붙인다.
+- "주문 ORD-2026-..." 같이 주문번호로 시작하지 마라. 사용자가 명시적으로 주문번호를 물을 때만 메인으로 표기한다.
+- 거래처는 회사명(company_name)을 우선 사용하고, 없으면 사용자명(name)을 사용한다.
+- 예시 (좋음): "5월 10일 사과 50박스를 홍마트에 납품 (확정)."
+- 예시 (나쁨): "주문 ORD-2026-0510-1234, 납품일 5월 10일, 상품 사과 50박스, 거래처 홍마트, 상태 확정." """
 
 
 # 판매자 부록 — 도구 목록·등록 안내·의도 구분·필수 정보 누락 처리·판매자 응답 원칙
@@ -787,8 +864,6 @@ SELLER_ROLE_APPENDIX = """
 - 주문 조회: get_orders, get_order_detail
 - 주문 상태 변경: update_order_status
 - 주문 삭제: delete_order
-- 캘린더 조회: get_calendar_events
-- 캘린더 등록: create_calendar_event
 - 대체 거래처 탐색: find_alternative_partners
 - 채팅방 개설: open_chat_room
 - 사용자 프로필 조회: get_user_profile
@@ -852,8 +927,6 @@ BUYER_ROLE_APPENDIX = """
 - 주문 조회: get_orders, get_order_detail
 - 주문 상태 확인 및 변경: update_order_status
 - 판매자/상품 검색: find_sellers_by_product
-- 캘린더 조회: get_calendar_events
-- 캘린더 등록: create_calendar_event
 - 대체 거래처 탐색: find_alternative_partners
 - 채팅방 개설: open_chat_room
 - 사용자 프로필 조회: get_user_profile
@@ -1037,11 +1110,12 @@ async def orchestrator_node(state: AgentState) -> dict:
     """
     TEA 방식 라우터 노드.
     - tools 파라미터 없이 순수 LLM 호출
-    - JSON 응답으로 intent만 분류 (INVENTORY / ORDER / GENERAL)
+    - JSON 응답으로 intent만 분류 (INVENTORY / ORDER / CALENDAR / GENERAL)
     - GENERAL인 경우 직접 답변 텍스트도 반환
+    - CALENDAR인 경우 subtype(DATA/REASON) + target_year/target_month 도 함께 추출
     - tool을 직접 선택하거나 실행하지 않는다
     """
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = get_openai_client()
     model = "gpt-4o-mini"
 
     current_messages = state["messages"]
@@ -1060,20 +1134,58 @@ async def orchestrator_node(state: AgentState) -> dict:
         parsed = {"intent": "GENERAL", "response": content}
 
     intent = parsed.get("intent", "GENERAL").upper()
-    if intent not in ("INVENTORY", "ORDER", "GENERAL"):
+    if intent not in ("INVENTORY", "ORDER", "CALENDAR", "GENERAL"):
         intent = "GENERAL"
 
     if intent == "GENERAL":
         answer = parsed.get("response", "")
         return {
             "intent": "GENERAL",
+            "subtype": "",
+            "target_year": 0,
+            "target_month": 0,
             "final_response": answer,
             "messages": [{"role": "assistant", "content": answer}],
+        }
+
+    if intent == "CALENDAR":
+        # subtype 검증 (DATA/REASON 외엔 DATA 폴백)
+        subtype = str(parsed.get("subtype", "DATA")).upper()
+        if subtype not in ("DATA", "REASON"):
+            subtype = "DATA"
+
+        # target_year / target_month 검증 + 폴백
+        today = datetime.now()
+        try:
+            target_year = int(parsed.get("target_year", 0))
+        except (ValueError, TypeError):
+            target_year = 0
+        try:
+            target_month = int(parsed.get("target_month", 0))
+        except (ValueError, TypeError):
+            target_month = 0
+
+        # 연도 범위 (2024~2030) 와 월 범위 (1~12) 가 아니면 폴백
+        if not (2024 <= target_year <= 2030) or not (1 <= target_month <= 12):
+            if subtype == "DATA":
+                target_year, target_month = today.year, today.month
+            else:  # REASON → 다음 달
+                target_year = today.year + (1 if today.month == 12 else 0)
+                target_month = 1 if today.month == 12 else today.month + 1
+
+        return {
+            "intent": "CALENDAR",
+            "subtype": subtype,
+            "target_year": target_year,
+            "target_month": target_month,
         }
 
     # INVENTORY 또는 ORDER — inventory_order_node로 라우팅 (라우터 JSON은 messages에 추가하지 않음)
     return {
         "intent": intent,
+        "subtype": "",
+        "target_year": 0,
+        "target_month": 0,
     }
 
 
@@ -1086,7 +1198,7 @@ async def inventory_order_node(state: AgentState) -> dict:
     """
     MAX_TOOL_ROUNDS = 3
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = get_openai_client()
     model = "gpt-4o-mini"
 
     user_id = state.get("user_id", "")
@@ -1249,6 +1361,246 @@ async def inventory_order_node(state: AgentState) -> dict:
     }
 
 
+# ─────────────────────────────────────────────
+# calendar_data_node — CALENDAR + DATA (조회/등록)
+# ─────────────────────────────────────────────
+
+async def calendar_data_node(state: AgentState) -> dict:
+    """
+    CALENDAR 분기 + subtype=DATA.
+    - get_calendar_events / create_calendar_event 두 tool 만 노출
+    - 최대 2회 tool 루프
+    - tool 결과를 받은 뒤 LLM 이 자연어로 마감 답변 생성
+    """
+    MAX_TOOL_ROUNDS = 2
+
+    client = get_openai_client()
+    model = "gpt-4o-mini"
+
+    user_id = state.get("user_id", "")
+    user_info = state.get("user_info", {})
+    company_name = user_info.get("company_name", "미설정")
+    user_name = user_info.get("name", "사용자")
+    today = datetime.now()
+    target_year = state.get("target_year") or today.year
+    target_month = state.get("target_month") or today.month
+
+    system_prompt = (
+        "당신은 AgriFlow 캘린더 도우미입니다. "
+        "사용자의 요청에 맞게 캘린더 일정을 조회하거나 등록하세요. "
+        "결과는 한국어로 친절하게, 구체적인 날짜·일정 제목을 담아 답하세요.\n\n"
+        f"[사용자 정보]\n"
+        f"- 담당자: {user_name}\n"
+        f"- 회사명: {company_name}\n"
+        f"- user_id: {user_id}\n\n"
+        f"[현재 시각]\n"
+        f"- 오늘: {today.year}년 {today.month}월 {today.day}일\n"
+        f"- 사용자 관심 시점: {target_year}년 {target_month}월\n\n"
+        "[원칙]\n"
+        "- 일정 조회는 get_calendar_events(user_id, year, month) 호출.\n"
+        "- 일정 등록은 create_calendar_event 호출 전 같은 날짜 중복을 get_calendar_events 로 확인.\n"
+        "- year/month 가 명시되지 않으면 위의 사용자 관심 시점을 사용.\n"
+        "- tool 결과를 그대로 전달하고 임의 추측은 금지.\n"
+        "- 응답 형식: 상품명 · 거래처명 · 날짜 · 상태 순으로 자연스럽게 풀어 쓰고, 주문번호는 끝에 작게 부연한다."
+    )
+
+    original_user_message = state.get("message", "")
+
+    agent_messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": original_user_message},
+    ]
+
+    tools_used: list[str] = list(state.get("tools_used", []))
+    all_tool_results: list[dict[str, Any]] = []
+
+    try:
+        for round_idx in range(MAX_TOOL_ROUNDS):
+            response = await client.chat.completions.create(
+                model=model,
+                messages=agent_messages,
+                tools=TOOLS_CALENDAR,
+                tool_choice="auto",
+            )
+
+            choice = response.choices[0]
+
+            if choice.finish_reason == "stop":
+                final_text = choice.message.content or ""
+                return {
+                    "tools_used": tools_used,
+                    "tool_results": all_tool_results,
+                    "tool_round": state.get("tool_round", 0) + round_idx + 1,
+                    "final_response": final_text,
+                }
+
+            if choice.finish_reason == "tool_calls":
+                tool_calls = choice.message.tool_calls or []
+
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": choice.message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+                agent_messages.append(assistant_msg)
+
+                for tc in tool_calls:
+                    tool_name = tc.function.name
+                    try:
+                        tool_input = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        tool_input = {}
+
+                    # user_id 자동 교정 (LLM 이 누락하거나 잘못 넣어도 보정)
+                    tool_input = _fix_id_params(tool_name, tool_input, user_id)
+
+                    if tool_name not in tools_used:
+                        tools_used.append(tool_name)
+
+                    result_content = _execute_tool(tool_name, tool_input)
+
+                    agent_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result_content,
+                    })
+
+                    try:
+                        parsed_result = json.loads(result_content)
+                    except json.JSONDecodeError:
+                        parsed_result = {"raw": result_content}
+                    all_tool_results.append({
+                        "tool_name": tool_name,
+                        "result": parsed_result,
+                    })
+                continue
+
+            break
+
+        # 루프 한계 도달 — 마지막에 자연어 마감 한 번 더 호출
+        wrap_response = await client.chat.completions.create(
+            model=model,
+            messages=agent_messages + [
+                {
+                    "role": "user",
+                    "content": "위 tool 결과를 바탕으로 한국어로 자연스럽게 마감 답변을 작성해줘.",
+                }
+            ],
+        )
+        final_text = wrap_response.choices[0].message.content or "캘린더 처리를 마쳤습니다."
+
+        return {
+            "tools_used": tools_used,
+            "tool_results": all_tool_results,
+            "tool_round": state.get("tool_round", 0) + MAX_TOOL_ROUNDS,
+            "final_response": final_text,
+        }
+
+    except Exception as e:
+        return {
+            "tools_used": tools_used,
+            "tool_results": all_tool_results,
+            "tool_round": state.get("tool_round", 0) + 1,
+            "final_response": f"캘린더 요청을 처리하는 중 오류가 발생했습니다: {str(e)}",
+        }
+
+
+# ─────────────────────────────────────────────
+# calendar_reason_node — CALENDAR + REASON (추천/추론)
+# ─────────────────────────────────────────────
+
+async def calendar_reason_node(state: AgentState) -> dict:
+    """
+    CALENDAR 분기 + subtype=REASON.
+    1. schedule_agent.get_recommendation 으로 구조화된 추천 데이터 획득
+    2. has_recommendation=False 면 message 를 그대로 final_response 로 반환 (비용 절감)
+    3. has_recommendation=True 면 LLM 1회 호출로 자연어 답변 생성
+    """
+    user_id = state.get("user_id", "")
+    user_role = state.get("user_role", "SELLER")
+    user_info = state.get("user_info", {})
+    company_name = user_info.get("company_name", "미설정")
+    today = datetime.now()
+    next_year = today.year + (1 if today.month == 12 else 0)
+    next_month = 1 if today.month == 12 else today.month + 1
+    target_year = state.get("target_year") or next_year
+    target_month = state.get("target_month") or next_month
+
+    try:
+        recommendation = await schedule_agent.get_recommendation(
+            user_id=user_id,
+            role=user_role,
+            company_name=company_name,
+            year=target_year,
+            month=target_month,
+        )
+    except Exception as e:
+        return {
+            "tools_used": ["schedule_recommend"],
+            "tool_results": [],
+            "tool_round": state.get("tool_round", 0) + 1,
+            "final_response": f"일정 추천 중 오류가 발생했습니다: {str(e)}",
+        }
+
+    rec_dump = recommendation.model_dump()
+
+    # 추천이 없으면 LLM 추가 호출 없이 message 그대로 반환
+    if not recommendation.has_recommendation:
+        return {
+            "tools_used": ["schedule_recommend"],
+            "tool_results": [{"tool_name": "schedule_recommend", "result": rec_dump}],
+            "tool_round": state.get("tool_round", 0) + 1,
+            "final_response": recommendation.message or "추천할 일정이 없습니다.",
+        }
+
+    # 추천 있음 → LLM 으로 자연어 답변 생성
+    client = get_openai_client()
+    model = "gpt-4o-mini"
+
+    system_prompt = (
+        "당신은 AgriFlow 캘린더 도우미입니다. "
+        "아래는 추천 일정 데이터입니다. 사용자 친화적으로 한국어로 정리해서 답하세요. "
+        "추천 일정마다 날짜·상품·수량·이유를 포함해 자연스럽게 풀어 쓰고, "
+        "마지막에 한 줄 요약을 덧붙이세요. JSON 이나 코드 블록 형식은 사용하지 마세요. "
+        "응답 형식: 상품명 · 거래처명 · 날짜 · 상태 순으로 자연스럽게 풀어 쓰고, 주문번호는 끝에 작게 부연한다."
+    )
+    original_user_message = state.get("message", "")
+    user_message = (
+        f"[원래 사용자 요청]\n{original_user_message}\n\n"
+        f"[추천 데이터 (JSON)]\n{json.dumps(rec_dump, ensure_ascii=False)}"
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+        )
+        final_text = response.choices[0].message.content or recommendation.message
+    except Exception as e:
+        # LLM 실패 시 message 폴백
+        final_text = recommendation.message or f"일정 추천 결과 정리 중 오류: {str(e)}"
+
+    return {
+        "tools_used": ["schedule_recommend"],
+        "tool_results": [{"tool_name": "schedule_recommend", "result": rec_dump}],
+        "tool_round": state.get("tool_round", 0) + 1,
+        "final_response": final_text,
+    }
+
+
 def _is_router_json(content: str) -> bool:
     """orchestrator_node가 생성한 라우터 JSON인지 판단한다."""
     try:
@@ -1298,7 +1650,7 @@ async def response_node(state: AgentState) -> dict:
     if state.get("final_response"):
         return {}
 
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    client = get_openai_client()
     model = "gpt-4o-mini"
 
     import json as _json
@@ -1402,10 +1754,18 @@ def route_after_orchestrator(state: AgentState) -> str:
     """
     orchestrator_node 실행 후 다음 노드를 결정한다.
     - INVENTORY 또는 ORDER → inventory_order_node (전문 에이전트)
+    - CALENDAR + DATA → calendar_data_node
+    - CALENDAR + REASON → calendar_reason_node
     - GENERAL → response_node (orchestrator가 직접 답변 완료)
     """
-    if state["intent"] in ("INVENTORY", "ORDER"):
+    intent = state.get("intent", "GENERAL")
+    if intent in ("INVENTORY", "ORDER"):
         return "inventory_order_node"
+    if intent == "CALENDAR":
+        subtype = state.get("subtype", "DATA")
+        if subtype == "REASON":
+            return "calendar_reason_node"
+        return "calendar_data_node"
     return "response_node"
 
 
@@ -1430,6 +1790,8 @@ def _build_graph():
 
     graph.add_node("orchestrator_node", orchestrator_node)
     graph.add_node("inventory_order_node", inventory_order_node)
+    graph.add_node("calendar_data_node", calendar_data_node)
+    graph.add_node("calendar_reason_node", calendar_reason_node)
     graph.add_node("validator_node", validator_node)
     graph.add_node("response_node", response_node)
 
@@ -1440,6 +1802,8 @@ def _build_graph():
         route_after_orchestrator,
         {
             "inventory_order_node": "inventory_order_node",
+            "calendar_data_node": "calendar_data_node",
+            "calendar_reason_node": "calendar_reason_node",
             "response_node": "response_node",
         },
     )
@@ -1452,6 +1816,9 @@ def _build_graph():
             "response_node": "response_node",
         },
     )
+    # 캘린더 노드들은 자체적으로 final_response 를 채우므로 바로 response_node 로
+    graph.add_edge("calendar_data_node", "response_node")
+    graph.add_edge("calendar_reason_node", "response_node")
     graph.add_edge("response_node", END)
 
     return graph.compile()
@@ -1495,14 +1862,19 @@ class AgentOrchestrator:
             }
         """
         # orchestrator_node는 라우터 전용 시스템 프롬프트 사용
+        # 매 호출마다 현재 시각을 반영하기 위해 _build_router_system() 으로 새로 빌드
+        router_system = _build_router_system()
         initial_state: AgentState = {
             "user_id": user_id,
             "user_role": role,
             "user_info": user_info,
             "message": user_message,
             "intent": "GENERAL",
+            "subtype": "",
+            "target_year": 0,
+            "target_month": 0,
             "messages": [
-                {"role": "system", "content": ORCHESTRATOR_ROUTER_SYSTEM},
+                {"role": "system", "content": router_system},
                 *[m for m in history if m.get("role") in ("user", "assistant")],
                 {"role": "user", "content": user_message},
             ],

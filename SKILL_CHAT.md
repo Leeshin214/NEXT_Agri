@@ -391,7 +391,7 @@ async def send_private_message(self, user_id, message):
 - `consensus_handled=True` AND 60s < elapsed ≤ 1800s: True (signature 비교는 `_handle_consensus` 가 담당 → 같은 거래는 거기서 skip, 다른 거래는 처리)
 - elapsed > 1800s: 일반 status 분기 (general 60s, negotiating 10s, consensus/rejected 항상 True)
 
-`last_analysis` 는 `cachetools.TTLCache(maxsize=10000, ttl=3600)` 사용 (메모리 누수 방지). cachetools 미설치 시 일반 dict로 fallback.
+`last_analysis` 는 `cachetools.TTLCache(maxsize=10000, ttl=3600)` 사용 (메모리 누수 방지). `cachetools>=5.3.0` 는 `backend/requirements.txt` 의 정식 의존성 — 운영에서 dict fallback 으로 떨어지지 않도록 venv 에 설치 필수 (2026-04-29 검증). `chat_ws.py` 의 try/except ImportError fallback 은 dev 환경 안전망으로 유지하되, 운영 startup 로그에 `[WS] cachetools 미설치` 가 보이면 venv 에 미설치된 상태이니 `pip install -r requirements.txt` 재실행 필요.
 
 ```python
 # C-3 낙관적 락 패턴 (chat_ws.py)

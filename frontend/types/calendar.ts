@@ -31,6 +31,10 @@ export interface CalendarEvent {
   order_number: string | null;
   product_name: string | null;
   order_status: OrderStatus | null;
+  buyer_name?: string | null;
+  buyer_company?: string | null;
+  seller_name?: string | null;
+  seller_company?: string | null;
 }
 
 export interface CalendarEventCreate {

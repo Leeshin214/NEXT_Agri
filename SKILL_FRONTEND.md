@@ -369,32 +369,6 @@ Vercel 배포 후 Railway URL로 전환할 때는 `NEXT_PUBLIC_API_URL` 환경�
 - `middleware.ts` — `matcher: []` 비활성화, 인증 가드는 `<AuthGuard>` (클라이언트)에서
 - `store/authStore.ts` — persist name도 tabId suffix, `loginExpiresAt` 필드로 2일 만료 정책
 
-#### useMutation 온디맨드 호출 패턴 (검증됨)
-
-자동 fetch가 아닌 버튼 클릭 시에만 호출하는 AI/에이전트 훅은 `useQuery` 대신 `useMutation`을 사용한다.
-`isIdle` → `isPending` → `data` / `isError` 순서로 상태를 분기 렌더링한다.
-
-```typescript
-// hooks/useScheduleAgent.ts
-export function useScheduleRecommend() {
-  return useMutation({
-    mutationFn: async (params: { year: number; month: number }) => {
-      const res = await api.post<SuccessResponse<ScheduleRecommendResponse>>(
-        '/schedule-agent/recommend',
-        params
-      );
-      return res;
-    },
-  });
-}
-
-// 컴포넌트에서 사용
-const { mutate, data, isPending, isError, isIdle } = useScheduleRecommend();
-const result = data?.data;  // SuccessResponse 래퍼 안의 data 필드
-
-// 상태 분기: isIdle → 초기 안내 + 버튼 / isPending → 스피너 / result → 결과 / isError → 에러
-```
-
 #### 캘린더 일정 클릭 → EventDetailModal 패턴 (검증됨, 2026-04-27)
 
 캘린더 셀의 일정 항목과 우측 "전체 일정" 리스트의 일정 카드 클릭 시 동일하게 상세 모달이 열려야 한다.
@@ -517,34 +491,34 @@ onClick={() => {
 
 **컴포넌트 위치**: `components/calendar/DayEventsModal.tsx`. 헤더는 한국식 + 요일(`2026년 5월 6일 (수)`), 본문은 start_time 오름차순 정렬(없으면 마지막), 일정 없으면 "이 날짜에 등록된 일정이 없습니다" 메시지, 푸터는 "일정 추가" + "닫기" 버튼. 기존 공통 `Modal` 컴포넌트 재사용.
 
-#### 캘린더 페이지 — 우측 패널 "전체 일정" 단일 카드 패턴 (검증됨, 2026-04-27)
+#### 캘린더 페이지 — 12-grid 레이아웃 + 셀 균일 높이 (검증됨, 2026-04-29)
 
-기존 "선택한 날짜 일정 + ScheduleAgentPanel" 2단 스택 구조에서, **단일 "전체 일정" 카드**로 통합되었다.
-ScheduleAgentPanel/useScheduleAgent는 다른 곳 재사용 예정으로 **파일은 보존**, 캘린더 페이지에서만 import/렌더링 제거.
+기존 `lg:grid-cols-4 + col-span-3 / 1` 비율(75:25)에서, **12-grid 기반 단계 분할**로 리디자인되었다.
+`lg` 에서는 67:33, `xl` 이상 큰 화면에서는 75:25 — 좁은 lg 화면에서도 사이드바가 잘 읽히고 xl 에서는 달력에 더 많이 할당.
 
 레이아웃 (seller/buyer 동일):
-- `lg:grid-cols-4` → 달력 `lg:col-span-3` + 우측 단일 카드 (col-span 1)
-- 우측 카드의 `space-y-6` 래퍼 div 제거됨 (스택할 컴포넌트가 사라짐)
+- 부모: `grid grid-cols-1 gap-6 lg:grid-cols-12`
+- 달력 wrapper: `lg:col-span-8 xl:col-span-9 rounded-xl bg-white p-6 shadow-sm`
+- 사이드바 wrapper: `lg:col-span-4 xl:col-span-3 space-y-4`
 
-```tsx
-<div className="rounded-xl bg-white p-6 shadow-sm">
-  <div className="mb-4 flex items-center justify-between">
-    <h3 className="font-semibold text-gray-900">전체 일정</h3>
-    <button onClick={() => { /* selectedDate 없으면 오늘로 fallback */ setShowModal(true); }} ...>
-      <Plus className="h-4 w-4" />
-    </button>
-  </div>
-  {sortedEvents.length === 0 ? (
-    <p className="text-sm text-gray-400">등록된 일정이 없습니다.</p>
-  ) : (
-    <div className="max-h-[calc(100vh-260px)] space-y-3 overflow-y-auto pr-1">
-      {sortedEvents.map((ev) => /* 카드 */)}
-    </div>
-  )}
-</div>
-```
+날짜 셀 균일 높이 패턴:
+- 빈 셀(이전 달): `<div className="h-28 rounded-lg bg-gray-50/40" />` — 톤 다운된 배경
+- 일반 셀: `h-28 cursor-pointer overflow-hidden rounded-lg border p-2 transition-colors`
+  - 기본 테두리 `border-gray-100`, hover `hover:border-gray-200 hover:bg-gray-50`
+  - 선택됨 `border-primary-500 bg-primary-50 ring-1 ring-primary-500`
+  - `h-28`(112px) **고정** + `overflow-hidden` — 일정 개수와 무관하게 모든 셀 동일 높이
+- 셀 안 일정 칩: 최대 **2개** 표시, 메인 라인만(`text-[11px]`), sub 라인은 셀에서 노출 안 함
+- "+N개 더보기": `bg-gray-100 text-gray-600 font-medium text-[11px]`
 
-스크롤 영역 높이는 `max-h-[calc(100vh-260px)]` 사용 — TopBar/PageHeader/카드 패딩을 제외한 잔여 높이.
+월 네비게이션:
+- "오늘" 버튼: 좌측 화살표 옆에 작은 텍스트 버튼 — `text-xs font-medium text-gray-600 hover:bg-gray-100 hover:text-primary-700 px-2 py-1 rounded`
+- 클릭 시 `setYear(today.getFullYear()); setMonth(today.getMonth() + 1)`
+
+우측 "전체 일정" 카드:
+- 스크롤 영역: `max-h-[calc(100vh-220px)] space-y-4 overflow-y-auto pr-1`
+- 날짜 그룹 헤더: `sticky top-0 ... border-b-2 border-gray-200 bg-white py-2.5` — 시각 구분 강화
+- 일정 카드 sub 텍스트: `truncate` 대신 `line-clamp-1` 로 가독성 확보
+- 타입 라벨 뱃지: `text-xs` (이전 `text-[10px]` 대비 약간 큼)
 
 #### 캘린더 — CANCELLED 일정 방어적 프론트 필터링 (검증됨, 2026-04-27)
 
@@ -570,10 +544,10 @@ const buildDateStr = (d: number) =>
 
 백엔드 `event_date`는 Postgres `date` → `'YYYY-MM-DD'` 문자열로 안정적으로 직렬화되므로 양쪽이 정확히 일치한다.
 
-#### CalendarEvent — product_name/order_number/order_status 필드 패턴 (검증됨, 2026-04-27)
+#### CalendarEvent — product_name/order_status + 거래처 4필드 (검증됨, 2026-04-29 갱신)
 
-백엔드 `CalendarEventResponse`에 `order_number`, `product_name`, `order_status` 세 필드가 추가됨.
-`order_id` 없는 일정(MEETING 등)은 모두 null.
+백엔드 `CalendarEventResponse`에 `order_number`, `product_name`, `order_status` + 거래처 4필드(`buyer_name/buyer_company/seller_name/seller_company`)가 추가됨.
+`order_id` 없는 일정(MEETING 등)은 모두 null. **거래처 4필드는 optional** — 백엔드 미배포 환경에서도 안전하게 동작.
 
 ```typescript
 // types/calendar.ts
@@ -583,27 +557,37 @@ export interface CalendarEvent {
   // 기존 필드들...
   order_number: string | null;
   product_name: string | null;
-  order_status: OrderStatus | null;  // 백엔드는 string | null, 프론트는 OrderStatus union으로 좁힘
+  order_status: OrderStatus | null;
+  buyer_name?: string | null;
+  buyer_company?: string | null;
+  seller_name?: string | null;
+  seller_company?: string | null;
 }
 ```
 
-표시 규칙 — **메인 라인은 product_name fallback title, 서브 라인은 order_number 작은 글씨**:
+표시 정책 (2026-04-29 변경) — **메인 = product_name fallback title, 서브 = 거래처명, 주문번호는 미노출 또는 작은 회색 텍스트로 격하**:
 ```tsx
-const main = ev.product_name ?? ev.title;
-const sub = ev.order_number;
+// seller/calendar/page.tsx — 판매자에게 거래처는 buyer
+const getEventLabels = (ev: CalendarEvent) => {
+  const main = ev.product_name ?? ev.title;
+  const partner = ev.buyer_company ?? ev.buyer_name ?? null;
+  const sub = partner;  // 주문번호 대신 거래처명
+  return { main, sub };
+};
 
-// 캘린더 셀 (좁은 영역, 흰색 텍스트 위)
-<div className="rounded px-1 py-0.5 text-[10px] text-white" /* event color bg */>
-  <div className="truncate font-medium">{main}</div>
-  {sub && <div className="truncate text-[9px] text-white/80">{sub}</div>}
-</div>
-
-// 일정 카드 (넓은 영역, 회색 텍스트)
-<span className="text-sm font-medium text-gray-900">{main}</span>
-{sub && <p className="text-xs text-gray-500">{sub}</p>}
+// buyer/calendar/page.tsx — 구매자에게 거래처는 seller
+const getEventLabels = (ev: CalendarEvent) => {
+  const main = ev.product_name ?? ev.title;
+  const partner = ev.seller_company ?? ev.seller_name ?? null;
+  const sub = partner;
+  return { main, sub };
+};
 ```
 
+**중요**: 두 캘린더 페이지의 `getEventLabels`는 **이 한 곳만 의도적으로 갈라진다** (buyer ↔ seller). 다른 모든 코드는 두 파일에서 100% 동일.
+
 `title` fallback 필수: 사용자가 수동 등록한 일정은 product_name이 null이라 title이 메인이 된다.
+주문번호(`order_number`)는 더 이상 메인/서브 어디에도 노출하지 않는다 — 사용자에게 의미 없는 식별자라 제거. EventDetailModal/DayEventsModal 같은 상세 모달에서만 부가정보로 표시.
 
 #### 캘린더 일정 색상/라벨 — order_status 필드 우선, event_type fallback (검증됨, 2026-04-27)
 
@@ -1563,6 +1547,124 @@ useEffect(() => {
   ```
 - 검증: 모든 항목 product_id 선택, quantity ≥ 1, unit_price ≥ 0, start_date ≥ today, end_date ≥ start_date, MONTHLY는 day_of_month 1~31, WEEKLY/BIWEEKLY는 day_of_week 0~6
 - 날짜는 timezone-safe 문자열 조합 — `defaultStartDate()`는 오늘+7일을 `YYYY-MM-DD` 로 직접 생성 (ISO 변환 금지)
+
+##### NextDeliveryLabel — 정기배송 D-day 표시 (검증됨, 2026-04-29)
+
+`components/subscriptions/NextDeliveryLabel.tsx` — 정기배송 "다음 배송일"을 D-day 카운트와 함께 강조 표시하는 공용 컴포넌트.
+
+**Props 시그니처:**
+```typescript
+{
+  date: string | null | undefined;          // 'YYYY-MM-DD'. null/undefined → "-"
+  calendarHref?: string;                    // 있으면 <Link>, 없으면 <span>
+  prefix?: string;                          // 기본 '다음 배송'. ''(빈 문자열) → 라벨 prefix 생략
+  ariaLabel?: string;
+  className?: string;
+}
+```
+
+**사용처 4곳 (모두 동일 컴포넌트 재사용):**
+- `app/(dashboard)/buyer/subscriptions/page.tsx` — 카드 요약 행, prefix 기본 사용, **calendarHref 미전달** (아래 nested DOM 가드 참조)
+- `app/(dashboard)/seller/subscriptions/page.tsx` — 동일
+- `app/(dashboard)/buyer/orders/page.tsx` — 정기배송 탭 DataTable 셀, `prefix=""` 로 헤더 중복 회피, calendarHref 전달 OK (셀이 단독 컬럼이라 nested 문제 없음)
+- `app/(dashboard)/seller/orders/page.tsx` — 동일
+
+**핵심 패턴:**
+- 오늘 날짜는 KST 기준 — `getTodayKstString()` (`lib/date.ts`).
+- D-day 계산은 `diffInDays(today, target)` (`lib/date.ts`) — `Date.UTC` 로 변환 후 86_400_000 으로 나눈다 (DST 영향 회피).
+- `diff > 0` → "D-N" 회색 / `diff === 0` → "D-Day" 빨강+`AlertCircle` / `diff < 0` → "D+N 지남" 빨강+`AlertCircle`.
+- `<Link onClick={(e) => e.stopPropagation()}>` 로 부모 카드의 행 펼침 onClick 과 분리 (DataTable 셀 등 부모가 클릭 핸들러를 가진 영역에서).
+- `calendarHref` 는 role 별로 다르게: `/buyer/calendar?date=${date}` 또는 `/seller/calendar?date=${date}`.
+
+**Nested interactive element 가드 (검증됨, 2026-04-29):**
+
+부모가 `<button>` 인 영역(예: 정기배송 카드의 행 펼침 토글)에서는 **calendarHref 를 전달하지 않는다.** 전달하면 `<button>` 안에 `<a>` 가 들어가 HTML invalid → React `validateDOMNesting` 경고 + Safari/Firefox 가 button 종료를 강제로 고쳐 layout 이 깨질 위험. `e.stopPropagation()` 만으로 우회 불가 (DOM 구조 자체가 invalid).
+
+**해결 패턴 — 정기배송 페이지의 카드 헤더:**
+```tsx
+// ❌ 카드 헤더 <button> 안에 calendarHref 전달 → <a> nested → invalid
+<button onClick={toggleRow}>
+  <NextDeliveryLabel date={...} calendarHref="/buyer/calendar?date=..." />
+</button>
+
+// ✅ 헤더에서는 <span> 으로만 렌더하고, 펼침 영역에 별도 버튼으로 분리
+<button onClick={toggleRow}>
+  <NextDeliveryLabel date={sub.next_delivery_date} />  {/* calendarHref 생략 */}
+</button>
+{isExpanded && (
+  <div>
+    {/* ... 다른 액션 버튼들 옆에 ... */}
+    {sub.next_delivery_date && (
+      <button onClick={() => router.push(`/buyer/calendar?date=${sub.next_delivery_date}`)}>
+        <CalendarDays className="h-3.5 w-3.5" />
+        캘린더에서 보기
+      </button>
+    )}
+  </div>
+)}
+```
+
+DataTable 셀처럼 부모가 `<button>` 이 아닌 컨텍스트에서는 calendarHref 를 그대로 전달해도 무방.
+
+**`lib/date.ts` 신규 헬퍼:**
+- `getTodayKstString(): string` — 'YYYY-MM-DD' (KST). 백엔드 날짜 컬럼과 직접 문자열 비교 가능. `TodayTasksWidget.tsx` 에 있던 사설 헬퍼를 공용으로 승격.
+- `diffInDays(base, target): number` — 'YYYY-MM-DD' 두 문자열 간 일수 차. 잘못된 입력은 0 반환.
+
+##### 캘린더 페이지 ?date= 쿼리 진입 (검증됨, 2026-04-29)
+
+`app/(dashboard)/buyer/calendar/page.tsx` 와 `seller/calendar/page.tsx` 는 `?date=YYYY-MM-DD` 쿼리를 받으면 해당 월/일로 즉시 이동한다 (`NextDeliveryLabel` 클릭 시 사용).
+
+**Suspense boundary 필수 (Next.js 14 App Router):**
+`useSearchParams()` 를 client page root 에서 직접 사용하면 빌드 경고 + 페이지 전체가 동적 fallback 으로 강제된다. 실제 로직은 `BuyerCalendarPageInner` / `SellerCalendarPageInner` 에 두고 default export 는 얇은 `<Suspense>` wrapper:
+
+```tsx
+'use client';
+import { Suspense, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
+
+function BuyerCalendarPageInner() {
+  const searchParams = useSearchParams();
+  // ... 모든 페이지 로직
+}
+
+export default function BuyerCalendarPage() {
+  return (
+    <Suspense fallback={<div className="py-12 text-center text-sm text-gray-400">캘린더 로딩 중...</div>}>
+      <BuyerCalendarPageInner />
+    </Suspense>
+  );
+}
+```
+
+같은 패턴은 `useSearchParams` 를 사용하는 모든 client page 에 적용한다 (현재 buyer/seller calendar 두 곳, buyer/browse 도 향후 동일하게 wrap 권장).
+
+```tsx
+const searchParams = useSearchParams();
+const dateParam = searchParams?.get('date') ?? null;
+const parsedQuery = useMemo(() => {
+  if (!dateParam) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateParam);
+  if (!m) return null;
+  // ... validate & return { year, month, day, dateStr }
+}, [dateParam]);
+
+// 초기 state 를 쿼리 기반으로 설정
+const [year, setYear] = useState(parsedQuery?.year ?? today.getFullYear());
+const [month, setMonth] = useState(parsedQuery?.month ?? today.getMonth() + 1);
+const [selectedDate, setSelectedDate] = useState<string | null>(parsedQuery?.dateStr ?? null);
+const [dayModalDate, setDayModalDate] = useState<string | null>(parsedQuery?.dateStr ?? null);
+
+// 같은 페이지에서 쿼리만 변경되는 클라이언트 네비게이션 동기화
+useEffect(() => {
+  if (!parsedQuery) return;
+  setYear(parsedQuery.year);
+  setMonth(parsedQuery.month);
+  setSelectedDate(parsedQuery.dateStr);
+  setDayModalDate(parsedQuery.dateStr);
+}, [parsedQuery]);
+```
+
+쿼리 형식이 잘못되면 무시하고 오늘 기준으로 폴백 (안전 기본값).
 
 ##### EventType 'SUBSCRIPTION' + subscription_id 동기 일정 (검증됨, 2026-04-28)
 `types/calendar.ts`의 `EventType` union 에 `'SUBSCRIPTION'` 포함, `CalendarEvent` 인터페이스에 `subscription_id: string | null` 필드 포함.

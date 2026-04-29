@@ -128,7 +128,7 @@ QA 결과는 두 가지:
 - **Validation**: Pydantic v2
 - **WebSocket**: FastAPI WebSocket (채팅)
 - **Background**: Celery + Redis (알림, 배치)
-- **AI**: Anthropic Claude API (claude-3-5-sonnet-20241022)
+- **AI**: OpenAI API (gpt-4o-mini)
 
 ### Database / Infra
 - **Database**: Supabase (PostgreSQL 15)
@@ -289,7 +289,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_JWT_SECRET=
-ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
 REDIS_URL=redis://localhost:6379
 DATABASE_URL=postgresql+asyncpg://...
 ```
@@ -304,7 +304,7 @@ DATABASE_URL=postgresql+asyncpg://...
 |-------|------|---------|
 | frontend-agent | `.claude/agents/frontend-agent.md` | Next.js 페이지·컴포넌트, Tailwind, Zustand, 라우팅, UI 전체 |
 | backend-agent | `.claude/agents/backend-agent.md` | FastAPI, SQLAlchemy, Pydantic, DB 마이그레이션, RLS, Auth |
-| ai-agent | `.claude/agents/ai-agent.md` | Claude API 연동, 스트리밍, 프롬프트 설계, AI 기능 확장 |
+| ai-agent | `.claude/agents/ai-agent.md` | OpenAI API 연동, 스트리밍, 프롬프트 설계, AI 기능 확장 |
 | validator-agent | `.claude/agents/validator-agent.md` | 코드 수정 후 자동 검증 — TS 컴파일, Python 문법, API 계약 불일치 탐지 |
 | qa-tester-agent | `.claude/agents/qa-tester-agent.md` | 자율 PM 사이클의 마지막 게이트. 실제 브라우저로 사용자 시나리오 진행, UX 페인 포인트·런타임 버그 발견 (코드 수정 X) |
 
