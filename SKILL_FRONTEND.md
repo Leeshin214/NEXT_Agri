@@ -50,11 +50,13 @@ frontend/
 │   └── dashboard/
 │       └── TodayTasksWidget.tsx     ← role='seller'|'buyer' — 오늘 할 일 요약
 ├── hooks/
-│   ├── useAuth.ts
-│   ├── useAIStream.ts
+│   ├── useAuth.ts                  ← user, signOut (signOut에서 AI 대화 캐시도 초기화)
+│   ├── useAIStream.ts              ← AI 채팅 호출 + aiChatStore 에 turn 저장
+│   ├── useAIHistory.ts             ← /ai/history fetch + aiChatStore hydrate
 │   └── useChat.ts
 ├── store/
-│   ├── authStore.ts                ← user, setUser, logout
+│   ├── authStore.ts                ← user, setSession, logout (탭별 격리 persist)
+│   ├── aiChatStore.ts              ← AI 대화 turns(최대 100), localStorage persist (글로벌)
 │   └── uiStore.ts                  ← aiPanelOpen, toggleAIPanel (사이드바 state 없음 — 호버 전용)
 ├── types/
 │   ├── user.ts                     ← User, UserRole
@@ -205,7 +207,53 @@ export const buyerMenus: MenuItem[] = [
 // - 마이페이지: router.push('/profile')
 // - 로그아웃: signOut()
 // click-outside: useRef + mousedown 이벤트로 처리
+//
+// 종(Bell) 알림: 별도 컴포넌트 NotificationBell 로 분리되어 있음.
+// TopBar 는 <NotificationBell /> 만 렌더하고 끝 — 상태/구독 로직 직접 보유 X.
 ```
+
+---
+
+## 알림(Notification) 시스템 (실제 기준)
+
+```
+backend                                 frontend
+─────────                               ────────
+order_service / chat_service            useNotificationRealtime  ← 단일 mount (NotificationBell 내부)
+   ↓ INSERT public.notifications          ↓ supabase.channel(`notifications:${userId}`)
+   ↓ Supabase Realtime publication        ↓ filter: user_id=eq.${userId}
+   ↓ INSERT/UPDATE 모두 본인 행만 푸시 ─► queryClient.invalidateQueries(['notifications'])
+                                          ↓
+GET  /notifications?limit=30            useNotifications({ limit, onlyUnread })
+GET  /notifications/unread-count        useUnreadCount()  ← refetchInterval 60s (Realtime 끊김 대비)
+POST /notifications/{id}/read           useMarkNotificationRead()  ← Optimistic (race-safe)
+POST /notifications/read-all            useMarkAllNotificationsRead()  ← Optimistic (race-safe)
+```
+
+**주요 규칙:**
+- Realtime 구독은 **NotificationBell 한 곳** 에서만 호출 (AppLayout/TopBar 에서 중복 호출 금지 — 채널 누수)
+- Realtime 은 INSERT + UPDATE 둘 다 listen — 다른 탭에서 mark_read 하면 이 탭에도 즉시 반영
+- 카운트 뱃지는 `useUnreadCount()` 우선, fallback 으로 `listQuery.data.meta.unread_count` 사용
+- 두 쿼리 모두 `['notifications', ...]` prefix 키 → Realtime 시 한 번의 invalidate 로 동기화됨
+- 백엔드 응답 형태: `SuccessResponse<Notification[]>` + `meta: { unread_count, total }` (페이지네이션 meta 와 같은 자리)
+- 행 클릭 → **`await markRead.mutateAsync(id)` 후** `router.push(link_url)`. `mutate()` fire-and-forget 으로 호출 직후 navigate 하면 fetch 가 abort 됨 — 항상 await. order 관련은 `/{role}/orders?id=...`, NEW_MESSAGE 는 `/{role}/chat?room_id=...`. orders/chat 페이지는 `?id=` / `?room_id=` 쿼리로 자동 모달/방 선택 처리 (각 page.tsx 의 `useEffect(() => searchParams.get(...))` 참조).
+
+### Optimistic mark-read mutation 의 race 회피 정책 (검증됨)
+
+증상: "안 읽음 표시가 안 사라진다." 백엔드 access log 에 POST 자체가 안 찍힘.
+
+원인 3가지를 모두 차단해야 함:
+1. **router.push 가 fetch abort** — `markRead.mutate(id)` 직후 `router.push(...)` 호출하면 React Query 의 onMutate microtask 가 진행 중인 동안 navigation 시작 → fetch 가 abort 또는 무시. 해결: `await markRead.mutateAsync(id)` 로 끝까지 기다린 뒤 navigate.
+2. **cancelQueries hang** — `useUnreadCount` 의 60초 polling 이 in-flight 일 때 onMutate 안의 `await queryClient.cancelQueries(['notifications'])` 가 정상 종료 안 되면 mutationFn 실행 안 됨. 해결: **onMutate 에서 cancelQueries 호출 안 함**. 어차피 setQueryData 로 즉시 덮으므로 cancel 불필요.
+3. **invalidate 후 refetch 가 옛 응답 덮어씀** — onSettled 에서 `invalidateQueries` 호출하면 polling refetch 가 즉시 실행되며, 그 응답이 optimistic 으로 만든 0 카운트를 옛 N 카운트로 덮을 수 있음. 해결: **onSettled invalidate 제거**. 대신 onSuccess 에서 server 응답으로 `setQueriesData` 직접 업데이트, 그리고 다른 탭/디바이스 동기화는 **Realtime UPDATE 이벤트** 로 보완.
+
+추가 안전장치: `useUnreadCount` 에 `refetchOnMount: false` — mutation 직후 mount 변화로 인한 refetch race 방지.
+
+`setQueriesData` 의 콜백 안에서는 `unread-count` 단일 객체 캐시 (`data` 가 배열 아님) 와 list 캐시를 구분해야 함. `if (!Array.isArray(cast.data)) return old;` 로 list 만 처리.
+
+회귀 영향: invalidate 제거로 기존에 의존하던 자동 refetch 가 사라지지만, (a) 같은 탭에서는 onSuccess 의 setQueriesData 가 server truth 를 직접 cache 에 박고, (b) 다른 탭/디바이스는 Realtime UPDATE 이벤트가 invalidate 트리거. 60초 polling fallback 도 유지.
+
+**상대 시간 헬퍼**: `lib/date.ts` 의 `formatRelativeKst(iso)` 사용. "방금" / "{N}분 전" / "{N}시간 전" / "YYYY-MM-DD"(KST) 4단계.
 
 ---
 
@@ -214,7 +262,11 @@ export const buyerMenus: MenuItem[] = [
 ```typescript
 // frontend/components/layout/AIChatPanel.tsx
 // - useAuthStore로 role 감지 → sellerQuickPrompts / buyerQuickPrompts 자동 선택
-// - useAIStream 훅 사용 (응답, 스트리밍 상태, 전송)
+// - useAIStream 훅 사용 → { isStreaming, manualReview, stream } 만 destructure
+//   (response 는 더 이상 직접 안 씀 — store 의 turns 가 SSOT)
+// - useAIHistory(100) 호출로 store hydrate 트리거
+// - useAIChatStore 의 turns 를 구독해 사용자/AI 말풍선 형태로 모두 표시
+// - 새 응답이 와도 이전 대화가 유지되며, 페이지 이동/새로고침 후에도 localStorage 에서 복원
 // - 입력: Enter(전송), Shift+Enter(줄바꿈) 지원
 // - 별도 라우트(/ai-assistant) 없음
 //
@@ -229,6 +281,36 @@ export const buyerMenus: MenuItem[] = [
 // uiStore에 aiPanelOpen / toggleAIPanel / setAIPanelOpen 사용
 // 채팅 UI는 chatUI 변수로 한 번만 작성 후 확장 상태 두 곳에서 재사용
 ```
+
+### AIChatPanel turns 렌더 패턴 (검증됨, 2026-04-30)
+
+좁은 패널(폭 320~440px)에 맞춘 **컴팩트 사이즈**로 turns 모두 표시.
+ai-assistant 페이지의 풀 사이즈 (text-sm, max-w-[75%], px-4 py-2) 와 다른 컴팩트 톤을 사용한다:
+- 텍스트: `text-xs` (페이지는 `text-sm`)
+- 말풍선: `max-w-[85%] rounded-2xl px-3 py-1.5` (페이지는 `max-w-[75%] rounded-2xl px-4 py-2`)
+- 컨테이너 padding: `p-3 space-y-1.5`
+- 날짜 구분선 폰트: `text-[10px]`
+- manual review 배너 폰트: `text-[11px]` + 아이콘 `h-3.5 w-3.5`
+
+```tsx
+const { isStreaming, manualReview, stream } = useAIStream();  // response 는 안 씀
+useAIHistory(100);
+const turns = useAIChatStore((s) => s.turns);
+const messagesEndRef = useRef<HTMLDivElement>(null);
+const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
+
+useEffect(() => {
+  messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+}, [turns.length, lastTurn?.response]);
+
+// pending 마지막 turn 의 AI 말풍선은 깜빡이는 캐럿만 표시
+const isLastPending = idx === turns.length - 1 && turn.pending && turn.response === '';
+```
+
+**핵심**: `response` state 는 useAIStream 이 외부 호환성으로 유지하되,
+실제 화면 렌더는 `useAIChatStore.turns` 가 SSOT (Single Source of Truth).
+이렇게 해야 새 응답이 와도 이전 대화가 사라지지 않고, 페이지 이동 후 돌아와도 그대로 남는다.
 
 ---
 
@@ -843,13 +925,13 @@ const sortedHistory = [...history].reverse(); // 오래된순 정렬
 #### useAIStream — manualReview 플래그 (검증됨)
 
 `useAIStream`이 `manualReview: boolean`을 추가로 반환한다.
-백엔드 orchestrator `final_state.manual_review`가 `true`이면 페이지에서 경고 배너를 표시한다.
+백엔드 orchestrator `final_state.manual_review`가 `true`이면 페이지/패널에서 경고 배너를 표시한다.
 
 ```typescript
 // hooks/useAIStream.ts — 반환값
 return { response, isStreaming, manualReview, stream, abort, reset };
 
-// 페이지에서 사용
+// 페이지에서 사용 (풀 사이즈 — text-sm)
 const { response, isStreaming, manualReview, stream } = useAIStream();
 
 {manualReview && (
@@ -860,6 +942,12 @@ const { response, isStreaming, manualReview, stream } = useAIStream();
     </span>
   </div>
 )}
+
+// AIChatPanel(우측 좁은 패널)에서 사용 — 컴팩트 톤 (text-[11px])
+// response 는 destructure 하지 않고 turns 기준으로 렌더하면서
+// 마지막 turn 응답 직후에만 배너 노출
+const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
 ```
 
 백엔드 orchestrator.py `run()` return에도 `manual_review` 필드를 포함해야 한다:
@@ -1178,6 +1266,25 @@ const canRespond =
 
 `from_role`(SELLER/BUYER)은 배지 표시용. 인증된 사용자 ID와의 비교는
 반드시 `from_user_id` 사용 — `from_role`만으로 본인/상대 판별 금지(같은 역할 두 사용자가 있을 수 있음).
+
+#### 납품일 변경 섹션 — NegotiationHistory 와 동일 패턴 (검증됨, 2026-04-29)
+
+`components/common/DeliveryDateChangeSection.tsx` 가 주문 상세 슬라이드 패널의 `<NegotiationHistory />` **바로 아래**에 배치된다 (buyer/seller 양 페이지). props:
+```ts
+interface DeliveryDateChangeSectionProps {
+  orderId: string;
+  orderStatus: OrderStatus;
+  currentDeliveryDate: string | null;
+}
+```
+
+핵심 동작:
+- `QUOTE_REQUESTED`/`NEGOTIATING`/`CONFIRMED` 일 때만 "변경 요청" 버튼 + 인라인 폼 노출
+- `PREPARING` 이상이면 "출하 준비 중이라 납품일을 변경할 수 없습니다" 안내 박스
+- 가장 최근 PENDING 이 상대방 제안이면 수락/거절 버튼 (NegotiationHistory 와 동일 가드, **CONFIRMED 도 응답 가능**)
+- 수락 시 `useAcceptDeliveryDateChange` 가 `['calendar']` 도 invalidate → 캘린더 자동 동기화
+
+훅은 `hooks/useDeliveryDateChanges.ts` (4개 export): `useDeliveryDateChanges` / `useSubmitDeliveryDateChange` / `useAcceptDeliveryDateChange` / `useRejectDeliveryDateChange`. 모두 `orderId` argument.
 
 #### 판매자 vs 구매자 — 상태 전이 권한 매트릭스 (검증됨, 2026-04-27 갱신)
 

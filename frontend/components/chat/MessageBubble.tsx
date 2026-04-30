@@ -7,6 +7,7 @@ import {
 } from '@/hooks/useOrders';
 import { useAuthStore } from '@/store/authStore';
 import StatusBadge from '@/components/common/StatusBadge';
+import DeliveryDateChangeCard from '@/components/chat/DeliveryDateChangeCard';
 import { cn } from '@/lib/utils';
 import type { Message, MessageMetadata } from '@/types';
 
@@ -63,10 +64,106 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
         <OrderCancelledCard metadata={metadata} content={message.content} />
       );
 
+    case 'DELIVERY_DATE_CHANGE':
+      return (
+        <DeliveryDateChangeCard
+          message={message}
+          metadata={metadata}
+          isMine={isMine}
+        />
+      );
+
+    case 'DELIVERY_DATE_ACCEPTED':
+      return (
+        <DeliveryDateAcceptedCard metadata={metadata} content={message.content} />
+      );
+
+    case 'DELIVERY_DATE_REJECTED':
+      return (
+        <DeliveryDateRejectedCard metadata={metadata} content={message.content} />
+      );
+
     case 'TEXT':
     default:
       return <TextBubble content={message.content} isMine={isMine} />;
   }
+}
+
+// ─── DELIVERY_DATE_ACCEPTED ────────────────────────────────────────
+
+function formatDate(iso: string | null | undefined): string {
+  if (!iso) return '-';
+  try {
+    return new Date(iso).toLocaleDateString('ko-KR', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function DeliveryDateAcceptedCard({
+  metadata,
+  content,
+}: {
+  metadata: MessageMetadata;
+  content: string;
+}) {
+  const accepted =
+    metadata.accepted_delivery_date ?? metadata.proposed_delivery_date;
+  return (
+    <div className="flex justify-center">
+      <div className="w-full max-w-[85%] rounded-xl border border-green-300 bg-green-50 p-3">
+        <div className="flex items-center gap-2">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-green-200 text-green-800">
+            <Check className="h-3.5 w-3.5" />
+          </span>
+          <p className="text-sm font-medium text-green-900">
+            납품일이 {formatDate(accepted)} 로 변경되었습니다
+          </p>
+        </div>
+        {content && (
+          <p className="mt-1 text-[11px] text-green-800/80">{content}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── DELIVERY_DATE_REJECTED ────────────────────────────────────────
+
+function DeliveryDateRejectedCard({
+  metadata,
+  content,
+}: {
+  metadata: MessageMetadata;
+  content: string;
+}) {
+  const proposed = metadata.proposed_delivery_date;
+  return (
+    <div className="flex justify-center">
+      <div className="w-full max-w-[85%] rounded-xl border border-gray-300 bg-gray-50 p-3">
+        <div className="flex items-center gap-2">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gray-200 text-gray-700">
+            <X className="h-3.5 w-3.5" />
+          </span>
+          <p className="text-sm font-medium text-gray-700">
+            납품일 변경 거절
+            {proposed && (
+              <span className="ml-1 text-xs text-gray-500">
+                ({formatDate(proposed)})
+              </span>
+            )}
+          </p>
+        </div>
+        {content && (
+          <p className="mt-1 text-[11px] text-gray-600">{content}</p>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ─── TEXT ───────────────────────────────────────────────────────────

@@ -25,6 +25,10 @@ const ORDER_RELATED_TYPES: MessageType[] = [
   'ORDER_CANCELLED',
   // SYSTEM 은 견적 요청 자동 생성 시 발송 → 신규 주문이 목록에 노출되도록 invalidate
   'SYSTEM',
+  // 납품일 변경 — 수락 시 orders.delivery_date / 캘린더 동기화 반영 필요
+  'DELIVERY_DATE_CHANGE',
+  'DELIVERY_DATE_ACCEPTED',
+  'DELIVERY_DATE_REJECTED',
 ];
 
 // ─── 채팅방 목록 (Realtime 구독으로 자동 갱신) ───
@@ -198,6 +202,23 @@ export function useMessagesWithWebSocket(roomId: string | null) {
       // 이전 카드의 수락/거절 버튼이 사라지지 않는다. WS 는 새 메시지 INSERT 만 푸시하고
       // 기존 메시지의 metadata UPDATE 는 알리지 않으므로 여기서 강제 invalidate.
       queryClient.invalidateQueries({ queryKey: ['messages', roomId] });
+
+      // 납품일 변경 이벤트 — delivery-date-changes 목록 + (수락 시) 캘린더 동기화
+      if (
+        msgType === 'DELIVERY_DATE_CHANGE' ||
+        msgType === 'DELIVERY_DATE_ACCEPTED' ||
+        msgType === 'DELIVERY_DATE_REJECTED'
+      ) {
+        if (orderId) {
+          queryClient.invalidateQueries({
+            queryKey: ['orders', orderId, 'delivery-date-changes'],
+          });
+        }
+        if (msgType === 'DELIVERY_DATE_ACCEPTED') {
+          // 수락 시 orders.delivery_date 업데이트 → 캘린더 이벤트 동기화
+          queryClient.invalidateQueries({ queryKey: ['calendar'] });
+        }
+      }
     }
   }, [lastMessage, roomId, queryClient]);
 

@@ -8,6 +8,7 @@ import NextDeliveryLabel from '@/components/subscriptions/NextDeliveryLabel';
 import DataTable, { type Column } from '@/components/common/DataTable';
 import StatusBadge from '@/components/common/StatusBadge';
 import NegotiationHistory from '@/components/common/NegotiationHistory';
+import DeliveryDateChangeSection from '@/components/common/DeliveryDateChangeSection';
 import CancelOrderModal from '@/components/common/CancelOrderModal';
 import CreateOrderModal from '@/components/buyer/CreateOrderModal';
 import EditOrderModal from '@/components/buyer/EditOrderModal';
@@ -704,6 +705,13 @@ export default function BuyerOrdersPage() {
               <NegotiationHistory
                 orderId={selectedOrder.id}
                 orderStatus={selectedOrder.status}
+              />
+
+              {/* 납품일 변경 — 협상 이력 바로 아래 */}
+              <DeliveryDateChangeSection
+                orderId={selectedOrder.id}
+                orderStatus={selectedOrder.status}
+                currentDeliveryDate={selectedOrder.delivery_date}
               />
             </div>
 

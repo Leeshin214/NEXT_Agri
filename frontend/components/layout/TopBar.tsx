@@ -1,9 +1,10 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Bell, LogOut, User as UserIcon, Settings } from 'lucide-react';
+import { LogOut, User as UserIcon, Settings } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '@/hooks/useAuth';
+import NotificationBell from './NotificationBell';
 import type { User } from '@/types/user';
 
 interface TopBarProps {
@@ -36,10 +37,8 @@ export default function TopBar({ user }: TopBarProps) {
 
       {/* 우측: 사용자 정보 */}
       <div className="flex items-center gap-4">
-        {/* 알림 */}
-        <button className="relative flex h-9 w-9 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-100 hover:text-gray-600">
-          <Bell className="h-5 w-5" />
-        </button>
+        {/* 알림 — 종 + 드롭다운 + Realtime 구독은 NotificationBell 내부에서 단일 mount */}
+        <NotificationBell />
 
         {/* 프로필 드롭다운 */}
         <div className="relative" ref={dropdownRef}>

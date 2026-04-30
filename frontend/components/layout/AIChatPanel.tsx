@@ -1,18 +1,27 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { Bot, Send, Sparkles, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Bot, Send, Sparkles, ChevronLeft, ChevronRight, AlertTriangle } from 'lucide-react';
 import { useAIStream } from '@/hooks/useAIStream';
 import { useAuthStore } from '@/store/authStore';
 import { useUIStore } from '@/store/uiStore';
+import { useAIChatStore } from '@/store/aiChatStore';
+import { useAIHistory } from '@/hooks/useAIHistory';
 import { sellerQuickPrompts, buyerQuickPrompts } from '@/constants/aiPrompts';
 
 export default function AIChatPanel() {
   const [input, setInput] = useState('');
   const [isMobile, setIsMobile] = useState(false);
-  const { response, isStreaming, stream } = useAIStream();
+  const { isStreaming, manualReview, stream } = useAIStream();
   const { user } = useAuthStore();
   const { aiPanelOpen, toggleAIPanel, setAIPanelOpen } = useUIStore();
+
+  // AI 히스토리 hydrate 트리거 + store 의 turns 구독
+  useAIHistory(100);
+  const turns = useAIChatStore((s) => s.turns);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+  const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
 
   const quickPrompts = user?.role === 'SELLER' ? sellerQuickPrompts : buyerQuickPrompts;
 
@@ -29,6 +38,11 @@ export default function AIChatPanel() {
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, [setAIPanelOpen]);
+
+  // turns 변화 또는 마지막 응답 변화 시 자동 스크롤
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [turns.length, lastTurn?.response]);
 
   const handleSubmit = (text: string) => {
     if (!text.trim()) return;
@@ -77,21 +91,66 @@ export default function AIChatPanel() {
       </div>
 
       {/* 응답 영역 */}
-      <div className="flex-1 overflow-y-auto p-4">
-        {response ? (
-          <div className="prose prose-sm max-w-none whitespace-pre-wrap text-sm text-gray-800 leading-relaxed">
-            {response}
-            {isStreaming && (
-              <span className="inline-block h-4 w-0.5 animate-pulse bg-primary-600 ml-0.5 align-text-bottom" />
-            )}
-          </div>
-        ) : (
+      <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
+        {turns.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <Bot className="h-10 w-10 text-gray-200" />
             <p className="text-xs text-gray-400">
               질문을 입력하거나 빠른 프롬프트를 선택하세요
             </p>
           </div>
+        ) : (
+          <>
+            {turns.map((turn, idx) => {
+              const dateLabel = turn.created_at.slice(0, 10);
+              const prevDateLabel = idx > 0 ? turns[idx - 1].created_at.slice(0, 10) : null;
+              const showDivider = dateLabel !== prevDateLabel;
+              const isLastPending = idx === turns.length - 1 && turn.pending && turn.response === '';
+
+              return (
+                <div key={turn.id}>
+                  {showDivider && (
+                    <div className="flex items-center gap-2 my-2">
+                      <div className="flex-1 h-px bg-gray-200" />
+                      <span className="text-[10px] text-gray-400 whitespace-nowrap">{dateLabel}</span>
+                      <div className="flex-1 h-px bg-gray-200" />
+                    </div>
+                  )}
+                  {/* 사용자 메시지 — 오른쪽 */}
+                  <div className="flex justify-end mb-1">
+                    <div className="max-w-[85%] rounded-2xl bg-primary-100 px-3 py-1.5 text-xs text-primary-900 break-words whitespace-pre-wrap">
+                      {turn.prompt}
+                    </div>
+                  </div>
+                  {/* manual review 배너 — 마지막 turn 응답 직후 */}
+                  {idx === turns.length - 1 && showManualReviewBanner && (
+                    <div className="bg-yellow-50 border border-yellow-400 rounded p-2 mb-1 flex items-start gap-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5 text-yellow-500 flex-shrink-0 mt-0.5" aria-hidden="true" />
+                      <span className="text-yellow-800 text-[11px] leading-snug">
+                        AI 답변 검토 필요 — 결과를 직접 확인해 주세요.
+                      </span>
+                    </div>
+                  )}
+                  {/* AI 응답 — 왼쪽 */}
+                  <div className="flex justify-start mb-1">
+                    <div className="max-w-[85%] rounded-2xl bg-gray-100 px-3 py-1.5 text-xs text-gray-800 break-words whitespace-pre-wrap leading-relaxed">
+                      {isLastPending ? (
+                        <span className="inline-block h-3 w-0.5 animate-pulse bg-primary-600" />
+                      ) : (
+                        <>
+                          {turn.response}
+                          {idx === turns.length - 1 && isStreaming && (
+                            <span className="inline-block h-3 w-0.5 animate-pulse bg-primary-600 ml-0.5" />
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            <div ref={messagesEndRef} />
+          </>
         )}
       </div>
 

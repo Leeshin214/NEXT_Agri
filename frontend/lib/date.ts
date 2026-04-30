@@ -36,6 +36,35 @@ export function getTodayKstString(): string {
 }
 
 /**
+ * ISO 문자열(보통 백엔드 created_at — UTC) 을 KST 기준 상대 시간 문자열로 반환한다.
+ * - "방금" (60초 미만)
+ * - "{N}분 전" (60분 미만)
+ * - "{N}시간 전" (24시간 미만 + 같은 KST 날짜)
+ * - 그 외: "YYYY-MM-DD" KST 날짜
+ *
+ * NotificationBell 등 알림 목록의 시간 라벨로 사용한다.
+ * 잘못된 입력이면 원본 문자열을 그대로 반환한다.
+ */
+export function formatRelativeKst(iso: string): string {
+  if (!iso) return iso;
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return iso;
+  const diffMs = Date.now() - ts;
+
+  // 미래 시각이거나 60초 미만 — 방금
+  if (diffMs < 60_000) return '방금';
+
+  const diffMin = Math.floor(diffMs / 60_000);
+  if (diffMin < 60) return `${diffMin}분 전`;
+
+  const diffHour = Math.floor(diffMs / 3_600_000);
+  if (diffHour < 24) return `${diffHour}시간 전`;
+
+  // 24시간 이상 → KST 날짜로 표기
+  return new Date(ts).toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' });
+}
+
+/**
  * 'YYYY-MM-DD' 두 문자열 간 차이(일 단위)를 정수로 반환한다.
  * 양수: target 이 base 이후, 0: 같은 날, 음수: target 이 base 이전.
  *

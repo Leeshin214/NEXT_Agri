@@ -103,6 +103,41 @@ class NegotiationHistoryResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class DeliveryDateChangeCreate(BaseModel):
+    """납품일 변경 요청 — 주문 당사자(SELLER/BUYER) 누구나 제시 가능.
+
+    proposed_delivery_date: 새로 제안하는 납품일 (오늘 이상이어야 함)
+    notes: 변경 사유 등 자유 텍스트
+    """
+
+    proposed_delivery_date: date
+    notes: Optional[str] = None
+
+
+class DeliveryDateChangeResponse(BaseModel):
+    """납품일 변경 요청 단건/이력 응답.
+
+    from_user_name / from_user_company 는 router/service 단계에서 동적 주입 (DB 컬럼 X).
+    """
+
+    id: UUID
+    order_id: UUID
+    from_user_id: UUID
+    from_role: str
+    proposed_delivery_date: date
+    notes: Optional[str] = None
+    status: str
+    responded_at: Optional[datetime] = None
+    responded_by: Optional[UUID] = None
+    created_at: datetime
+    updated_at: datetime
+    # 동적 주입 (사용자 표시용 — 응답 평탄화 시 join 으로 채움)
+    from_user_name: Optional[str] = None
+    from_user_company: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
 class OrderResponse(BaseModel):
     id: UUID
     order_number: str

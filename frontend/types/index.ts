@@ -12,6 +12,9 @@ export type {
   CounterOfferCreate,
   CounterOfferStatus,
   FromRole,
+  DeliveryDateChange,
+  DeliveryDateChangeCreate,
+  DeliveryDateChangeStatus,
 } from './order';
 export type { Partner, PartnerStatus, PartnerCreate } from './partner';
 export type { CalendarEvent, EventType, CalendarEventCreate } from './calendar';
@@ -33,3 +36,10 @@ export type {
   SubscriptionStatus,
   PartnerStats,
 } from './subscription';
+export type {
+  Notification,
+  NotificationType,
+  NotificationListMeta,
+  UnreadCountData,
+  MarkAllReadData,
+} from './notification';

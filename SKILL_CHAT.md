@@ -767,6 +767,63 @@ const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: re
 )}
 ```
 
+### 납품일 변경 요청·승인 채팅 카드 (검증됨, 2026-04-29)
+
+backend 가 `delivery_date_change_history` 테이블 + 4개 엔드포인트 (`/orders/{id}/delivery-date-changes` GET/POST + `.../{change_id}/accept`, `.../{change_id}/reject`) 추가. 채팅에는 3개 신규 message_type 이 broadcast 된다:
+- `DELIVERY_DATE_CHANGE` — 변경 요청 발송. metadata: `{change_id, proposed_delivery_date, from_role, notes, status, previous_delivery_date}`
+- `DELIVERY_DATE_ACCEPTED` — 수락. metadata: `{change_id, accepted_delivery_date, from_role}`. 이 시점에 `orders.delivery_date` 가 업데이트되고 캘린더 동기화됨
+- `DELIVERY_DATE_REJECTED` — 거절. metadata: `{change_id, proposed_delivery_date, from_role}`
+
+상태 가드: `QUOTE_REQUESTED`/`NEGOTIATING`/`CONFIRMED` 만 변경 요청 가능. `PREPARING` 이상은 백엔드 422.
+
+#### MessageBubble 분기 추가 (components/chat/MessageBubble.tsx)
+```tsx
+case 'DELIVERY_DATE_CHANGE':
+  return <DeliveryDateChangeCard message={message} metadata={metadata} isMine={isMine} />;
+case 'DELIVERY_DATE_ACCEPTED':
+  return <DeliveryDateAcceptedCard metadata={metadata} content={message.content} />;
+case 'DELIVERY_DATE_REJECTED':
+  return <DeliveryDateRejectedCard metadata={metadata} content={message.content} />;
+```
+
+`DeliveryDateChangeCard` 는 `CounterOfferCard` 패턴 그대로 (sky-300/sky-50 톤). 상대방 PENDING 일 때만 수락/거절 버튼 노출. Accept/Reject 시 `useAcceptDeliveryDateChange` / `useRejectDeliveryDateChange` 호출.
+
+#### useDeliveryDateChanges (hooks/useDeliveryDateChanges.ts)
+협상 훅과 동일 패턴. queryKey: `['orders', orderId, 'delivery-date-changes']`. **수락 mutation 만 `['calendar']` 도 invalidate** — 캘린더 화면이 같은 탭에 열려 있으면 새 납품일이 즉시 반영.
+
+#### useChat.ts ORDER_RELATED_TYPES 확장
+3개 신규 타입을 추가하고, `useMessagesWithWebSocket` useEffect 안에서:
+- 모든 delivery date 메시지 → `['orders', orderId, 'delivery-date-changes']` invalidate
+- `DELIVERY_DATE_ACCEPTED` 만 추가로 `['calendar']` invalidate
+
+```typescript
+if (msgType === 'DELIVERY_DATE_CHANGE' ||
+    msgType === 'DELIVERY_DATE_ACCEPTED' ||
+    msgType === 'DELIVERY_DATE_REJECTED') {
+  if (orderId) {
+    queryClient.invalidateQueries({
+      queryKey: ['orders', orderId, 'delivery-date-changes']
+    });
+  }
+  if (msgType === 'DELIVERY_DATE_ACCEPTED') {
+    queryClient.invalidateQueries({ queryKey: ['calendar'] });
+  }
+}
+```
+
+#### 채팅 입력창 빠른 액션 — DeliveryDatePopover (components/chat/DeliveryDatePopover.tsx)
+`PriceOfferPopover` 패턴 복제 (sky 톤). `room.order_id` 가 있고 `orderStatus` 가 변경 가능 상태일 때만 활성. seller/buyer chat page 둘 다 입력창의 `<PriceOfferPopover />` **바로 우측**에 배치:
+```tsx
+<PriceOfferPopover roomId={selectedRoomId} orderId={linkedOrderId} currentTotal={linkedOrderTotal} />
+<DeliveryDatePopover roomId={selectedRoomId} orderId={linkedOrderId}
+  orderStatus={linkedOrderStatus} currentDeliveryDate={linkedOrderDeliveryDate} />
+<input ... />
+```
+
+채팅 페이지에서 `useOrder(linkedOrderId)` 응답에서 `total_amount` / `status` / `delivery_date` 모두 추출해 두 popover 에 분배.
+
+---
+
 ## 작업 체크리스트
 
 - [ ] FastAPI chat 라우터 (rooms, messages CRUD)

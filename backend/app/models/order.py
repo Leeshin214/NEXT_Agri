@@ -9,6 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.delivery_date_change import DeliveryDateChangeHistory
     from app.models.negotiation import NegotiationHistory
 
 
@@ -44,6 +45,11 @@ class Order(Base, SoftDeleteMixin):
         "NegotiationHistory",
         primaryjoin="Order.id == foreign(NegotiationHistory.order_id)",
         order_by="NegotiationHistory.created_at.desc()",
+    )
+    delivery_date_changes: Mapped[list["DeliveryDateChangeHistory"]] = relationship(
+        "DeliveryDateChangeHistory",
+        primaryjoin="Order.id == foreign(DeliveryDateChangeHistory.order_id)",
+        order_by="DeliveryDateChangeHistory.created_at.desc()",
     )
 
 

@@ -226,6 +226,36 @@ CREATE INDEX idx_messages_room_type ON messages(room_id, message_type);
 { order_id: UUID, order_number: str, total_amount: int? }
 ```
 
+### notifications 테이블 — 우상단 종 아이콘 알림 (2026-04-29)
+```sql
+CREATE TABLE notifications (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type       TEXT NOT NULL CHECK (type IN (
+                'NEW_MESSAGE',
+                'COUNTER_OFFER', 'OFFER_ACCEPTED', 'OFFER_REJECTED',
+                'DELIVERY_DATE_CHANGE', 'DELIVERY_DATE_ACCEPTED', 'DELIVERY_DATE_REJECTED',
+                'ORDER_STATUS')),
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  link_url   TEXT,
+  order_id   UUID REFERENCES orders(id)     ON DELETE SET NULL,
+  room_id    UUID REFERENCES chat_rooms(id) ON DELETE SET NULL,
+  is_read    BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  read_at    TIMESTAMPTZ
+);
+CREATE INDEX idx_notifications_user_unread
+  ON notifications(user_id, created_at DESC) WHERE is_read = false;
+CREATE INDEX idx_notifications_user_recent
+  ON notifications(user_id, created_at DESC);
+```
+- RLS: SELECT/UPDATE 본인만 (`user_id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())`).
+  INSERT 정책 없음 → service_role 만 INSERT (서버 emit 전용).
+- Supabase Realtime publication 등록 (`ALTER PUBLICATION supabase_realtime ADD TABLE notifications;`).
+- 마이그레이션: `supabase/migrations/20260429000002_create_notifications.sql`.
+- `deleted_at` 미보유 — 일반적으로 알림은 일시 보존 (TTL 정책 추가 시 별도 처리).
+
 ### ai_conversations 테이블 (AI 대화 히스토리)
 ```sql
 CREATE TABLE ai_conversations (
@@ -604,3 +634,41 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
   ```
   - `Z` suffix 처리 필수 — Python `datetime.fromisoformat` 은 3.11+ 부터만 `Z` 직접 파싱 지원. `replace("Z", "+00:00")` 가 안전하다.
   - `delivery_date` 같은 DATE 컬럼은 timezone 불필요 — 그대로 `[:10]` slice.
+
+- **service-role-only INSERT 테이블 패턴 (notifications, 2026-04-29)**: 서버 내부에서만 emit 하고 클라이언트 직접 INSERT 를 차단하려면 RLS 에서 INSERT 정책 자체를 정의하지 않으면 된다 (SELECT/UPDATE 만 정의). PostgreSQL 의 RLS 는 화이트리스트 모델이라 정책이 없으면 anon/authenticated 는 INSERT 불가, service_role 은 RLS 우회로 INSERT 가능. notifications 테이블이 이 패턴의 첫 적용 사례 — 알림 INSERT 는 항상 백엔드 서비스(`notification_service.emit`)를 거치고 외부 노출 엔드포인트(`POST /notifications`) 를 두지 않는다. SELECT 는 본인만 (`user_id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())`), UPDATE 도 동일.
+
+- **soft delete 컬럼 보유 테이블 갱신 (2026-04-29)**: `deleted_at` 보유 = `users, products, partners, orders, calendar_events, messages, subscriptions` (7개). `deleted_at` 미보유 = `order_items, chat_rooms, ai_conversations, subscription_items, negotiation_history, delivery_date_change_history, notifications`. 알림은 일시성 데이터라 soft delete 미적용 — 향후 TTL/archive 정책 추가 시 재검토.
+
+- **supabase-py 2.x `update().execute()` representation 응답 비신뢰 패턴 (2026-04-29 notification 읽음 처리 버그 수정)**: supabase-py 2.11.0 의 `client.table(...).update(...).execute()` 는 UPDATE 가 실제로 성공해도 `result.data == []` 로 빈 배열을 반환하는 케이스가 있다 (representation 헤더 누락 / RLS 의 SELECT-after-UPDATE 단계 차단 / 일부 응답 경로). service_role 키 호출이라 RLS 자체는 우회되지만, 클라이언트 라이브러리 내부에서 representation 이 빠질 수 있어 `len(result.data)` 또는 `result.data[0]` 으로 성공 판단을 하면 안 된다. 검증된 회피 패턴:
+  ```python
+  # 단건 UPDATE — pre-select 로 존재/권한 확인 → UPDATE → 재조회 (3 step)
+  pre = await asyncio.to_thread(
+      lambda: self.table.select("id")
+      .eq("id", nid_str).eq("user_id", user_id_str).limit(1).execute()
+  )
+  if not (pre.data or []):
+      return {}                      # 라우터가 404 처리
+  await asyncio.to_thread(
+      lambda: self.table.update({...}).eq("id", nid_str).eq("user_id", user_id_str).execute()
+  )
+  after = await asyncio.to_thread(
+      lambda: self.table.select("*")
+      .eq("id", nid_str).eq("user_id", user_id_str).limit(1).execute()
+  )
+  return after.data[0] if after.data else {}
+
+  # 다건 UPDATE — pre-count 로 affected row 수 측정 → UPDATE → count 반환
+  pre = await asyncio.to_thread(
+      lambda: self.table.select("id", count="exact")
+      .eq("user_id", ...).eq("is_read", False).execute()
+  )
+  pending = pre.count or 0
+  if pending == 0: return 0
+  await asyncio.to_thread(
+      lambda: self.table.update({...}).eq("user_id", ...).eq("is_read", False).execute()
+  )
+  return pending
+  ```
+  - 적용 위치: `notification_service.mark_read` / `mark_all_read`. 동일 함정이 있는 다른 서비스(예: 향후 partners/orders 의 단순 UPDATE 응답을 신뢰하는 코드)도 같은 패턴으로 보강 가능.
+  - 비용: round-trip 1~2회 추가. 알림 읽음 같은 저빈도/단건 mutation 이라 무시 가능. 고빈도 경로(메시지 일괄 읽음 등)에서는 RPC SECURITY DEFINER 함수로 1 round-trip 처리 권장.
+  - 증상 진단: 프론트에서 mutation 후 invalidate 해도 UI 가 갱신되지 않고, DB 직접 확인 시 데이터는 갱신되어 있으면 거의 이 함정이다.

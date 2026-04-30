@@ -247,6 +247,36 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 # POST /orders - 견적 요청 (구매자만)
 # PATCH /orders/{id}/status - 상태 변경
 # POST /orders/{id}/items - 아이템 추가
+
+# 협상 (counter-offer) — 가격 협상
+# POST   /orders/{id}/counter-offers                       제시
+# POST   /orders/{id}/counter-offers/{offer_id}/accept     수락 → orders.total_amount 갱신
+# POST   /orders/{id}/counter-offers/{offer_id}/reject     거절
+# GET    /orders/{id}/counter-offers                       이력 (시간 역순)
+
+# 납품일 변경 (delivery-date-changes) — 2026-04-29 신규
+# POST   /orders/{id}/delivery-date-changes                            제시
+# POST   /orders/{id}/delivery-date-changes/{change_id}/accept         수락 → orders.delivery_date 갱신
+#                                                                       + calendar_events 재동기화
+#                                                                       + DELIVERY_DATE_ACCEPTED 채팅 메시지
+# POST   /orders/{id}/delivery-date-changes/{change_id}/reject         거절
+# GET    /orders/{id}/delivery-date-changes                            이력 (시간 역순)
+#
+# Body (POST /delivery-date-changes):
+#   { proposed_delivery_date: "YYYY-MM-DD",  # KST 기준 오늘 이상, 과거 → 422
+#     notes: Optional[str] }
+# Response: DeliveryDateChangeResponse {id, order_id, from_user_id, from_role,
+#   proposed_delivery_date, notes, status (PENDING|ACCEPTED|REJECTED|SUPERSEDED),
+#   responded_at, responded_by, created_at, updated_at,
+#   from_user_name?, from_user_company?  # 동적 주입 (list 시 N+1 회피 일괄 join)}
+#
+# 가드:
+#   - 주문 당사자(BUYER/SELLER)만 접근
+#   - 제시: 주문 status ∈ {QUOTE_REQUESTED, NEGOTIATING, CONFIRMED} 만 허용
+#           (PREPARING 이상은 출하 준비 단계라 차단)
+#   - 본인이 제시한 PENDING 은 본인이 accept/reject 불가 (상대방만)
+#   - 신규 제시 시 같은 주문의 이전 PENDING 은 모두 SUPERSEDED 마킹
+#     + messages.metadata.status 도 동기화 (negotiation 패턴과 동일)
 ```
 
 ### calendar.py (일정 API)
@@ -346,6 +376,44 @@ router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 #   - 멱등성: partial unique index uniq_calendar_events_active_subscription_user_date 로
 #            (subscription_id, user_id, event_date) 활성 행 1개 보장.
 #   - 실패 정책: best-effort, 주문/정기배송 자체는 막지 않고 로그만 남김.
+```
+
+### notifications.py (알림 API — 2026-04-29)
+```python
+router = APIRouter(prefix="/notifications", tags=["notifications"])
+
+# GET  /notifications?limit=30&only_unread=false
+#   응답: SuccessResponse[list[NotificationResponse]] + meta {unread_count, total}
+#   limit: 1~100 (기본 30)
+#   only_unread=True 면 미읽음만 (total = unread_count)
+# GET  /notifications/unread-count
+#   응답: SuccessResponse[{unread_count: int}]  — 가벼운 폴링 fallback
+# POST /notifications/{notification_id}/read
+#   응답: SuccessResponse[NotificationResponse] — 단건 읽음
+#   404: 본인 알림 아님 또는 존재하지 않음
+# POST /notifications/read-all
+#   응답: SuccessResponse[{updated: int}] — 미읽음 전체 읽음 처리
+
+# 알림 타입 (DB CHECK 제약과 1:1):
+#   NEW_MESSAGE, COUNTER_OFFER, OFFER_ACCEPTED, OFFER_REJECTED,
+#   DELIVERY_DATE_CHANGE, DELIVERY_DATE_ACCEPTED, DELIVERY_DATE_REJECTED,
+#   ORDER_STATUS
+
+# INSERT 는 외부 노출 없음 — 서버 내부 emit 만 (notification_service.emit):
+#   - order_service: 7곳 (counter offer 3 + delivery date 3 + status 1)
+#   - chat_service.send_message: 1곳 (TEXT 만, sender == receiver skip)
+# emit 시그니처:
+#   await notification_service.emit(
+#       user_id, type, title, body,
+#       link_url=None, order_id=None, room_id=None,
+#   )
+# - 실패해도 호출처(주문/채팅) 흐름 막지 않음 (try/except + logger.error)
+# - link_url 은 수신자 role 기준 (`/buyer/orders?id=...`, `/seller/chat?room_id=...`)
+# - 자기 자신에게는 발송 안 함 (sender == receiver 면 skip)
+
+# RLS: notifications_select_own / notifications_update_own (auth.uid() ↔ users.supabase_uid)
+# INSERT 정책 미정의 → service_role 만 INSERT 가능 (anon/authenticated 차단).
+# Supabase Realtime publication 등록 → 프론트가 종 아이콘 즉시 갱신 가능.
 ```
 
 ### partners.py (거래처 API — V1.6 양방향 승인 모델 2026-04-28)
@@ -1060,3 +1128,8 @@ pytest-cov==6.0.0
   - `event_type='SHIPMENT'` 또는 `'ORDER'` 등 calendar_events.CHECK 제약과 일치해야 함.
   - DB 의 `uniq_calendar_events_active_order_user_date` partial unique index 와 충돌 시 23505 발생 가능 — try/except 로 무시 (정상 race).
   - manual event 만 다루는 calendar_service 와는 격리된 기능으로 본다.
+
+- **함수 파라미터로 builtin shadow 금지 — `type`, `id`, `list`, `dict` 등 (2026-04-29 latent bug 수정)**: Python 함수 시그니처에서 builtin 식별자를 그대로 파라미터명으로 쓰면 함수 본문 안에서 해당 builtin 호출이 차단된다. 특히 except 핸들러에서 `type(e).__name__` 같이 에러 분류 패턴을 쓰는데 시그니처에 `type: str` 이 있으면 `TypeError: 'str' object is not callable` 이 발생해 INSERT 실패 시 로그 자체가 깨진다. **검증된 사례**: `notification_service.emit(..., type: str, ...)` 가 105 line 의 `type(e).__name__` 를 파괴 — `notification_type: str` 으로 rename 하여 해결. 호출처(`chat_service.py`, `order_service.py`)도 keyword arg 를 `notification_type=` 으로 일괄 변경. **체크리스트**:
+  - 새 service 메서드 작성 시 파라미터명에 builtin 사용 금지 (`type` → `notification_type`/`event_type`/`message_type`, `id` → `resource_id`/`user_id`, `list` → `items`, `dict` → `payload`, `format` → `output_format`).
+  - 기존 코드 리뷰 시: `def fn(..., type: str, ...)` 같은 시그니처를 grep 으로 발견하면 우선 수정 대상.
+  - 로그 포맷 문자열 안의 `type=%s` 는 builtin 호출이 아니므로 문제 없음 — 시그니처 파라미터만 주의.
