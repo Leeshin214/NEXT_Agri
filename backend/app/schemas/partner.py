@@ -34,6 +34,12 @@ class PartnerResponse(BaseModel):
     partner_company: Optional[str] = None
     partner_role: Optional[str] = None
     partner_phone: Optional[str] = None
+    # 최근 거래 정보 (PM Report #8 작업 5)
+    # - last_trade_date  : YYYY-MM-DD 문자열 (delivery_date 우선, 없으면 created_at 의 KST 날짜)
+    # - last_trade_amount: total_amount (KRW 정수)
+    # CANCELLED / soft-deleted 주문 제외, 가장 최근 created_at 한 건 기준.
+    last_trade_date: Optional[str] = None
+    last_trade_amount: Optional[int] = None
 
     model_config = {"from_attributes": True}
 

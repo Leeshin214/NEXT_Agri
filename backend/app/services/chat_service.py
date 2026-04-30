@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections import Counter
 from typing import Any, Optional
 from uuid import UUID
@@ -6,7 +7,12 @@ from uuid import UUID
 from app.core.supabase import get_supabase_client
 
 
+logger = logging.getLogger(__name__)
+
+
 # 허용된 message_type 값 (DB CHECK 제약과 동기화)
+# 주의: 마이그레이션 20260429000001_create_delivery_date_change_history.sql 의
+# messages.message_type CHECK 제약과 1:1 동기화되어야 한다.
 ALLOWED_MESSAGE_TYPES = {
     "TEXT",
     "SYSTEM",
@@ -15,6 +21,10 @@ ALLOWED_MESSAGE_TYPES = {
     "OFFER_REJECTED",
     "ORDER_STATUS",
     "ORDER_CANCELLED",
+    # 납품일 변경 흐름 (2026-04-29 추가)
+    "DELIVERY_DATE_CHANGE",
+    "DELIVERY_DATE_ACCEPTED",
+    "DELIVERY_DATE_REJECTED",
 }
 
 
@@ -180,7 +190,114 @@ class ChatService:
             ).eq("id", str(room_id)).execute()
         )
 
+        # 알림 emit — 채팅방 상대방에게 NEW_MESSAGE
+        # 실패해도 메시지 송수신 자체는 막지 않도록 try/except 로 격리.
+        try:
+            await self._emit_new_message_notification(
+                room_id=room_id, sender_id=sender_id, content=content
+            )
+        except Exception as e:
+            logger.error(
+                "[chat_service.send_message] notification emit 실패 (무시): "
+                "room_id=%s sender_id=%s error=%s: %s",
+                room_id,
+                sender_id,
+                type(e).__name__,
+                e,
+            )
+
         return message
+
+    async def _emit_new_message_notification(
+        self,
+        *,
+        room_id: UUID | str,
+        sender_id: UUID | str,
+        content: str,
+    ) -> None:
+        """채팅방 상대방에게 NEW_MESSAGE 알림 emit.
+
+        - chat_rooms 에서 (seller_id, buyer_id) 조회 후 sender_id 가 아닌 쪽이 수신자.
+        - 자기 자신에게는 보내지 않음 (sender_id == receiver_id 면 skip).
+        - body 는 메시지 본문 80자 truncate, title 은 발신자 이름.
+        - link_url 은 수신자 role 기준 (`/buyer/chat?room_id=...` or `/seller/chat?...`).
+
+        notification_service 는 chat_service 를 import 하지 않으므로 순환 안전.
+        notification_service 를 함수 내부에서 import 하여 모듈 로드 순서 의존성도 회피.
+        """
+        from app.services.notification_service import notification_service
+
+        room_id_str = str(room_id)
+        sender_id_str = str(sender_id)
+
+        # 1) 채팅방 조회
+        room_result = await asyncio.to_thread(
+            lambda: self.rooms.select("id, seller_id, buyer_id")
+            .eq("id", room_id_str)
+            .single()
+            .execute()
+        )
+        room = room_result.data
+        if not room:
+            return
+
+        seller_id = str(room.get("seller_id") or "")
+        buyer_id = str(room.get("buyer_id") or "")
+
+        # 2) 수신자 결정 (sender 가 아닌 쪽)
+        if sender_id_str == seller_id:
+            receiver_id = buyer_id
+            receiver_role = "BUYER"
+        elif sender_id_str == buyer_id:
+            receiver_id = seller_id
+            receiver_role = "SELLER"
+        else:
+            # 발신자가 채팅방 참여자가 아닌 비정상 케이스 — skip
+            return
+
+        # 3) 자기 자신 skip
+        if not receiver_id or receiver_id == sender_id_str:
+            return
+
+        # 4) 발신자 이름 조회 (title 용)
+        sender_name = "상대방"
+        try:
+            sender_result = await asyncio.to_thread(
+                lambda: self.client.table("users")
+                .select("name, company_name")
+                .eq("id", sender_id_str)
+                .single()
+                .execute()
+            )
+            sender_data = sender_result.data or {}
+            sender_name = (
+                sender_data.get("name")
+                or sender_data.get("company_name")
+                or "상대방"
+            )
+        except Exception as e:
+            logger.error(
+                "[chat_service._emit_new_message_notification] "
+                "sender 이름 조회 실패 (무시): %s: %s",
+                type(e).__name__,
+                e,
+            )
+
+        # 5) link_url — 수신자 역할 기준 채팅 페이지
+        prefix = "buyer" if receiver_role == "BUYER" else "seller"
+        link_url = f"/{prefix}/chat?room_id={room_id_str}"
+
+        # 6) body — 메시지 80자 truncate (notification_service.emit 도 추가 truncate 안전망)
+        body = content if len(content) <= 80 else content[:77] + "..."
+
+        await notification_service.emit(
+            user_id=receiver_id,
+            notification_type="NEW_MESSAGE",
+            title=sender_name,
+            body=body,
+            link_url=link_url,
+            room_id=room_id_str,
+        )
 
     async def mark_as_read(self, room_id: UUID, user_id: UUID) -> None:
         # soft-deleted 메시지는 읽음 처리 대상에서 제외

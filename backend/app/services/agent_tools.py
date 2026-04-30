@@ -3,12 +3,11 @@ agent_tools.py — LangGraph 오케스트레이터에서 실제로 호출되는 
 
 각 함수는 Supabase DB를 직접 조회/수정하고, 결과를 dict로 반환한다.
 오케스트레이터(orchestrator.py)가 LLM의 tool 선택에 따라 TOOL_FUNCTION_MAP을 통해 실행한다.
-현재 LLM: Groq (meta-llama/llama-4-scout) — Claude API 확보 시 orchestrator.py만 수정하면 됨.
+현재 LLM: OpenAI (gpt-4o-mini)
 """
 
 import asyncio
 import json
-import os
 import random
 from calendar import monthrange
 from datetime import datetime, timezone
@@ -99,7 +98,7 @@ def get_products(seller_id: str, category: Optional[str] = None) -> dict:
             "count": len(result.data or []),
         }
     except Exception as e:
-        # 오류 발생 시 실패 정보를 Claude에게 전달 (함수 자체는 터뜨리지 않음)
+        # 오류 발생 시 실패 정보를 LLM 에 전달 (함수 자체는 터뜨리지 않음)
         return {"success": False, "error": str(e), "products": [], "count": 0}
 
 
@@ -398,7 +397,14 @@ def update_product(
 # ─────────────────────────────────────────────
 
 def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
-    """사용자의 주문 목록을 조회한다. role에 따라 buyer_id / seller_id로 필터링."""
+    """사용자의 주문 목록을 조회한다. role에 따라 buyer_id / seller_id로 필터링.
+
+    응답 평탄화 (LLM 토큰 절약 + 응답 우선순위 정책 — 상품명·거래처명 메인):
+    - buyer_name / buyer_company / seller_name / seller_company
+    - product_summary: "{첫 상품명}" 또는 "{첫 상품명} 외 N건" (items 비면 None)
+    - items_count: order_items 길이
+    임베딩 객체(buyer/seller/order_items)는 응답에서 제거.
+    """
     try:
         supabase = get_supabase_client()
 
@@ -413,7 +419,10 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
             supabase.table("orders")
             .select(
                 "id, order_number, status, total_amount, delivery_date, "
-                "delivery_address, notes, created_at, buyer_id, seller_id"
+                "delivery_address, notes, created_at, buyer_id, seller_id, "
+                "buyer:users!buyer_id(name,company_name), "
+                "seller:users!seller_id(name,company_name), "
+                "order_items(quantity, unit_price, products(name))"
             )
             .eq(id_column, user_id)
         )
@@ -424,26 +433,64 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
 
         result = query.order("created_at", desc=True).limit(20).execute()
 
+        rows = result.data or []
+        flattened: list[dict] = []
+        for row in rows:
+            buyer = row.pop("buyer", None) or {}
+            seller = row.pop("seller", None) or {}
+            items = row.pop("order_items", None) or []
+
+            row["buyer_name"] = buyer.get("name")
+            row["buyer_company"] = buyer.get("company_name")
+            row["seller_name"] = seller.get("name")
+            row["seller_company"] = seller.get("company_name")
+
+            product_names: list[str] = []
+            for item in items:
+                product = item.get("products") if isinstance(item, dict) else None
+                if not product:
+                    continue
+                name = product.get("name")
+                if name:
+                    product_names.append(name)
+
+            if not product_names:
+                row["product_summary"] = None
+            elif len(product_names) == 1:
+                row["product_summary"] = product_names[0]
+            else:
+                row["product_summary"] = f"{product_names[0]} 외 {len(product_names) - 1}건"
+
+            row["items_count"] = len(items)
+            flattened.append(row)
+
         return {
             "success": True,
-            "orders": result.data or [],
-            "count": len(result.data or []),
+            "orders": flattened,
+            "count": len(flattened),
         }
     except Exception as e:
         return {"success": False, "error": str(e), "orders": [], "count": 0}
 
 
 def get_order_detail(order_id: str) -> dict:
-    """주문 상세 정보와 주문 항목(order_items)을 함께 조회한다."""
+    """주문 상세 정보와 주문 항목(order_items)을 함께 조회한다.
+
+    응답 평탄화 (응답 우선순위 정책 — 상품명·거래처명 메인):
+    - order: buyer_name/buyer_company/seller_name/seller_company 추가
+    - items[i]: product_name, product_unit 평탄화
+    """
     try:
         supabase = get_supabase_client()
 
-        # 주문 기본 정보 조회
+        # 주문 기본 정보 + buyer/seller 임베딩
         order_result = (
             supabase.table("orders")
             .select(
                 "id, order_number, status, total_amount, delivery_date, "
-                "delivery_address, notes, created_at, buyer_id, seller_id"
+                "delivery_address, notes, created_at, buyer_id, seller_id, "
+                "buyer:users!buyer_id(name,company_name), "
+                "seller:users!seller_id(name,company_name)"
             )
             .eq("id", order_id)
             .execute()
@@ -452,18 +499,36 @@ def get_order_detail(order_id: str) -> dict:
         if not order_result.data:
             return {"success": False, "error": "해당 주문을 찾을 수 없습니다.", "order": None}
 
-        # 주문 항목 조회 (어떤 상품이 몇 개, 단가가 얼마인지)
+        # 주문 항목 조회 + products(name, unit) 임베딩
         items_result = (
             supabase.table("order_items")
-            .select("id, product_id, quantity, unit_price, subtotal")
+            .select(
+                "id, product_id, quantity, unit_price, subtotal, "
+                "products(name, unit)"
+            )
             .eq("order_id", order_id)
             .execute()
         )
 
-        # 주문 정보에 항목 리스트를 합쳐서 반환
         order_data = order_result.data[0]
-        order_data["items"] = items_result.data or []
-        order_data["items_count"] = len(items_result.data or [])
+
+        buyer = order_data.pop("buyer", None) or {}
+        seller = order_data.pop("seller", None) or {}
+        order_data["buyer_name"] = buyer.get("name")
+        order_data["buyer_company"] = buyer.get("company_name")
+        order_data["seller_name"] = seller.get("name")
+        order_data["seller_company"] = seller.get("company_name")
+
+        items_raw = items_result.data or []
+        flat_items: list[dict] = []
+        for item in items_raw:
+            product = item.pop("products", None) or {}
+            item["product_name"] = product.get("name")
+            item["product_unit"] = product.get("unit")
+            flat_items.append(item)
+
+        order_data["items"] = flat_items
+        order_data["items_count"] = len(flat_items)
 
         return {"success": True, "order": order_data}
     except Exception as e:
@@ -844,6 +909,12 @@ def get_calendar_events(user_id: str, year: int, month: int) -> dict:
     """해당 월의 캘린더 일정을 조회한다.
     날짜 범위: YYYY-MM-01 ~ YYYY-MM-{말일}
     deleted_at IS NULL 조건 적용 (BUG-1 패턴: .is_("deleted_at", None) 사용)
+
+    응답 평탄화 (응답 우선순위 정책 — 상품명·거래처명·날짜·상태 메인):
+    - product_name: 첫 활성 상품명 또는 "{첫 상품명} 외 N건"
+    - order_number, order_status
+    - buyer_name, buyer_company, seller_name, seller_company
+    임베딩 객체(orders 등)는 응답에서 제거 — LLM 토큰 낭비 방지.
     반환: {success, events, count}
     """
     try:
@@ -855,7 +926,13 @@ def get_calendar_events(user_id: str, year: int, month: int) -> dict:
 
         result = (
             supabase.table("calendar_events")
-            .select("id, title, event_type, event_date, description, order_id, created_at")
+            .select(
+                "id, title, event_type, event_date, description, order_id, created_at, "
+                "orders(order_number, status, "
+                "buyer:users!buyer_id(name,company_name), "
+                "seller:users!seller_id(name,company_name), "
+                "order_items(quantity, unit, products(name)))"
+            )
             .eq("user_id", user_id)
             .gte("event_date", date_from)
             .lte("event_date", date_to)
@@ -864,10 +941,52 @@ def get_calendar_events(user_id: str, year: int, month: int) -> dict:
             .execute()
         )
 
+        rows = result.data or []
+        flattened: list[dict] = []
+        for row in rows:
+            order_payload = row.pop("orders", None)
+
+            # 기본값
+            row["order_number"] = None
+            row["order_status"] = None
+            row["product_name"] = None
+            row["buyer_name"] = None
+            row["buyer_company"] = None
+            row["seller_name"] = None
+            row["seller_company"] = None
+
+            if isinstance(order_payload, dict):
+                row["order_number"] = order_payload.get("order_number")
+                row["order_status"] = order_payload.get("status")
+
+                buyer = order_payload.get("buyer") or {}
+                seller = order_payload.get("seller") or {}
+                row["buyer_name"] = buyer.get("name")
+                row["buyer_company"] = buyer.get("company_name")
+                row["seller_name"] = seller.get("name")
+                row["seller_company"] = seller.get("company_name")
+
+                items = order_payload.get("order_items") or []
+                product_names: list[str] = []
+                for item in items:
+                    product = item.get("products") if isinstance(item, dict) else None
+                    if not product:
+                        continue
+                    name = product.get("name")
+                    if name:
+                        product_names.append(name)
+                if product_names:
+                    if len(product_names) == 1:
+                        row["product_name"] = product_names[0]
+                    else:
+                        row["product_name"] = f"{product_names[0]} 외 {len(product_names) - 1}건"
+
+            flattened.append(row)
+
         return {
             "success": True,
-            "events": result.data or [],
-            "count": len(result.data or []),
+            "events": flattened,
+            "count": len(flattened),
         }
     except Exception as e:
         return {"success": False, "error": str(e), "events": [], "count": 0}
@@ -1261,11 +1380,11 @@ def analyze_chat_consensus(
     }
     """
     import copy
+    from app.core.config import settings
     fallback = copy.deepcopy(_CONSENSUS_FALLBACK)
 
     try:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
+        if not settings.OPENAI_API_KEY:
             return fallback
 
         supabase = get_supabase_client()
@@ -1320,8 +1439,8 @@ def analyze_chat_consensus(
         conversation_text = "\n".join(lines)
 
         # 4. OpenAI 동기 클라이언트로 분석 (response_format=json_object)
-        import openai  # type: ignore
-        client = openai.OpenAI(api_key=api_key)
+        from app.core.llm import get_openai_sync_client
+        client = get_openai_sync_client()
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1360,7 +1479,7 @@ def analyze_chat_consensus(
 # tool 이름 → 함수 매핑 테이블
 # ─────────────────────────────────────────────
 
-# 오케스트레이터가 Claude의 tool_use 응답에서 tool 이름을 보고
+# 오케스트레이터가 LLM 의 tool_use 응답에서 tool 이름을 보고
 # 실제 어떤 함수를 실행할지 찾을 때 이 딕셔너리를 사용한다.
 TOOL_FUNCTION_MAP = {
     "get_products": get_products,

@@ -163,6 +163,8 @@ export function useAcceptSubscription() {
 
 /**
  * V1.6 — PENDING 정기배송 거절. status='REJECTED' 로 전환.
+ * 백엔드 reject_subscription 가 _cleanup_subscription_future_events 를 호출하여
+ * 미래 calendar_events 가 soft-delete 되므로 calendar 캐시도 invalidate 해야 stale 표시 방지.
  */
 export function useRejectSubscription() {
   const qc = useQueryClient();
@@ -175,6 +177,7 @@ export function useRejectSubscription() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['subscriptions'] });
       qc.invalidateQueries({ queryKey: ['partner-stats'] });
+      qc.invalidateQueries({ queryKey: ['calendar'] });
     },
   });
 }

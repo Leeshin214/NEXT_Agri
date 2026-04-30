@@ -2,7 +2,7 @@ import asyncio
 import json
 from calendar import monthrange
 
-from app.core.config import settings
+from app.core.llm import get_openai_client
 from app.core.supabase import get_supabase_client
 from app.schemas.schedule_agent import ScheduleRecommendResponse, ScheduleRecommendation
 
@@ -232,9 +232,7 @@ class ScheduleAgentService:
 
         # 3. OpenAI 호출
         try:
-            from openai import AsyncOpenAI
-
-            client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            client = get_openai_client()
             system_prompt = self._build_system_prompt(role, company_name)
             user_message = self._build_user_message(context, year, month)
 

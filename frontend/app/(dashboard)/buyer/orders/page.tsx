@@ -2,11 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { MessageCircle, PackageCheck, Plus } from 'lucide-react';
+import { MessageCircle, PackageCheck, Plus, X } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
+import NextDeliveryLabel from '@/components/subscriptions/NextDeliveryLabel';
 import DataTable, { type Column } from '@/components/common/DataTable';
 import StatusBadge from '@/components/common/StatusBadge';
 import NegotiationHistory from '@/components/common/NegotiationHistory';
+import DeliveryDateChangeSection from '@/components/common/DeliveryDateChangeSection';
 import CancelOrderModal from '@/components/common/CancelOrderModal';
 import CreateOrderModal from '@/components/buyer/CreateOrderModal';
 import EditOrderModal from '@/components/buyer/EditOrderModal';
@@ -128,10 +130,16 @@ export default function BuyerOrdersPage() {
   const isSubTab = !!activeTabDef?.isSubscription;
   const activeStatuses = activeTabDef?.statuses ?? [];
 
+  // PM Report #8 작업 5 (V1.7) — 거래처 페이지의 "최근 거래" 컬럼이
+  // /buyer/orders?partner_user_id=<uuid> 로 진입하면 해당 거래처 주문만 필터링
+  // (정기배송 탭에는 적용하지 않음 — 정기배송은 useSubscriptions 별도 흐름)
+  const partnerFilter = searchParams.get('partner_user_id') || undefined;
+
   // 일반 주문: 탭별로 백엔드에서 status_in 다중 필터로 받아옴
   // 정기배송 탭이면 useOrders 비활성 (status_in: [])
   const { data: listData, isLoading } = useOrders({
     status_in: isSubTab ? [] : activeStatuses,
+    partner_user_id: isSubTab ? undefined : partnerFilter,
     limit: 2000,
   });
   const filteredOrders = isSubTab ? [] : listData?.data ?? [];
@@ -141,8 +149,19 @@ export default function BuyerOrdersPage() {
   const allSubs: Subscription[] = isSubTab ? subsData.data?.data ?? [] : [];
 
   // 정기배송 탭의 거래처 매핑 — 행 클릭 시 PartnerDetailModal 오픈용
+  // (last_trade 필드는 여기서 불필요하므로 include_last_trade 미지정 → 기본 false)
   const partnersData = usePartners();
   const partners: Partner[] = partnersData.data?.data ?? [];
+
+  // partner_user_id 필터 활성 시 chip 에 표시할 거래처 이름 lookup
+  const filteredPartner = partnerFilter
+    ? partners.find((p) => p.partner_user_id === partnerFilter)
+    : null;
+  const filteredPartnerLabel =
+    filteredPartner?.nickname ||
+    filteredPartner?.partner_company ||
+    filteredPartner?.partner_name ||
+    '특정 거래처';
 
   // 상세는 별도 쿼리로 - 액션 직후 자동 refetch 위해
   const { data: detailData } = useOrder(selectedOrderId ?? '');
@@ -178,12 +197,18 @@ export default function BuyerOrdersPage() {
     if (idParam) setSelectedOrderId(idParam);
   }, [searchParams]);
 
-  const handleOpenChat = async () => {
-    if (!selectedOrder) return;
+  /**
+   * 주어진 주문에 대한 채팅방을 생성/조회 후 채팅 페이지로 이동.
+   * - 인자가 없으면 selectedOrder 기준 (상세 패널 "채팅으로 대화" 버튼)
+   * - 인자가 있으면 그 주문 기준 (목록 행 빠른 액션 버튼)
+   */
+  const handleOpenChat = async (order?: Order) => {
+    const target = order ?? selectedOrder;
+    if (!target) return;
     try {
       const res = await createChatRoom.mutateAsync({
-        partner_user_id: selectedOrder.seller_id,
-        order_id: selectedOrder.id,
+        partner_user_id: target.seller_id,
+        order_id: target.id,
       });
       router.push(`/buyer/chat?room_id=${res.data.id}`);
     } catch (e) {
@@ -277,6 +302,31 @@ export default function BuyerOrdersPage() {
       header: '상태',
       render: (item) => <StatusBadge status={item.status} />,
     },
+    {
+      key: 'actions',
+      header: '',
+      className: 'text-right',
+      render: (item) => {
+        if (item.status === 'CANCELLED') return null;
+        return (
+          <div className="flex items-center justify-end gap-1.5">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleOpenChat(item);
+              }}
+              disabled={createChatRoom.isPending}
+              title="채팅으로 이동"
+              aria-label="채팅으로 이동"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 bg-white text-primary-600 hover:bg-primary-50 disabled:opacity-50"
+            >
+              <MessageCircle className="h-4 w-4" />
+            </button>
+          </div>
+        );
+      },
+    },
   ];
 
   // 정기배송 탭 컬럼 정의
@@ -325,9 +375,12 @@ export default function BuyerOrdersPage() {
       key: 'next',
       header: '다음 배송일',
       render: (sub) => (
-        <span className="text-sm text-gray-700">
-          {formatDate(sub.next_delivery_date)}
-        </span>
+        <NextDeliveryLabel
+          date={sub.next_delivery_date}
+          calendarHref={`/buyer/calendar?date=${sub.next_delivery_date}`}
+          prefix=""
+          className="text-sm"
+        />
       ),
     },
     {
@@ -461,6 +514,22 @@ export default function BuyerOrdersPage() {
           );
         })}
       </div>
+
+      {/* PM Report #8 작업 5 — 활성 거래처 필터 chip (정기배송 탭에서는 미노출) */}
+      {!isSubTab && partnerFilter && (
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-xs text-gray-500">필터:</span>
+          <button
+            type="button"
+            onClick={() => router.push('/buyer/orders')}
+            className="inline-flex items-center gap-1 rounded-full bg-primary-50 px-3 py-1 text-xs text-primary-700 hover:bg-primary-100"
+            title="필터 해제"
+          >
+            거래처: {filteredPartnerLabel}
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
 
       {isSubTab ? (
         // 정기배송 탭
@@ -637,6 +706,13 @@ export default function BuyerOrdersPage() {
                 orderId={selectedOrder.id}
                 orderStatus={selectedOrder.status}
               />
+
+              {/* 납품일 변경 — 협상 이력 바로 아래 */}
+              <DeliveryDateChangeSection
+                orderId={selectedOrder.id}
+                orderStatus={selectedOrder.status}
+                currentDeliveryDate={selectedOrder.delivery_date}
+              />
             </div>
 
             {/* 액션 버튼 영역 */}
@@ -649,7 +725,7 @@ export default function BuyerOrdersPage() {
               <div className="flex flex-wrap gap-2">
                 {selectedOrder.status !== 'CANCELLED' && (
                   <button
-                    onClick={handleOpenChat}
+                    onClick={() => handleOpenChat()}
                     disabled={createChatRoom.isPending}
                     className="inline-flex items-center gap-1 rounded-lg border border-primary-600 bg-white px-3 py-2 text-xs font-medium text-primary-700 hover:bg-primary-50 disabled:opacity-50"
                   >

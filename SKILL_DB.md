@@ -144,21 +144,28 @@ CREATE TABLE order_items (
 ### calendar_events 테이블
 ```sql
 CREATE TABLE calendar_events (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id     UUID NOT NULL REFERENCES users(id),
-  order_id    UUID REFERENCES orders(id),
-  title       TEXT NOT NULL,
-  event_type  TEXT NOT NULL CHECK (event_type IN (
-                'SHIPMENT', 'DELIVERY', 'MEETING', 'QUOTE_DEADLINE', 'ORDER', 'OTHER'
-              )),
-  event_date  DATE NOT NULL,
-  start_time  TIME,
-  end_time    TIME,
-  description TEXT,
-  is_allday   BOOLEAN DEFAULT true,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id         UUID NOT NULL REFERENCES users(id),
+  order_id        UUID REFERENCES orders(id),
+  -- 정기배송 자동 등록 일정 식별 (2026-04-28 추가, 마이그레이션 20260428000003)
+  subscription_id UUID REFERENCES subscriptions(id) ON DELETE SET NULL,
+  title           TEXT NOT NULL,
+  event_type      TEXT NOT NULL CHECK (event_type IN (
+                    'SHIPMENT', 'DELIVERY', 'MEETING', 'QUOTE_DEADLINE', 'ORDER', 'OTHER'
+                  )),
+  event_date      DATE NOT NULL,
+  start_time      TIME,
+  end_time        TIME,
+  description     TEXT,
+  is_allday       BOOLEAN DEFAULT true,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at      TIMESTAMPTZ
 );
+-- 정기배송-유저-날짜 활성 행 1개 보장
+CREATE UNIQUE INDEX uniq_calendar_events_active_subscription_user_date
+  ON calendar_events (subscription_id, user_id, event_date)
+  WHERE subscription_id IS NOT NULL AND deleted_at IS NULL;
 ```
 
 ### chat_rooms 테이블
@@ -218,6 +225,36 @@ CREATE INDEX idx_messages_room_type ON messages(room_id, message_type);
 // SYSTEM (견적 요청 알림 등)
 { order_id: UUID, order_number: str, total_amount: int? }
 ```
+
+### notifications 테이블 — 우상단 종 아이콘 알림 (2026-04-29)
+```sql
+CREATE TABLE notifications (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  type       TEXT NOT NULL CHECK (type IN (
+                'NEW_MESSAGE',
+                'COUNTER_OFFER', 'OFFER_ACCEPTED', 'OFFER_REJECTED',
+                'DELIVERY_DATE_CHANGE', 'DELIVERY_DATE_ACCEPTED', 'DELIVERY_DATE_REJECTED',
+                'ORDER_STATUS')),
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  link_url   TEXT,
+  order_id   UUID REFERENCES orders(id)     ON DELETE SET NULL,
+  room_id    UUID REFERENCES chat_rooms(id) ON DELETE SET NULL,
+  is_read    BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  read_at    TIMESTAMPTZ
+);
+CREATE INDEX idx_notifications_user_unread
+  ON notifications(user_id, created_at DESC) WHERE is_read = false;
+CREATE INDEX idx_notifications_user_recent
+  ON notifications(user_id, created_at DESC);
+```
+- RLS: SELECT/UPDATE 본인만 (`user_id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())`).
+  INSERT 정책 없음 → service_role 만 INSERT (서버 emit 전용).
+- Supabase Realtime publication 등록 (`ALTER PUBLICATION supabase_realtime ADD TABLE notifications;`).
+- 마이그레이션: `supabase/migrations/20260429000002_create_notifications.sql`.
+- `deleted_at` 미보유 — 일반적으로 알림은 일시 보존 (TTL 정책 추가 시 별도 처리).
 
 ### ai_conversations 테이블 (AI 대화 히스토리)
 ```sql
@@ -507,6 +544,30 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 
 - **partners.status — V1 즐겨찾기 모델 (Option A): 등록 즉시 ACTIVE 고정 (2026-04-27)**: `partners` 테이블 status 컬럼의 SQL DEFAULT 는 `'ACTIVE'` (`20260321000003_create_partners.sql`) 이며, V1 에서는 양방향 승인(PENDING → ACTIVE) 플로우를 구현하지 않고 즐겨찾기 모델로 단순화한다. `partner_service.create_partner` 는 INSERT payload 에 `"status": "ACTIVE"` 를 명시적으로 박아 전달한다 (DB default 와 동일하지만, 미래에 default 가 바뀌어도 V1 정책이 깨지지 않도록 방어). `PartnerCreate` schema 는 `status` 필드를 받지 않아 클라이언트가 PENDING 으로 등록할 수 없다. 단, PATCH `/partners/{id}` 는 `PartnerUpdate.status: Optional[str]` 로 사용자가 직접 INACTIVE 등으로 전이 가능 — 이는 즐겨찾기 해제/거래 종료 의미. 추후 양방향 승인 모델 도입 시 `PartnerStatus` enum 의 `PENDING` 을 그대로 재사용할 수 있도록 enum 자체는 유지(`ACTIVE`/`INACTIVE`/`PENDING` 3종 보존).
 
+- **partners 양방향 동기화 — create/accept/reject/delete 모두 두 row 처리 (V1.6, 2026-04-28 delete 버그 수정)**: V1.6 양방향 승인 모델에서는 거래 관계 1건 = 본인 row(`user_id=A, partner_user_id=B`) + 반대편 row(`user_id=B, partner_user_id=A`) 두 row 가 항상 짝으로 존재한다. 이 때문에 status/soft-delete 를 변경하는 모든 서비스 메서드는 양쪽을 함께 처리해야 한다. 단방향만 처리하면 상대방 거래처 목록에서 비대칭 상태로 보이는 정합성 버그가 발생한다 (예: 본인은 삭제했는데 상대 화면에선 ACTIVE 로 계속 보임).
+  ```python
+  # _find_counterpart_row 헬퍼 — partner_service.py
+  async def _find_counterpart_row(self, *, my_user_id: str, partner_user_id: str) -> Optional[dict]:
+      result = await asyncio.to_thread(
+          lambda: self.table.select("*")
+          .eq("user_id", partner_user_id)        # 반대편의 user_id = 본인의 partner_user_id
+          .eq("partner_user_id", my_user_id)     # 반대편의 partner_user_id = 본인의 user_id
+          .is_("deleted_at", None)
+          .limit(1).execute()
+      )
+      return result.data[0] if result.data else None
+
+  # delete_partner — 본인 + 반대편 모두 soft-delete (호출 시그니처는 키워드)
+  counterpart = await self._find_counterpart_row(
+      my_user_id=user_id_str,
+      partner_user_id=partner_user_id_str,
+  )
+  ```
+  - 호출 시그니처는 항상 키워드 인자(`my_user_id=`, `partner_user_id=`) — `accept_partner` / `reject_partner` / `delete_partner` 모두 동일.
+  - 본인 row 처리는 strict (없으면 404), 반대편 row 처리는 best-effort (try/except + 로그) — 마이그레이션 전 단방향 데이터나 이미 정리된 row 가 있을 수 있음.
+  - 멱등성: 본인 row 조회/UPDATE 모두 `.is_("deleted_at", None)` 필터를 거치므로 같은 partner_id 로 두 번째 호출하면 404 반환. 반대편도 마찬가지로 두 번째 호출에서는 `_find_counterpart_row` 가 None 을 반환해 자동 스킵.
+  - return 타입은 기존과 동일 (`bool` for delete, `dict` for accept, `bool` for reject) → router 코드 변경 없음.
+
 - **subscriptions / subscription_items 정합성 — RLS 컨벤션 통일 (2026-04-28)**: 새 마이그레이션의 RLS 정책은 반드시 기존 프로젝트 컨벤션 `id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())` 패턴을 따라야 한다. 외부 명세에 `auth.uid() = buyer_id` 형태가 있더라도 그대로 적용하면 안 된다 — Supabase Auth 의 `auth.uid()` 는 `users.supabase_uid` 이지 `users.id` 가 아니므로 비교가 항상 false 가 되어 모든 SELECT/INSERT/UPDATE 가 차단된다. 백엔드가 service_role 키로 접근하므로 RLS 우회되어 평소엔 문제 없지만, 미래에 anon 키 직접 접근 / Edge Functions / Realtime subscribe 시점에 폭발한다. 적용 위치:
   - `subscriptions_participant_select/insert/update`
   - `subscription_items_participant_select/insert/update/delete`
@@ -514,3 +575,100 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 - **soft delete 컬럼 보유 테이블 갱신 (2026-04-28 마이그레이션 후)**: 운영 Supabase 기준 `deleted_at` 컬럼 보유 테이블 = `users, products, partners, orders, calendar_events, messages, subscriptions` (7개). `deleted_at` 미보유 = `order_items, chat_rooms, ai_conversations, subscription_items, negotiation_history`. subscription_items 는 부모 subscriptions 의 soft delete + ON DELETE CASCADE FK 로 간접 관리되어 자체 deleted_at 컬럼 불필요.
 
 - **subscriptions.next_delivery_date 계산 정책 (2026-04-28)**: 첫 회차의 `next_delivery_date` 는 `start_date` 와 동일하게 시작 (즉 최초 INSERT 시점에 `next_delivery_date = start_date`). `generate_order_for_round` 호출 시 주문 생성 후 `compute_next_date` 로 다음 회차 갱신. PAUSED → ACTIVE 전환 시 `update_subscription` 안에서 오늘 이후가 될 때까지 `compute_next_date` 를 반복 호출해 재계산 (max 520회 = 약 10년치 주간 회차로 무한 루프 차단). MONTHLY 의 1/31 → 2/28 clamp 도 `calendar.monthrange()` 로 처리 — 검증 완료.
+
+- **calendar_events ↔ subscriptions 자동 동기화 (2026-04-28, 마이그레이션 20260428000003)**: 정기배송 등록·수락 시 첫 배송일이 양 당사자 캘린더에 자동 등록되도록 `calendar_events.subscription_id UUID REFERENCES subscriptions(id) ON DELETE SET NULL` 컬럼 추가. 한 정기배송 = 양 당사자 각 1건씩 두 row (seller=`SHIPMENT`, buyer=`DELIVERY`, `order_id IS NULL`). 멱등성 보장은 partial unique index `uniq_calendar_events_active_subscription_user_date ON (subscription_id, user_id, event_date) WHERE subscription_id IS NOT NULL AND deleted_at IS NULL` 로 처리. 기존 `uniq_calendar_events_active_order_user_date` 는 `WHERE order_id IS NOT NULL` 조건이라 두 인덱스가 독립적으로 공존한다.
+  - **호출 시점**: `subscription_service.accept_subscription` (PENDING→ACTIVE INSERT), `update_subscription` (frequency/next_delivery_date 변경 시 UPDATE; CANCELLED/ENDED/PAUSED/REJECTED 시 cleanup), `delete_subscription` (미래 일정 cleanup), `generate_order_for_round` (다음 회차로 UPSERT — 회차 주문 자체의 order-linked 일정은 별도로 INSERT 됨).
+  - **상태별 동작**: `status='ACTIVE'` 만 캘린더 INSERT/UPDATE. `PENDING`/`PAUSED`/`CANCELLED`/`ENDED`/`REJECTED` 는 `_cleanup_subscription_future_events` 로 미래 일정만 soft-delete (event_date >= today; 이미 회차 주문이 생성된 과거 일정은 이력 보존).
+  - **백필 미수행**: 마이그레이션 20260428000003 은 컬럼/인덱스만 추가하고 기존 ACTIVE 정기배송에 대한 backfill 은 수행하지 않는다. 신규 mutation 부터만 동기화. 운영 데이터 양이 적고 사용자 수동 등록 일정과 중복 가능성 때문 — 필요 시 별도 운영 스크립트로 후처리.
+  - **응답 스키마**: `CalendarEventResponse.subscription_id: Optional[UUID]` 필드를 추가해 프론트가 정기배송 일정과 일반 일정을 구분할 수 있도록 노출.
+
+- **PostgREST 다건 양방향 N+1 회피 — IN 절 + 메모리 그룹핑 (2026-04-28, PartnerResponse.last_trade_*)**: `partners` 목록 응답에 거래처별 "최근 거래 1건" 을 붙일 때, partner 마다 orders 를 1번씩 조회하면 N+1. PostgREST 는 `DISTINCT ON` 을 지원하지 않으므로 다음 패턴이 검증된 최선책:
+  ```python
+  # 1) counterpart_ids 수집 (set 으로 중복 제거)
+  counterpart_ids = {str(p["partner_user_id"]) for p in partners}
+  in_clause = f"({','.join(counterpart_ids)})"  # UUID 는 안전 문자만 포함, 따옴표 불필요
+
+  # 2) 단일 양방향 쿼리 — me ↔ counterparts (created_at DESC)
+  result = await asyncio.to_thread(lambda: client.table("orders")
+      .select("id, buyer_id, seller_id, total_amount, delivery_date, created_at, status")
+      .is_("deleted_at", None)
+      .neq("status", "CANCELLED")
+      .or_(
+          f"and(buyer_id.eq.{my_user_id},seller_id.in.{in_clause}),"
+          f"and(seller_id.eq.{my_user_id},buyer_id.in.{in_clause})"
+      )
+      .order("created_at", desc=True)
+      .execute()
+  )
+
+  # 3) 메모리에서 counterpart_id 별 첫 row 만 픽업 (이미 DESC 정렬됨)
+  latest_by_counterpart: dict[str, dict] = {}
+  for o in result.data or []:
+      counterpart = o["seller_id"] if o["buyer_id"] == my_user_id else o["buyer_id"]
+      if counterpart not in latest_by_counterpart:
+          latest_by_counterpart[counterpart] = o
+  ```
+  - `get_stats` 의 단건 양방향 패턴 (단일 partner 대상) 을 다건으로 확장한 형태.
+  - PostgREST `in.(...)` 문법 — UUID/숫자처럼 안전 문자만 들어가는 컬럼이면 따옴표 없이 OK. 문자열·검색어를 IN 으로 넣을 때는 PostgREST 의 `or_` PEG 파서가 깨질 수 있어 escape 필요.
+  - partners 1페이지 (limit 20) × 평균 N 건 주문 = 단일 쿼리 1회로 끝. counterpart 가 비어있으면 쿼리 자체를 스킵.
+  - `or_()` 안의 `and(buyer_id.eq.X,seller_id.in.(...))` — PostgREST 는 한 줄 안에 `and(...)` 와 `in.(...)` 를 함께 쓸 수 있지만 인용/공백에 민감. PEP 끊어쓰기 금지.
+
+- **created_at (UTC TIMESTAMPTZ) → KST 날짜 변환 헬퍼 (검증됨, 2026-04-28)**: Supabase 에서 받은 `created_at` 은 보통 ISO 문자열 (`2026-04-28T05:30:00+00:00` 또는 `Z` suffix). KST 날짜 (YYYY-MM-DD) 가 필요할 때 단순 `[:10]` slice 는 자정 부근에서 하루 어긋난다. `Asia/Seoul = UTC+9` 고정 (DST 없음) 이라 `timezone(timedelta(hours=9))` 상수로 충분.
+  ```python
+  _KST = timezone(timedelta(hours=9))
+
+  @staticmethod
+  def _created_at_to_kst_date_str(created_at) -> Optional[str]:
+      if not created_at:
+          return None
+      try:
+          if isinstance(created_at, str):
+              dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+          else:
+              dt = created_at
+          if dt.tzinfo is None:
+              dt = dt.replace(tzinfo=timezone.utc)
+          return dt.astimezone(_KST).date().isoformat()
+      except Exception:
+          return str(created_at)[:10] if created_at else None
+  ```
+  - `Z` suffix 처리 필수 — Python `datetime.fromisoformat` 은 3.11+ 부터만 `Z` 직접 파싱 지원. `replace("Z", "+00:00")` 가 안전하다.
+  - `delivery_date` 같은 DATE 컬럼은 timezone 불필요 — 그대로 `[:10]` slice.
+
+- **service-role-only INSERT 테이블 패턴 (notifications, 2026-04-29)**: 서버 내부에서만 emit 하고 클라이언트 직접 INSERT 를 차단하려면 RLS 에서 INSERT 정책 자체를 정의하지 않으면 된다 (SELECT/UPDATE 만 정의). PostgreSQL 의 RLS 는 화이트리스트 모델이라 정책이 없으면 anon/authenticated 는 INSERT 불가, service_role 은 RLS 우회로 INSERT 가능. notifications 테이블이 이 패턴의 첫 적용 사례 — 알림 INSERT 는 항상 백엔드 서비스(`notification_service.emit`)를 거치고 외부 노출 엔드포인트(`POST /notifications`) 를 두지 않는다. SELECT 는 본인만 (`user_id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())`), UPDATE 도 동일.
+
+- **soft delete 컬럼 보유 테이블 갱신 (2026-04-29)**: `deleted_at` 보유 = `users, products, partners, orders, calendar_events, messages, subscriptions` (7개). `deleted_at` 미보유 = `order_items, chat_rooms, ai_conversations, subscription_items, negotiation_history, delivery_date_change_history, notifications`. 알림은 일시성 데이터라 soft delete 미적용 — 향후 TTL/archive 정책 추가 시 재검토.
+
+- **supabase-py 2.x `update().execute()` representation 응답 비신뢰 패턴 (2026-04-29 notification 읽음 처리 버그 수정)**: supabase-py 2.11.0 의 `client.table(...).update(...).execute()` 는 UPDATE 가 실제로 성공해도 `result.data == []` 로 빈 배열을 반환하는 케이스가 있다 (representation 헤더 누락 / RLS 의 SELECT-after-UPDATE 단계 차단 / 일부 응답 경로). service_role 키 호출이라 RLS 자체는 우회되지만, 클라이언트 라이브러리 내부에서 representation 이 빠질 수 있어 `len(result.data)` 또는 `result.data[0]` 으로 성공 판단을 하면 안 된다. 검증된 회피 패턴:
+  ```python
+  # 단건 UPDATE — pre-select 로 존재/권한 확인 → UPDATE → 재조회 (3 step)
+  pre = await asyncio.to_thread(
+      lambda: self.table.select("id")
+      .eq("id", nid_str).eq("user_id", user_id_str).limit(1).execute()
+  )
+  if not (pre.data or []):
+      return {}                      # 라우터가 404 처리
+  await asyncio.to_thread(
+      lambda: self.table.update({...}).eq("id", nid_str).eq("user_id", user_id_str).execute()
+  )
+  after = await asyncio.to_thread(
+      lambda: self.table.select("*")
+      .eq("id", nid_str).eq("user_id", user_id_str).limit(1).execute()
+  )
+  return after.data[0] if after.data else {}
+
+  # 다건 UPDATE — pre-count 로 affected row 수 측정 → UPDATE → count 반환
+  pre = await asyncio.to_thread(
+      lambda: self.table.select("id", count="exact")
+      .eq("user_id", ...).eq("is_read", False).execute()
+  )
+  pending = pre.count or 0
+  if pending == 0: return 0
+  await asyncio.to_thread(
+      lambda: self.table.update({...}).eq("user_id", ...).eq("is_read", False).execute()
+  )
+  return pending
+  ```
+  - 적용 위치: `notification_service.mark_read` / `mark_all_read`. 동일 함정이 있는 다른 서비스(예: 향후 partners/orders 의 단순 UPDATE 응답을 신뢰하는 코드)도 같은 패턴으로 보강 가능.
+  - 비용: round-trip 1~2회 추가. 알림 읽음 같은 저빈도/단건 mutation 이라 무시 가능. 고빈도 경로(메시지 일괄 읽음 등)에서는 RPC SECURITY DEFINER 함수로 1 round-trip 처리 권장.
+  - 증상 진단: 프론트에서 mutation 후 invalidate 해도 UI 가 갱신되지 않고, DB 직접 확인 시 데이터는 갱신되어 있으면 거의 이 함정이다.

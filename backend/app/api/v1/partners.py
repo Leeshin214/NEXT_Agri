@@ -20,6 +20,7 @@ router = APIRouter(prefix="/partners", tags=["partners"])
 async def list_partners(
     partner_status: Optional[str] = None,
     search: Optional[str] = None,
+    include_last_trade: bool = False,
     page: int = 1,
     limit: int = 20,
     current_user: dict = Depends(get_current_user),
@@ -31,11 +32,19 @@ async def list_partners(
       - status='PENDING_OUTGOING' : 본인이 보낸 요청 (수락 대기)
       - status='PENDING_INCOMING' : 받은 요청 (본인이 수락/거절 가능)
       - status='INACTIVE'         : 거래 종료
+
+    include_last_trade (PM Report #8 작업 5 — 2026-04-28):
+      - True  : 각 거래처의 last_trade_date / last_trade_amount 를 채워 반환.
+                거래처 페이지 "최근 거래" 컬럼 같이 실제로 필요한 화면에서만 사용.
+      - False (default): 두 필드 None 유지 — orders 추가 쿼리 발생 안 함.
+                매핑/검색용 호출 (members, orders 페이지의 partner_user_id→partner.id 맵 등)
+                에서 불필요한 N+1성 비용 차단.
     """
     data, meta = await partner_service.list_partners(
         user_id=current_user["id"],
         status=partner_status,
         search=search,
+        include_last_trade=include_last_trade,
         page=page,
         limit=limit,
     )

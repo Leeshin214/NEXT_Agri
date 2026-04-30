@@ -30,7 +30,11 @@ export type MessageType =
   | 'OFFER_ACCEPTED'
   | 'OFFER_REJECTED'
   | 'ORDER_STATUS'
-  | 'ORDER_CANCELLED';
+  | 'ORDER_CANCELLED'
+  // 납품일 변경 요청·승인 (2026-04-29 추가)
+  | 'DELIVERY_DATE_CHANGE'
+  | 'DELIVERY_DATE_ACCEPTED'
+  | 'DELIVERY_DATE_REJECTED';
 
 /**
  * 메시지의 metadata 필드는 message_type 별로 형태가 다르다.
@@ -56,6 +60,15 @@ export interface MessageMetadata {
   // ORDER_CANCELLED
   reason?: string;
   cancelled_by?: string;
+  // DELIVERY_DATE_CHANGE / DELIVERY_DATE_ACCEPTED / DELIVERY_DATE_REJECTED (2026-04-29)
+  // 백엔드 _emit_chat_event broadcast 와 동기화.
+  change_id?: string;
+  /** YYYY-MM-DD — DELIVERY_DATE_CHANGE / DELIVERY_DATE_REJECTED */
+  proposed_delivery_date?: string;
+  /** YYYY-MM-DD — DELIVERY_DATE_ACCEPTED 시 확정된 날짜 */
+  accepted_delivery_date?: string;
+  /** YYYY-MM-DD — DELIVERY_DATE_CHANGE 직전 orders.delivery_date (참고용) */
+  previous_delivery_date?: string;
   // 향후 확장 필드
   [key: string]: unknown;
 }

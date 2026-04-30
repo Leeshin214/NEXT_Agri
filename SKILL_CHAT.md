@@ -391,7 +391,7 @@ async def send_private_message(self, user_id, message):
 - `consensus_handled=True` AND 60s < elapsed ≤ 1800s: True (signature 비교는 `_handle_consensus` 가 담당 → 같은 거래는 거기서 skip, 다른 거래는 처리)
 - elapsed > 1800s: 일반 status 분기 (general 60s, negotiating 10s, consensus/rejected 항상 True)
 
-`last_analysis` 는 `cachetools.TTLCache(maxsize=10000, ttl=3600)` 사용 (메모리 누수 방지). cachetools 미설치 시 일반 dict로 fallback.
+`last_analysis` 는 `cachetools.TTLCache(maxsize=10000, ttl=3600)` 사용 (메모리 누수 방지). `cachetools>=5.3.0` 는 `backend/requirements.txt` 의 정식 의존성 — 운영에서 dict fallback 으로 떨어지지 않도록 venv 에 설치 필수 (2026-04-29 검증). `chat_ws.py` 의 try/except ImportError fallback 은 dev 환경 안전망으로 유지하되, 운영 startup 로그에 `[WS] cachetools 미설치` 가 보이면 venv 에 미설치된 상태이니 `pip install -r requirements.txt` 재실행 필요.
 
 ```python
 # C-3 낙관적 락 패턴 (chat_ws.py)
@@ -689,9 +689,23 @@ const handleAccept = () => {
 - 상품명 첫 항목 + "외 N건"
 - StatusBadge
 - 주문번호 + 총액
+- 우측 "이력" 토글 버튼 → 펼치면 `<NegotiationHistory orderId={...} />` (`components/chat/NegotiationHistory.tsx`) 협상 이력 타임라인 노출
 - 우측 "주문 상세 보기" 버튼 → `onOpenOrder(id)` 콜백 (페이지에서 `router.push('/{role}/orders?id=...')`)
 
-주문이 없거나 fetch 실패 시 배너 자동 숨김 (요구사항).
+이력 토글 상태는 컴포넌트 내부 `useState(false)` (전역 X). 모바일/데스크톱 모두 기본 접힘 → 닫힌 상태에서는 기존 1줄 layout 유지. 모바일 작은 폭에서는 버튼 라벨 ("이력"/"주문 상세 보기")이 `sm:` 미만에서 자동 축약.
+
+주문이 없거나 fetch 실패 시 배너 자동 숨김 (요구사항). props 시그니처는 `(orderId, role, onOpenOrder)` 그대로 — 호출부 (seller/chat/page.tsx, buyer/chat/page.tsx) 변경 불필요.
+
+#### NegotiationHistory — 채팅 배너 안 협상 타임라인 (components/chat/NegotiationHistory.tsx)
+
+`OrderContextBanner` 의 이력 토글이 펼쳐졌을 때만 렌더되는 **읽기 전용** 타임라인.
+`components/common/NegotiationHistory.tsx` 와 별도 — common 버전은 주문 상세 슬라이드 패널의 액션(수락/거절) 포함 풀 버전, **chat 버전은 액션 없음** (채팅 메시지의 `COUNTER_OFFER` 카드 = `MessageBubble` 가 동일 액션을 이미 제공하므로 중복 회피).
+
+- 동일 훅 `useNegotiationHistory(orderId)` 재사용 — 캐시 공유 (queryKey: `['negotiation', orderId]`)
+- 시간 역순. 빈 배열이면 미니 placeholder ("협상 이력이 없습니다.")
+- 에러 시 `null` 반환 (조용히 숨김 — UX 우선)
+- 좌측 세로 라인 + 상태별 색 dot (PENDING=노랑 / ACCEPTED=녹색 / REJECTED=빨강 / SUPERSEDED=회색) + 상대시간 표시 (`방금 전 / N분 전 / N시간 전 / N일 전`)
+- 컴포넌트 내부 padding (`px-4 pb-3`) 만 적용 → 부모(배너) 가 외곽 컨테이너 책임
 
 #### PriceOfferPopover — 채팅 입력창 가격 제시 버튼 (components/chat/PriceOfferPopover.tsx)
 
@@ -752,6 +766,63 @@ const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: re
   rooms.map(...)
 )}
 ```
+
+### 납품일 변경 요청·승인 채팅 카드 (검증됨, 2026-04-29)
+
+backend 가 `delivery_date_change_history` 테이블 + 4개 엔드포인트 (`/orders/{id}/delivery-date-changes` GET/POST + `.../{change_id}/accept`, `.../{change_id}/reject`) 추가. 채팅에는 3개 신규 message_type 이 broadcast 된다:
+- `DELIVERY_DATE_CHANGE` — 변경 요청 발송. metadata: `{change_id, proposed_delivery_date, from_role, notes, status, previous_delivery_date}`
+- `DELIVERY_DATE_ACCEPTED` — 수락. metadata: `{change_id, accepted_delivery_date, from_role}`. 이 시점에 `orders.delivery_date` 가 업데이트되고 캘린더 동기화됨
+- `DELIVERY_DATE_REJECTED` — 거절. metadata: `{change_id, proposed_delivery_date, from_role}`
+
+상태 가드: `QUOTE_REQUESTED`/`NEGOTIATING`/`CONFIRMED` 만 변경 요청 가능. `PREPARING` 이상은 백엔드 422.
+
+#### MessageBubble 분기 추가 (components/chat/MessageBubble.tsx)
+```tsx
+case 'DELIVERY_DATE_CHANGE':
+  return <DeliveryDateChangeCard message={message} metadata={metadata} isMine={isMine} />;
+case 'DELIVERY_DATE_ACCEPTED':
+  return <DeliveryDateAcceptedCard metadata={metadata} content={message.content} />;
+case 'DELIVERY_DATE_REJECTED':
+  return <DeliveryDateRejectedCard metadata={metadata} content={message.content} />;
+```
+
+`DeliveryDateChangeCard` 는 `CounterOfferCard` 패턴 그대로 (sky-300/sky-50 톤). 상대방 PENDING 일 때만 수락/거절 버튼 노출. Accept/Reject 시 `useAcceptDeliveryDateChange` / `useRejectDeliveryDateChange` 호출.
+
+#### useDeliveryDateChanges (hooks/useDeliveryDateChanges.ts)
+협상 훅과 동일 패턴. queryKey: `['orders', orderId, 'delivery-date-changes']`. **수락 mutation 만 `['calendar']` 도 invalidate** — 캘린더 화면이 같은 탭에 열려 있으면 새 납품일이 즉시 반영.
+
+#### useChat.ts ORDER_RELATED_TYPES 확장
+3개 신규 타입을 추가하고, `useMessagesWithWebSocket` useEffect 안에서:
+- 모든 delivery date 메시지 → `['orders', orderId, 'delivery-date-changes']` invalidate
+- `DELIVERY_DATE_ACCEPTED` 만 추가로 `['calendar']` invalidate
+
+```typescript
+if (msgType === 'DELIVERY_DATE_CHANGE' ||
+    msgType === 'DELIVERY_DATE_ACCEPTED' ||
+    msgType === 'DELIVERY_DATE_REJECTED') {
+  if (orderId) {
+    queryClient.invalidateQueries({
+      queryKey: ['orders', orderId, 'delivery-date-changes']
+    });
+  }
+  if (msgType === 'DELIVERY_DATE_ACCEPTED') {
+    queryClient.invalidateQueries({ queryKey: ['calendar'] });
+  }
+}
+```
+
+#### 채팅 입력창 빠른 액션 — DeliveryDatePopover (components/chat/DeliveryDatePopover.tsx)
+`PriceOfferPopover` 패턴 복제 (sky 톤). `room.order_id` 가 있고 `orderStatus` 가 변경 가능 상태일 때만 활성. seller/buyer chat page 둘 다 입력창의 `<PriceOfferPopover />` **바로 우측**에 배치:
+```tsx
+<PriceOfferPopover roomId={selectedRoomId} orderId={linkedOrderId} currentTotal={linkedOrderTotal} />
+<DeliveryDatePopover roomId={selectedRoomId} orderId={linkedOrderId}
+  orderStatus={linkedOrderStatus} currentDeliveryDate={linkedOrderDeliveryDate} />
+<input ... />
+```
+
+채팅 페이지에서 `useOrder(linkedOrderId)` 응답에서 `total_amount` / `status` / `delivery_date` 모두 추출해 두 popover 에 분배.
+
+---
 
 ## 작업 체크리스트
 

@@ -39,20 +39,24 @@ frontend/
 │   │   ├── Sidebar.tsx
 │   │   ├── TopBar.tsx              ← 프로필 드롭다운 포함
 │   │   └── AIChatPanel.tsx         ← 우측 고정 AI 패널 (모든 페이지 공통)
-│   └── common/
-│       ├── PageHeader.tsx
-│       ├── StatusBadge.tsx
-│       ├── SummaryCard.tsx
-│       ├── DataTable.tsx
-│       ├── SearchFilterBar.tsx
-│       ├── EmptyState.tsx
-│       └── Modal.tsx
+│   ├── common/
+│   │   ├── PageHeader.tsx
+│   │   ├── StatusBadge.tsx
+│   │   ├── SummaryCard.tsx
+│   │   ├── DataTable.tsx
+│   │   ├── SearchFilterBar.tsx
+│   │   ├── EmptyState.tsx
+│   │   └── Modal.tsx
+│   └── dashboard/
+│       └── TodayTasksWidget.tsx     ← role='seller'|'buyer' — 오늘 할 일 요약
 ├── hooks/
-│   ├── useAuth.ts
-│   ├── useAIStream.ts
+│   ├── useAuth.ts                  ← user, signOut (signOut에서 AI 대화 캐시도 초기화)
+│   ├── useAIStream.ts              ← AI 채팅 호출 + aiChatStore 에 turn 저장
+│   ├── useAIHistory.ts             ← /ai/history fetch + aiChatStore hydrate
 │   └── useChat.ts
 ├── store/
-│   ├── authStore.ts                ← user, setUser, logout
+│   ├── authStore.ts                ← user, setSession, logout (탭별 격리 persist)
+│   ├── aiChatStore.ts              ← AI 대화 turns(최대 100), localStorage persist (글로벌)
 │   └── uiStore.ts                  ← aiPanelOpen, toggleAIPanel (사이드바 state 없음 — 호버 전용)
 ├── types/
 │   ├── user.ts                     ← User, UserRole
@@ -203,7 +207,53 @@ export const buyerMenus: MenuItem[] = [
 // - 마이페이지: router.push('/profile')
 // - 로그아웃: signOut()
 // click-outside: useRef + mousedown 이벤트로 처리
+//
+// 종(Bell) 알림: 별도 컴포넌트 NotificationBell 로 분리되어 있음.
+// TopBar 는 <NotificationBell /> 만 렌더하고 끝 — 상태/구독 로직 직접 보유 X.
 ```
+
+---
+
+## 알림(Notification) 시스템 (실제 기준)
+
+```
+backend                                 frontend
+─────────                               ────────
+order_service / chat_service            useNotificationRealtime  ← 단일 mount (NotificationBell 내부)
+   ↓ INSERT public.notifications          ↓ supabase.channel(`notifications:${userId}`)
+   ↓ Supabase Realtime publication        ↓ filter: user_id=eq.${userId}
+   ↓ INSERT/UPDATE 모두 본인 행만 푸시 ─► queryClient.invalidateQueries(['notifications'])
+                                          ↓
+GET  /notifications?limit=30            useNotifications({ limit, onlyUnread })
+GET  /notifications/unread-count        useUnreadCount()  ← refetchInterval 60s (Realtime 끊김 대비)
+POST /notifications/{id}/read           useMarkNotificationRead()  ← Optimistic (race-safe)
+POST /notifications/read-all            useMarkAllNotificationsRead()  ← Optimistic (race-safe)
+```
+
+**주요 규칙:**
+- Realtime 구독은 **NotificationBell 한 곳** 에서만 호출 (AppLayout/TopBar 에서 중복 호출 금지 — 채널 누수)
+- Realtime 은 INSERT + UPDATE 둘 다 listen — 다른 탭에서 mark_read 하면 이 탭에도 즉시 반영
+- 카운트 뱃지는 `useUnreadCount()` 우선, fallback 으로 `listQuery.data.meta.unread_count` 사용
+- 두 쿼리 모두 `['notifications', ...]` prefix 키 → Realtime 시 한 번의 invalidate 로 동기화됨
+- 백엔드 응답 형태: `SuccessResponse<Notification[]>` + `meta: { unread_count, total }` (페이지네이션 meta 와 같은 자리)
+- 행 클릭 → **`await markRead.mutateAsync(id)` 후** `router.push(link_url)`. `mutate()` fire-and-forget 으로 호출 직후 navigate 하면 fetch 가 abort 됨 — 항상 await. order 관련은 `/{role}/orders?id=...`, NEW_MESSAGE 는 `/{role}/chat?room_id=...`. orders/chat 페이지는 `?id=` / `?room_id=` 쿼리로 자동 모달/방 선택 처리 (각 page.tsx 의 `useEffect(() => searchParams.get(...))` 참조).
+
+### Optimistic mark-read mutation 의 race 회피 정책 (검증됨)
+
+증상: "안 읽음 표시가 안 사라진다." 백엔드 access log 에 POST 자체가 안 찍힘.
+
+원인 3가지를 모두 차단해야 함:
+1. **router.push 가 fetch abort** — `markRead.mutate(id)` 직후 `router.push(...)` 호출하면 React Query 의 onMutate microtask 가 진행 중인 동안 navigation 시작 → fetch 가 abort 또는 무시. 해결: `await markRead.mutateAsync(id)` 로 끝까지 기다린 뒤 navigate.
+2. **cancelQueries hang** — `useUnreadCount` 의 60초 polling 이 in-flight 일 때 onMutate 안의 `await queryClient.cancelQueries(['notifications'])` 가 정상 종료 안 되면 mutationFn 실행 안 됨. 해결: **onMutate 에서 cancelQueries 호출 안 함**. 어차피 setQueryData 로 즉시 덮으므로 cancel 불필요.
+3. **invalidate 후 refetch 가 옛 응답 덮어씀** — onSettled 에서 `invalidateQueries` 호출하면 polling refetch 가 즉시 실행되며, 그 응답이 optimistic 으로 만든 0 카운트를 옛 N 카운트로 덮을 수 있음. 해결: **onSettled invalidate 제거**. 대신 onSuccess 에서 server 응답으로 `setQueriesData` 직접 업데이트, 그리고 다른 탭/디바이스 동기화는 **Realtime UPDATE 이벤트** 로 보완.
+
+추가 안전장치: `useUnreadCount` 에 `refetchOnMount: false` — mutation 직후 mount 변화로 인한 refetch race 방지.
+
+`setQueriesData` 의 콜백 안에서는 `unread-count` 단일 객체 캐시 (`data` 가 배열 아님) 와 list 캐시를 구분해야 함. `if (!Array.isArray(cast.data)) return old;` 로 list 만 처리.
+
+회귀 영향: invalidate 제거로 기존에 의존하던 자동 refetch 가 사라지지만, (a) 같은 탭에서는 onSuccess 의 setQueriesData 가 server truth 를 직접 cache 에 박고, (b) 다른 탭/디바이스는 Realtime UPDATE 이벤트가 invalidate 트리거. 60초 polling fallback 도 유지.
+
+**상대 시간 헬퍼**: `lib/date.ts` 의 `formatRelativeKst(iso)` 사용. "방금" / "{N}분 전" / "{N}시간 전" / "YYYY-MM-DD"(KST) 4단계.
 
 ---
 
@@ -212,7 +262,11 @@ export const buyerMenus: MenuItem[] = [
 ```typescript
 // frontend/components/layout/AIChatPanel.tsx
 // - useAuthStore로 role 감지 → sellerQuickPrompts / buyerQuickPrompts 자동 선택
-// - useAIStream 훅 사용 (응답, 스트리밍 상태, 전송)
+// - useAIStream 훅 사용 → { isStreaming, manualReview, stream } 만 destructure
+//   (response 는 더 이상 직접 안 씀 — store 의 turns 가 SSOT)
+// - useAIHistory(100) 호출로 store hydrate 트리거
+// - useAIChatStore 의 turns 를 구독해 사용자/AI 말풍선 형태로 모두 표시
+// - 새 응답이 와도 이전 대화가 유지되며, 페이지 이동/새로고침 후에도 localStorage 에서 복원
 // - 입력: Enter(전송), Shift+Enter(줄바꿈) 지원
 // - 별도 라우트(/ai-assistant) 없음
 //
@@ -227,6 +281,36 @@ export const buyerMenus: MenuItem[] = [
 // uiStore에 aiPanelOpen / toggleAIPanel / setAIPanelOpen 사용
 // 채팅 UI는 chatUI 변수로 한 번만 작성 후 확장 상태 두 곳에서 재사용
 ```
+
+### AIChatPanel turns 렌더 패턴 (검증됨, 2026-04-30)
+
+좁은 패널(폭 320~440px)에 맞춘 **컴팩트 사이즈**로 turns 모두 표시.
+ai-assistant 페이지의 풀 사이즈 (text-sm, max-w-[75%], px-4 py-2) 와 다른 컴팩트 톤을 사용한다:
+- 텍스트: `text-xs` (페이지는 `text-sm`)
+- 말풍선: `max-w-[85%] rounded-2xl px-3 py-1.5` (페이지는 `max-w-[75%] rounded-2xl px-4 py-2`)
+- 컨테이너 padding: `p-3 space-y-1.5`
+- 날짜 구분선 폰트: `text-[10px]`
+- manual review 배너 폰트: `text-[11px]` + 아이콘 `h-3.5 w-3.5`
+
+```tsx
+const { isStreaming, manualReview, stream } = useAIStream();  // response 는 안 씀
+useAIHistory(100);
+const turns = useAIChatStore((s) => s.turns);
+const messagesEndRef = useRef<HTMLDivElement>(null);
+const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
+
+useEffect(() => {
+  messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+}, [turns.length, lastTurn?.response]);
+
+// pending 마지막 turn 의 AI 말풍선은 깜빡이는 캐럿만 표시
+const isLastPending = idx === turns.length - 1 && turn.pending && turn.response === '';
+```
+
+**핵심**: `response` state 는 useAIStream 이 외부 호환성으로 유지하되,
+실제 화면 렌더는 `useAIChatStore.turns` 가 SSOT (Single Source of Truth).
+이렇게 해야 새 응답이 와도 이전 대화가 사라지지 않고, 페이지 이동 후 돌아와도 그대로 남는다.
 
 ---
 
@@ -367,32 +451,6 @@ Vercel 배포 후 Railway URL로 전환할 때는 `NEXT_PUBLIC_API_URL` 환경�
 - `middleware.ts` — `matcher: []` 비활성화, 인증 가드는 `<AuthGuard>` (클라이언트)에서
 - `store/authStore.ts` — persist name도 tabId suffix, `loginExpiresAt` 필드로 2일 만료 정책
 
-#### useMutation 온디맨드 호출 패턴 (검증됨)
-
-자동 fetch가 아닌 버튼 클릭 시에만 호출하는 AI/에이전트 훅은 `useQuery` 대신 `useMutation`을 사용한다.
-`isIdle` → `isPending` → `data` / `isError` 순서로 상태를 분기 렌더링한다.
-
-```typescript
-// hooks/useScheduleAgent.ts
-export function useScheduleRecommend() {
-  return useMutation({
-    mutationFn: async (params: { year: number; month: number }) => {
-      const res = await api.post<SuccessResponse<ScheduleRecommendResponse>>(
-        '/schedule-agent/recommend',
-        params
-      );
-      return res;
-    },
-  });
-}
-
-// 컴포넌트에서 사용
-const { mutate, data, isPending, isError, isIdle } = useScheduleRecommend();
-const result = data?.data;  // SuccessResponse 래퍼 안의 data 필드
-
-// 상태 분기: isIdle → 초기 안내 + 버튼 / isPending → 스피너 / result → 결과 / isError → 에러
-```
-
 #### 캘린더 일정 클릭 → EventDetailModal 패턴 (검증됨, 2026-04-27)
 
 캘린더 셀의 일정 항목과 우측 "전체 일정" 리스트의 일정 카드 클릭 시 동일하게 상세 모달이 열려야 한다.
@@ -515,34 +573,34 @@ onClick={() => {
 
 **컴포넌트 위치**: `components/calendar/DayEventsModal.tsx`. 헤더는 한국식 + 요일(`2026년 5월 6일 (수)`), 본문은 start_time 오름차순 정렬(없으면 마지막), 일정 없으면 "이 날짜에 등록된 일정이 없습니다" 메시지, 푸터는 "일정 추가" + "닫기" 버튼. 기존 공통 `Modal` 컴포넌트 재사용.
 
-#### 캘린더 페이지 — 우측 패널 "전체 일정" 단일 카드 패턴 (검증됨, 2026-04-27)
+#### 캘린더 페이지 — 12-grid 레이아웃 + 셀 균일 높이 (검증됨, 2026-04-29)
 
-기존 "선택한 날짜 일정 + ScheduleAgentPanel" 2단 스택 구조에서, **단일 "전체 일정" 카드**로 통합되었다.
-ScheduleAgentPanel/useScheduleAgent는 다른 곳 재사용 예정으로 **파일은 보존**, 캘린더 페이지에서만 import/렌더링 제거.
+기존 `lg:grid-cols-4 + col-span-3 / 1` 비율(75:25)에서, **12-grid 기반 단계 분할**로 리디자인되었다.
+`lg` 에서는 67:33, `xl` 이상 큰 화면에서는 75:25 — 좁은 lg 화면에서도 사이드바가 잘 읽히고 xl 에서는 달력에 더 많이 할당.
 
 레이아웃 (seller/buyer 동일):
-- `lg:grid-cols-4` → 달력 `lg:col-span-3` + 우측 단일 카드 (col-span 1)
-- 우측 카드의 `space-y-6` 래퍼 div 제거됨 (스택할 컴포넌트가 사라짐)
+- 부모: `grid grid-cols-1 gap-6 lg:grid-cols-12`
+- 달력 wrapper: `lg:col-span-8 xl:col-span-9 rounded-xl bg-white p-6 shadow-sm`
+- 사이드바 wrapper: `lg:col-span-4 xl:col-span-3 space-y-4`
 
-```tsx
-<div className="rounded-xl bg-white p-6 shadow-sm">
-  <div className="mb-4 flex items-center justify-between">
-    <h3 className="font-semibold text-gray-900">전체 일정</h3>
-    <button onClick={() => { /* selectedDate 없으면 오늘로 fallback */ setShowModal(true); }} ...>
-      <Plus className="h-4 w-4" />
-    </button>
-  </div>
-  {sortedEvents.length === 0 ? (
-    <p className="text-sm text-gray-400">등록된 일정이 없습니다.</p>
-  ) : (
-    <div className="max-h-[calc(100vh-260px)] space-y-3 overflow-y-auto pr-1">
-      {sortedEvents.map((ev) => /* 카드 */)}
-    </div>
-  )}
-</div>
-```
+날짜 셀 균일 높이 패턴:
+- 빈 셀(이전 달): `<div className="h-28 rounded-lg bg-gray-50/40" />` — 톤 다운된 배경
+- 일반 셀: `h-28 cursor-pointer overflow-hidden rounded-lg border p-2 transition-colors`
+  - 기본 테두리 `border-gray-100`, hover `hover:border-gray-200 hover:bg-gray-50`
+  - 선택됨 `border-primary-500 bg-primary-50 ring-1 ring-primary-500`
+  - `h-28`(112px) **고정** + `overflow-hidden` — 일정 개수와 무관하게 모든 셀 동일 높이
+- 셀 안 일정 칩: 최대 **2개** 표시, 메인 라인만(`text-[11px]`), sub 라인은 셀에서 노출 안 함
+- "+N개 더보기": `bg-gray-100 text-gray-600 font-medium text-[11px]`
 
-스크롤 영역 높이는 `max-h-[calc(100vh-260px)]` 사용 — TopBar/PageHeader/카드 패딩을 제외한 잔여 높이.
+월 네비게이션:
+- "오늘" 버튼: 좌측 화살표 옆에 작은 텍스트 버튼 — `text-xs font-medium text-gray-600 hover:bg-gray-100 hover:text-primary-700 px-2 py-1 rounded`
+- 클릭 시 `setYear(today.getFullYear()); setMonth(today.getMonth() + 1)`
+
+우측 "전체 일정" 카드:
+- 스크롤 영역: `max-h-[calc(100vh-220px)] space-y-4 overflow-y-auto pr-1`
+- 날짜 그룹 헤더: `sticky top-0 ... border-b-2 border-gray-200 bg-white py-2.5` — 시각 구분 강화
+- 일정 카드 sub 텍스트: `truncate` 대신 `line-clamp-1` 로 가독성 확보
+- 타입 라벨 뱃지: `text-xs` (이전 `text-[10px]` 대비 약간 큼)
 
 #### 캘린더 — CANCELLED 일정 방어적 프론트 필터링 (검증됨, 2026-04-27)
 
@@ -568,10 +626,10 @@ const buildDateStr = (d: number) =>
 
 백엔드 `event_date`는 Postgres `date` → `'YYYY-MM-DD'` 문자열로 안정적으로 직렬화되므로 양쪽이 정확히 일치한다.
 
-#### CalendarEvent — product_name/order_number/order_status 필드 패턴 (검증됨, 2026-04-27)
+#### CalendarEvent — product_name/order_status + 거래처 4필드 (검증됨, 2026-04-29 갱신)
 
-백엔드 `CalendarEventResponse`에 `order_number`, `product_name`, `order_status` 세 필드가 추가됨.
-`order_id` 없는 일정(MEETING 등)은 모두 null.
+백엔드 `CalendarEventResponse`에 `order_number`, `product_name`, `order_status` + 거래처 4필드(`buyer_name/buyer_company/seller_name/seller_company`)가 추가됨.
+`order_id` 없는 일정(MEETING 등)은 모두 null. **거래처 4필드는 optional** — 백엔드 미배포 환경에서도 안전하게 동작.
 
 ```typescript
 // types/calendar.ts
@@ -581,27 +639,37 @@ export interface CalendarEvent {
   // 기존 필드들...
   order_number: string | null;
   product_name: string | null;
-  order_status: OrderStatus | null;  // 백엔드는 string | null, 프론트는 OrderStatus union으로 좁힘
+  order_status: OrderStatus | null;
+  buyer_name?: string | null;
+  buyer_company?: string | null;
+  seller_name?: string | null;
+  seller_company?: string | null;
 }
 ```
 
-표시 규칙 — **메인 라인은 product_name fallback title, 서브 라인은 order_number 작은 글씨**:
+표시 정책 (2026-04-29 변경) — **메인 = product_name fallback title, 서브 = 거래처명, 주문번호는 미노출 또는 작은 회색 텍스트로 격하**:
 ```tsx
-const main = ev.product_name ?? ev.title;
-const sub = ev.order_number;
+// seller/calendar/page.tsx — 판매자에게 거래처는 buyer
+const getEventLabels = (ev: CalendarEvent) => {
+  const main = ev.product_name ?? ev.title;
+  const partner = ev.buyer_company ?? ev.buyer_name ?? null;
+  const sub = partner;  // 주문번호 대신 거래처명
+  return { main, sub };
+};
 
-// 캘린더 셀 (좁은 영역, 흰색 텍스트 위)
-<div className="rounded px-1 py-0.5 text-[10px] text-white" /* event color bg */>
-  <div className="truncate font-medium">{main}</div>
-  {sub && <div className="truncate text-[9px] text-white/80">{sub}</div>}
-</div>
-
-// 일정 카드 (넓은 영역, 회색 텍스트)
-<span className="text-sm font-medium text-gray-900">{main}</span>
-{sub && <p className="text-xs text-gray-500">{sub}</p>}
+// buyer/calendar/page.tsx — 구매자에게 거래처는 seller
+const getEventLabels = (ev: CalendarEvent) => {
+  const main = ev.product_name ?? ev.title;
+  const partner = ev.seller_company ?? ev.seller_name ?? null;
+  const sub = partner;
+  return { main, sub };
+};
 ```
 
+**중요**: 두 캘린더 페이지의 `getEventLabels`는 **이 한 곳만 의도적으로 갈라진다** (buyer ↔ seller). 다른 모든 코드는 두 파일에서 100% 동일.
+
 `title` fallback 필수: 사용자가 수동 등록한 일정은 product_name이 null이라 title이 메인이 된다.
+주문번호(`order_number`)는 더 이상 메인/서브 어디에도 노출하지 않는다 — 사용자에게 의미 없는 식별자라 제거. EventDetailModal/DayEventsModal 같은 상세 모달에서만 부가정보로 표시.
 
 #### 캘린더 일정 색상/라벨 — order_status 필드 우선, event_type fallback (검증됨, 2026-04-27)
 
@@ -857,13 +925,13 @@ const sortedHistory = [...history].reverse(); // 오래된순 정렬
 #### useAIStream — manualReview 플래그 (검증됨)
 
 `useAIStream`이 `manualReview: boolean`을 추가로 반환한다.
-백엔드 orchestrator `final_state.manual_review`가 `true`이면 페이지에서 경고 배너를 표시한다.
+백엔드 orchestrator `final_state.manual_review`가 `true`이면 페이지/패널에서 경고 배너를 표시한다.
 
 ```typescript
 // hooks/useAIStream.ts — 반환값
 return { response, isStreaming, manualReview, stream, abort, reset };
 
-// 페이지에서 사용
+// 페이지에서 사용 (풀 사이즈 — text-sm)
 const { response, isStreaming, manualReview, stream } = useAIStream();
 
 {manualReview && (
@@ -874,6 +942,12 @@ const { response, isStreaming, manualReview, stream } = useAIStream();
     </span>
   </div>
 )}
+
+// AIChatPanel(우측 좁은 패널)에서 사용 — 컴팩트 톤 (text-[11px])
+// response 는 destructure 하지 않고 turns 기준으로 렌더하면서
+// 마지막 turn 응답 직후에만 배너 노출
+const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
 ```
 
 백엔드 orchestrator.py `run()` return에도 `manual_review` 필드를 포함해야 한다:
@@ -952,7 +1026,8 @@ const filtered = data?.data ?? [];  // 서버가 필터링한 결과 그대로 �
 // hooks/useOrders.ts
 interface OrderFilters {
   order_status?: OrderStatus;
-  status_in?: OrderStatus[];   // 다중 상태 필터 — 백엔드 GET /orders 의 status_in 다중 query 와 매핑
+  status_in?: OrderStatus[];        // 다중 상태 필터 — 백엔드 GET /orders 의 status_in 다중 query 와 매핑
+  partner_user_id?: string;         // V1.7 — 양방향 거래처 필터 (me ↔ partner_user_id 사이의 주문만)
   page?: number;
   limit?: number;
 }
@@ -971,6 +1046,51 @@ const filteredOrders = listData?.data ?? [];   // 서버가 필터링한 결과 
 - 탭 전환 시 React Query `queryKey: ['orders', filters]` 가 `status_in` 배열 변화로 자동 refetch
 - 카운트 뱃지: 활성 탭만 `(N)` 표시 (서버에서 비활성 탭의 카운트를 한 번에 알 수 없으므로 비활성 탭은 카운트 생략)
 - 데이터 테이블은 `<div className="max-h-[calc(100vh-280px)] overflow-y-auto rounded-xl">` 로 감싸서 헤더 위치 고정 + 본문 스크롤
+
+#### orders 페이지 — partner_user_id 필터 chip 패턴 (검증됨, 2026-04-28, V1.7)
+
+거래처 페이지 "최근 거래" 컬럼 클릭 시 `/{role}/orders?partner_user_id=<uuid>` 로 진입한다.
+주문 페이지에서 `searchParams.get('partner_user_id')` 로 읽어 `useOrders({ partner_user_id })` 에 전달.
+
+- **정기배송 탭에는 적용하지 않음** — 정기배송은 `useSubscriptions` 별도 흐름이므로 `isSubTab ? undefined : partnerFilter` 로 가드.
+- 거래처 이름 lookup: `usePartners()` (인자 없음) 결과에서 `partner_user_id` 매칭. fallback 은 `'특정 거래처'`.
+  - 이미 정기배송 탭의 `PartnerDetailModal` 매핑용으로 호출 중이라 별도 호출 불필요.
+- chip UI 는 정기배송 탭에서는 미노출 (`!isSubTab && partnerFilter`), 탭 위에 위치:
+
+```tsx
+{!isSubTab && partnerFilter && (
+  <div className="mb-3 flex flex-wrap items-center gap-2">
+    <span className="text-xs text-gray-500">필터:</span>
+    <button
+      type="button"
+      onClick={() => router.push('/buyer/orders')}   // partner_user_id 빠진 URL 로 이동
+      className="inline-flex items-center gap-1 rounded-full bg-primary-50 px-3 py-1 text-xs text-primary-700 hover:bg-primary-100"
+      title="필터 해제"
+    >
+      거래처: {filteredPartnerLabel}
+      <X className="h-3 w-3" />
+    </button>
+  </div>
+)}
+```
+
+#### usePartners — include_last_trade 옵션 (검증됨, 2026-04-28, V1.7)
+
+`PartnerFilters` 에 `include_last_trade?: boolean` 추가. 백엔드 GET /partners 는 기본 false 로 last_trade_date / last_trade_amount 를 응답에 포함하지 않는다 (집계 비용 보호). 거래처 페이지에서만 명시적으로 true 로 호출.
+
+```typescript
+// 거래처 페이지 (last_trade 컬럼 노출 필요)
+const { data } = usePartners({
+  partner_status: ...,
+  search: ...,
+  include_last_trade: true,
+});
+
+// 다른 페이지 (orders 정기배송 매핑, members, subscriptions, AddPartnerModal 등) — 인자 없이 호출 유지
+const { data } = usePartners();
+```
+
+**주의 — React Query 캐시 분리**: queryKey 가 `['partners', filters]` 라서 `usePartners({ include_last_trade: true })` 와 `usePartners()` 는 별도 캐시 슬롯을 차지한다. 거래처 페이지(last_trade 포함)와 다른 페이지(last_trade 없음)가 같은 사용자 세션에서 두 번 fetch 되는 trade-off 가 발생하지만, 다른 페이지에서 불필요한 집계 비용을 피하는 설계 의도와 일치한다.
 
 #### lib/api.ts 배열 query param 직렬화 (검증됨, 2026-04-27)
 
@@ -1146,6 +1266,25 @@ const canRespond =
 
 `from_role`(SELLER/BUYER)은 배지 표시용. 인증된 사용자 ID와의 비교는
 반드시 `from_user_id` 사용 — `from_role`만으로 본인/상대 판별 금지(같은 역할 두 사용자가 있을 수 있음).
+
+#### 납품일 변경 섹션 — NegotiationHistory 와 동일 패턴 (검증됨, 2026-04-29)
+
+`components/common/DeliveryDateChangeSection.tsx` 가 주문 상세 슬라이드 패널의 `<NegotiationHistory />` **바로 아래**에 배치된다 (buyer/seller 양 페이지). props:
+```ts
+interface DeliveryDateChangeSectionProps {
+  orderId: string;
+  orderStatus: OrderStatus;
+  currentDeliveryDate: string | null;
+}
+```
+
+핵심 동작:
+- `QUOTE_REQUESTED`/`NEGOTIATING`/`CONFIRMED` 일 때만 "변경 요청" 버튼 + 인라인 폼 노출
+- `PREPARING` 이상이면 "출하 준비 중이라 납품일을 변경할 수 없습니다" 안내 박스
+- 가장 최근 PENDING 이 상대방 제안이면 수락/거절 버튼 (NegotiationHistory 와 동일 가드, **CONFIRMED 도 응답 가능**)
+- 수락 시 `useAcceptDeliveryDateChange` 가 `['calendar']` 도 invalidate → 캘린더 자동 동기화
+
+훅은 `hooks/useDeliveryDateChanges.ts` (4개 export): `useDeliveryDateChanges` / `useSubmitDeliveryDateChange` / `useAcceptDeliveryDateChange` / `useRejectDeliveryDateChange`. 모두 `orderId` argument.
 
 #### 판매자 vs 구매자 — 상태 전이 권한 매트릭스 (검증됨, 2026-04-27 갱신)
 
@@ -1516,57 +1655,236 @@ useEffect(() => {
 - 검증: 모든 항목 product_id 선택, quantity ≥ 1, unit_price ≥ 0, start_date ≥ today, end_date ≥ start_date, MONTHLY는 day_of_month 1~31, WEEKLY/BIWEEKLY는 day_of_week 0~6
 - 날짜는 timezone-safe 문자열 조합 — `defaultStartDate()`는 오늘+7일을 `YYYY-MM-DD` 로 직접 생성 (ISO 변환 금지)
 
-##### EventType 'SUBSCRIPTION' 추가 — 캘린더 가상 이벤트
-`types/calendar.ts`의 `EventType` union에 `'SUBSCRIPTION'` 추가. 단 **백엔드는 이 값을 송출하지 않음** — 프론트에서만 `useSubscriptions({ status: 'ACTIVE' })`의 결과로부터 향후 3개월(약 12회) 분량의 가상 이벤트를 합성한다.
+##### NextDeliveryLabel — 정기배송 D-day 표시 (검증됨, 2026-04-29)
+
+`components/subscriptions/NextDeliveryLabel.tsx` — 정기배송 "다음 배송일"을 D-day 카운트와 함께 강조 표시하는 공용 컴포넌트.
+
+**Props 시그니처:**
+```typescript
+{
+  date: string | null | undefined;          // 'YYYY-MM-DD'. null/undefined → "-"
+  calendarHref?: string;                    // 있으면 <Link>, 없으면 <span>
+  prefix?: string;                          // 기본 '다음 배송'. ''(빈 문자열) → 라벨 prefix 생략
+  ariaLabel?: string;
+  className?: string;
+}
+```
+
+**사용처 4곳 (모두 동일 컴포넌트 재사용):**
+- `app/(dashboard)/buyer/subscriptions/page.tsx` — 카드 요약 행, prefix 기본 사용, **calendarHref 미전달** (아래 nested DOM 가드 참조)
+- `app/(dashboard)/seller/subscriptions/page.tsx` — 동일
+- `app/(dashboard)/buyer/orders/page.tsx` — 정기배송 탭 DataTable 셀, `prefix=""` 로 헤더 중복 회피, calendarHref 전달 OK (셀이 단독 컬럼이라 nested 문제 없음)
+- `app/(dashboard)/seller/orders/page.tsx` — 동일
+
+**핵심 패턴:**
+- 오늘 날짜는 KST 기준 — `getTodayKstString()` (`lib/date.ts`).
+- D-day 계산은 `diffInDays(today, target)` (`lib/date.ts`) — `Date.UTC` 로 변환 후 86_400_000 으로 나눈다 (DST 영향 회피).
+- `diff > 0` → "D-N" 회색 / `diff === 0` → "D-Day" 빨강+`AlertCircle` / `diff < 0` → "D+N 지남" 빨강+`AlertCircle`.
+- `<Link onClick={(e) => e.stopPropagation()}>` 로 부모 카드의 행 펼침 onClick 과 분리 (DataTable 셀 등 부모가 클릭 핸들러를 가진 영역에서).
+- `calendarHref` 는 role 별로 다르게: `/buyer/calendar?date=${date}` 또는 `/seller/calendar?date=${date}`.
+
+**Nested interactive element 가드 (검증됨, 2026-04-29):**
+
+부모가 `<button>` 인 영역(예: 정기배송 카드의 행 펼침 토글)에서는 **calendarHref 를 전달하지 않는다.** 전달하면 `<button>` 안에 `<a>` 가 들어가 HTML invalid → React `validateDOMNesting` 경고 + Safari/Firefox 가 button 종료를 강제로 고쳐 layout 이 깨질 위험. `e.stopPropagation()` 만으로 우회 불가 (DOM 구조 자체가 invalid).
+
+**해결 패턴 — 정기배송 페이지의 카드 헤더:**
+```tsx
+// ❌ 카드 헤더 <button> 안에 calendarHref 전달 → <a> nested → invalid
+<button onClick={toggleRow}>
+  <NextDeliveryLabel date={...} calendarHref="/buyer/calendar?date=..." />
+</button>
+
+// ✅ 헤더에서는 <span> 으로만 렌더하고, 펼침 영역에 별도 버튼으로 분리
+<button onClick={toggleRow}>
+  <NextDeliveryLabel date={sub.next_delivery_date} />  {/* calendarHref 생략 */}
+</button>
+{isExpanded && (
+  <div>
+    {/* ... 다른 액션 버튼들 옆에 ... */}
+    {sub.next_delivery_date && (
+      <button onClick={() => router.push(`/buyer/calendar?date=${sub.next_delivery_date}`)}>
+        <CalendarDays className="h-3.5 w-3.5" />
+        캘린더에서 보기
+      </button>
+    )}
+  </div>
+)}
+```
+
+DataTable 셀처럼 부모가 `<button>` 이 아닌 컨텍스트에서는 calendarHref 를 그대로 전달해도 무방.
+
+**`lib/date.ts` 신규 헬퍼:**
+- `getTodayKstString(): string` — 'YYYY-MM-DD' (KST). 백엔드 날짜 컬럼과 직접 문자열 비교 가능. `TodayTasksWidget.tsx` 에 있던 사설 헬퍼를 공용으로 승격.
+- `diffInDays(base, target): number` — 'YYYY-MM-DD' 두 문자열 간 일수 차. 잘못된 입력은 0 반환.
+
+##### 캘린더 페이지 ?date= 쿼리 진입 (검증됨, 2026-04-29)
+
+`app/(dashboard)/buyer/calendar/page.tsx` 와 `seller/calendar/page.tsx` 는 `?date=YYYY-MM-DD` 쿼리를 받으면 해당 월/일로 즉시 이동한다 (`NextDeliveryLabel` 클릭 시 사용).
+
+**Suspense boundary 필수 (Next.js 14 App Router):**
+`useSearchParams()` 를 client page root 에서 직접 사용하면 빌드 경고 + 페이지 전체가 동적 fallback 으로 강제된다. 실제 로직은 `BuyerCalendarPageInner` / `SellerCalendarPageInner` 에 두고 default export 는 얇은 `<Suspense>` wrapper:
+
+```tsx
+'use client';
+import { Suspense, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
+
+function BuyerCalendarPageInner() {
+  const searchParams = useSearchParams();
+  // ... 모든 페이지 로직
+}
+
+export default function BuyerCalendarPage() {
+  return (
+    <Suspense fallback={<div className="py-12 text-center text-sm text-gray-400">캘린더 로딩 중...</div>}>
+      <BuyerCalendarPageInner />
+    </Suspense>
+  );
+}
+```
+
+같은 패턴은 `useSearchParams` 를 사용하는 모든 client page 에 적용한다 (현재 buyer/seller calendar 두 곳, buyer/browse 도 향후 동일하게 wrap 권장).
+
+```tsx
+const searchParams = useSearchParams();
+const dateParam = searchParams?.get('date') ?? null;
+const parsedQuery = useMemo(() => {
+  if (!dateParam) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateParam);
+  if (!m) return null;
+  // ... validate & return { year, month, day, dateStr }
+}, [dateParam]);
+
+// 초기 state 를 쿼리 기반으로 설정
+const [year, setYear] = useState(parsedQuery?.year ?? today.getFullYear());
+const [month, setMonth] = useState(parsedQuery?.month ?? today.getMonth() + 1);
+const [selectedDate, setSelectedDate] = useState<string | null>(parsedQuery?.dateStr ?? null);
+const [dayModalDate, setDayModalDate] = useState<string | null>(parsedQuery?.dateStr ?? null);
+
+// 같은 페이지에서 쿼리만 변경되는 클라이언트 네비게이션 동기화
+useEffect(() => {
+  if (!parsedQuery) return;
+  setYear(parsedQuery.year);
+  setMonth(parsedQuery.month);
+  setSelectedDate(parsedQuery.dateStr);
+  setDayModalDate(parsedQuery.dateStr);
+}, [parsedQuery]);
+```
+
+쿼리 형식이 잘못되면 무시하고 오늘 기준으로 폴백 (안전 기본값).
+
+##### EventType 'SUBSCRIPTION' + subscription_id 동기 일정 (검증됨, 2026-04-28)
+`types/calendar.ts`의 `EventType` union 에 `'SUBSCRIPTION'` 포함, `CalendarEvent` 인터페이스에 `subscription_id: string | null` 필드 포함.
+
+정기배송 일정은 두 경로로 들어온다:
+- **백엔드 동기 일정** — 정기배송 ACTIVE 시 백엔드가 양 당사자 캘린더에 INSERT. `event_type = 'SHIPMENT'`(판매자) / `'DELIVERY'`(구매자), `subscription_id != null`, `order_id = null`
+- **프론트 가상 이벤트** — `useSubscriptions({ status: 'ACTIVE' })` 로부터 향후 3개월(약 12회) 분량 합성. `event_type = 'SUBSCRIPTION'`, id prefix `sub-virtual-`, `subscription_id = sub.id`
+
+**중요 — Dedupe 필수 (검증됨, 2026-04-28)**: 두 경로가 동시에 존재하므로 같은 `(subscription_id, event_date)` 가 백엔드 응답에 이미 있으면 가상 이벤트 합성을 skip 해야 셀/리스트에 정기배송이 두 번 노출되지 않는다. 백엔드 backfill 안 된 기존 ACTIVE 정기배송에 대해서는 가상 이벤트 fallback 을 유지하여 점진적 전환을 보장한다.
 
 ```typescript
-// seller|buyer/calendar/page.tsx
+// seller|buyer/calendar/page.tsx — 가상 이벤트 합성 + dedupe
+// 백엔드가 이미 INSERT 한 (subscription_id, event_date) Set 만들기
+const backendSubKeys = useMemo(() => {
+  const keys = new Set<string>();
+  for (const ev of [...baseMonthEvents, ...baseAllEvents]) {
+    if (ev.subscription_id) keys.add(`${ev.subscription_id}|${ev.event_date}`);
+  }
+  return keys;
+}, [baseMonthEvents, baseAllEvents]);
+
 const subscriptionVirtualEvents: CalendarEvent[] = useMemo(() => {
   const events: CalendarEvent[] = [];
-  const now = new Date();
-  const horizon = new Date(now.getFullYear(), now.getMonth() + 3, 0);
-
   for (const sub of activeSubs) {
-    const cur = new Date(sub.next_delivery_date);
+    let cur = new Date(sub.next_delivery_date);
     let round = 1;
     while (cur <= horizon && round <= 50) {
-      events.push({
-        id: `sub-virtual-${sub.id}-${round}`,
-        user_id: '', order_id: null,
-        title: '정기배송 예정',
-        event_type: 'SUBSCRIPTION',
-        event_date: `${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`,
-        start_time: null, end_time: null,
-        description: `정기배송 ${round}회차 — ${sub.items[0]?.product_name ?? '상품'}`,
-        is_allday: true, created_at: '',
-        order_number: null,
-        product_name: sub.items[0]?.product_name ?? '정기배송',
-        order_status: null,
-      });
-      // 다음 회차 계산 — 백엔드 compute_next_date 와 동일 로직
-      if (sub.frequency === 'WEEKLY') cur.setDate(cur.getDate() + 7);
-      else if (sub.frequency === 'BIWEEKLY') cur.setDate(cur.getDate() + 14);
-      else if (sub.frequency === 'MONTHLY') {
-        cur.setMonth(cur.getMonth() + 1);
-        if (sub.day_of_month) {
-          const lastDay = new Date(cur.getFullYear(), cur.getMonth()+1, 0).getDate();
-          cur.setDate(Math.min(sub.day_of_month, lastDay));
-        }
+      const dateStr = `${cur.getFullYear()}-${String(cur.getMonth()+1).padStart(2,'0')}-${String(cur.getDate()).padStart(2,'0')}`;
+      // Dedupe — 백엔드 동기 INSERT 된 (subscription_id, date) 면 가상 이벤트 skip
+      if (!backendSubKeys.has(`${sub.id}|${dateStr}`)) {
+        events.push({
+          id: `sub-virtual-${sub.id}-${round}`,
+          user_id: '', order_id: null,
+          subscription_id: sub.id,  // ← 동기 일정과 일관된 식별자, color/label 분기 트리거
+          title: '정기배송 예정',
+          event_type: 'SUBSCRIPTION',
+          // ...나머지 필드
+        });
       }
+      // 다음 회차 계산 — 백엔드 compute_next_date 와 동일 로직 (생략)
       round += 1;
     }
   }
   return events;
-}, [activeSubs]);
-
-const visibleMonthEvents = useMemo(() => [...baseMonthEvents, ...subscriptionVirtualEvents], ...);
-const visibleAllEvents   = useMemo(() => [...baseAllEvents,   ...subscriptionVirtualEvents], ...);
+}, [activeSubs, backendSubKeys]);
 ```
 
-`constants/status.ts`의 `EVENT_TYPE_COLOR_CLASS` / `EVENT_TYPE_LABEL`에 `SUBSCRIPTION: 'bg-purple-400'` / `'정기배송'` 추가. 일정 추가 모달의 `EVENT_TYPE_OPTIONS`에는 추가하지 **않음** (사용자가 수동 등록할 수 없는 가상 타입).
+##### 정기배송 일정 색상/라벨 — subscription_id 우선 (필수 패턴)
+`constants/status.ts`의 `getCalendarEventColorClass` / `getCalendarEventLabel` 은 **`subscription_id` 가 가장 먼저** 분기된다. 백엔드 동기 일정은 `event_type` 이 `SHIPMENT`/`DELIVERY` 라 일반 출하/입고와 색이 같아져 정기배송을 구분할 수 없기 때문이다.
 
-##### EventDetailModal — 가상 이벤트 삭제 버튼 숨김 (함정)
-`event.id`가 `'sub-virtual-'` 로 시작하거나 `event_type === 'SUBSCRIPTION'` 인 경우 DB row가 없으므로 `useDeleteCalendarEvent.mutate(event.id)`가 404를 던진다. 푸터의 삭제 버튼을 조건부로 숨겨야 한다.
+```typescript
+// constants/status.ts
+export function getCalendarEventColorClass(event) {
+  if (event.subscription_id) return EVENT_TYPE_COLOR_CLASS.SUBSCRIPTION; // bg-purple-500
+  if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
+    return ORDER_STATUS_CONFIG[event.order_status].solidClassName;
+  }
+  return EVENT_TYPE_COLOR_CLASS[event.event_type] ?? EVENT_TYPE_COLOR_CLASS.OTHER;
+}
+
+export function getCalendarEventLabel(event) {
+  if (event.subscription_id) return EVENT_TYPE_LABEL.SUBSCRIPTION; // '정기배송'
+  if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
+    return ORDER_STATUS_CONFIG[event.order_status].label;
+  }
+  return EVENT_TYPE_LABEL[event.event_type] ?? '기타';
+}
+```
+
+`EVENT_TYPE_COLOR_CLASS.SUBSCRIPTION = 'bg-purple-500'` / `EVENT_TYPE_LABEL.SUBSCRIPTION = '정기배송'`. 다른 화면(주문 페이지 정기배송 출처 뱃지)의 `bg-purple-100/text-purple-700` 톤과 통일.
+
+##### 정기배송 시각적 식별 — Repeat 아이콘 + 보라 뱃지
+모든 캘린더 진입 지점에서 `subscription_id` 존재 시 lucide `Repeat` 아이콘과 `bg-purple-100 text-purple-700` 뱃지로 일관 표시:
+
+| 위치 | 시각 표시 |
+|------|---------|
+| 그리드 셀 일정 칩 | `<Repeat className="h-2.5 w-2.5" />` + main 텍스트 (셀 안 좁음) |
+| 우측 "전체 일정" 리스트 카드 | 색상 점 → `<Repeat className="h-3 w-3 text-purple-600" />` → 제목 + 우측에 보라 라벨(`정기배송`) |
+| `DayEventsModal` 카드 | 카드 자체 `border-purple-200 bg-purple-50/30` + Repeat 아이콘 + 보라 라벨 |
+| `EventDetailModal` 헤더 | 제목 옆 `<Repeat className="h-4 w-4 text-purple-600" />` |
+| `EventDetailModal` 메타 영역 | `정기배송` 보라 pill + Repeat 아이콘 |
+
+```tsx
+// 패턴 — 어느 위치든 동일
+const isSubscription = !!ev.subscription_id;  // 가상 이벤트도 subscription_id 채워졌으므로 동일 분기
+{isSubscription && <Repeat className="h-3 w-3 text-purple-600" />}
+<span className={cn('rounded-full px-2 py-0.5 text-[10px]',
+  isSubscription ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-600'
+)}>{typeLabel}</span>
+```
+
+##### EventDetailModal — 정기배송 일정 → "정기배송 관리로 이동" 링크
+`subscription_id` 가 있는 일정 또는 가상 SUBSCRIPTION 이벤트는 모달 본문 하단에 보라 톤 링크 버튼 노출. 클릭 시 역할별 주문 페이지의 `subscription` 탭으로 이동.
+
+```tsx
+const isSubscription = !!event.subscription_id || event.event_type === 'SUBSCRIPTION';
+
+const handleOpenSubscription = () => {
+  router.push(role === 'buyer' ? '/buyer/orders?tab=subscription' : '/seller/orders?tab=subscription');
+};
+
+{isSubscription && (
+  <button onClick={handleOpenSubscription}
+    className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-purple-200 bg-purple-50 px-4 py-2 text-sm font-medium text-purple-700 hover:bg-purple-100">
+    <ExternalLink className="h-4 w-4" /> 정기배송 관리로 이동
+  </button>
+)}
+```
+
+`order_id` 가 있는 일정에는 기존 "주문 상세 보기" 버튼 그대로 유지 — 정기배송 일정은 `order_id == null` 이므로 두 버튼이 동시에 뜨지 않는다.
+
+##### EventDetailModal — 가상 이벤트 삭제 버튼 숨김 (함정 유지)
+`event.id`가 `'sub-virtual-'` 로 시작하거나 `event_type === 'SUBSCRIPTION'` 인 경우 DB row가 없으므로 `useDeleteCalendarEvent.mutate(event.id)`가 404를 던진다. 푸터의 삭제 버튼을 조건부로 숨겨야 한다. (백엔드 동기 정기배송 일정은 DB row 가 있으므로 삭제 가능 — 가상 이벤트만 차단)
 
 ```tsx
 const isVirtual = event.event_type === 'SUBSCRIPTION' || event.id.startsWith('sub-virtual-');
@@ -1578,6 +1896,8 @@ footer={
   </>
 }
 ```
+
+`EVENT_TYPE_OPTIONS` (일정 추가 모달의 select) 에는 `SUBSCRIPTION` 추가하지 **않음** — 사용자가 수동 등록할 수 없는 시스템 타입.
 
 ##### 정기배송 출처 뱃지 — 주문/견적 페이지
 `Order.subscription_id`가 있으면 상품 컬럼에 보라색 pill `정기 N회차`(N = `subscription_round`) 표시. 상세 슬라이드 헤더에도 같은 뱃지를 주문번호 아래에 노출.
@@ -1733,12 +2053,55 @@ seller/buyer 양쪽 page.tsx 의 차이는 다음으로만 한정 (diff 검증):
 - 컴포넌트명 (`SellerPartnersPage` vs `BuyerPartnersPage`)
 - 채팅 라우트 (`/seller/chat` vs `/buyer/chat`)
 - 주문 작성 라우트 (`/seller/orders/new?buyer_id=` vs `/buyer/browse?seller_id=`)
+- 최근 거래 컬럼 라우트 (`/seller/orders?partner_user_id=` vs `/buyer/orders?partner_user_id=`)
 - `showCreateOrderAction` (false vs true)
 - log prefix (`[seller/partners]` vs `[buyer/partners]`)
 - copy (`바이어 거래처` vs `공급처`, 검색 placeholder)
 - `myRole` ('SELLER' vs 'BUYER')
 
 즐겨찾기 토글, 삭제 핸들러, useMemo 정렬 로직 등은 양쪽 완전히 동일.
+
+##### 최근 거래 컬럼 (PM Report #8 작업 5)
+
+`partners` 응답에 `last_trade_date` (ISO 'YYYY-MM-DD'), `last_trade_amount` (KRW int) 두 옵션 필드가 포함됨. 거래 없으면 둘 다 null.
+
+거래처 목록 컬럼 순서: `즐겨찾기 / 업체명 / 유형 / 등록일 / 최근 거래 / 상태 / 액션`. 컬럼 위치는 등록일과 상태 사이.
+
+```tsx
+{
+  key: 'last_trade',
+  header: '최근 거래',
+  render: (item) => {
+    // PENDING_OUTGOING/INCOMING 은 거래가 있을 수 없으므로 항상 '아직 거래 없음'
+    const isPreTrade =
+      item.status === 'PENDING_OUTGOING' || item.status === 'PENDING_INCOMING';
+    const hasTrade =
+      !isPreTrade && item.last_trade_date != null && item.last_trade_amount != null;
+
+    if (!hasTrade) return <span className="text-sm text-gray-400">아직 거래 없음</span>;
+
+    return (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation(); // 행 onClick(상세 모달) 차단
+          router.push(`/seller/orders?partner_user_id=${item.partner_user_id}`);
+        }}
+        className="text-left text-sm text-gray-700 hover:text-primary-700 hover:underline"
+      >
+        {formatDate(item.last_trade_date as string)}
+        {' · '}
+        {(item.last_trade_amount as number).toLocaleString('ko-KR')}원
+      </button>
+    );
+  },
+},
+```
+
+- 날짜 포맷은 기존 등록일과 동일하게 `formatDate` 재사용 (ko-KR 'YYYY. MM. DD.').
+- 금액 포맷은 `.toLocaleString('ko-KR')` + '원' (천단위 콤마).
+- 행 onClick 이 거래처 상세 모달을 열기 때문에 셀 내부 버튼은 반드시 `e.stopPropagation()` 호출.
+- `PENDING_OUTGOING` 행은 다른 컬럼들과 동일하게 `opacity-60` 적용.
 
 ---
 
@@ -1804,22 +2167,55 @@ export function usePartnerStatusMap(): Map<string, PartnerStatus> {
 
 PENDING_INCOMING 카드의 수락 버튼은 회원 user_id 가 아닌 **partner row id** 를 사용한다 — `useAcceptPartner.mutate(partnerId)`. 회원 카드 컴포넌트에서는 `partnerIdByUserId.get(member.id)` 로 partner.id 매핑.
 
-##### 거래처 페이지 상단 — 받은 요청 / 보낸 요청 섹션
+##### 거래처 페이지 상단 — 받은 요청 섹션 + 메인 리스트 통합 (PENDING_OUTGOING 비대칭 버그 수정, 2026-04-28)
 
 ```tsx
-// 본인 row.status 기준으로 3분류
+// PENDING_INCOMING 만 별도 섹션 (수락/거절 액션 필요 → 분리 UI 정당)
 const incomingRequests = partners.filter((p) => p.status === 'PENDING_INCOMING');
-const outgoingRequests = partners.filter((p) => p.status === 'PENDING_OUTGOING');
+// PENDING_OUTGOING 은 메인 리스트에 통합 — 본인이 보낸 요청도 자기 거래처 화면에 보이도록
 const mainListPartners = partners.filter(
-  (p) => p.status !== 'PENDING_OUTGOING' && p.status !== 'PENDING_INCOMING'
+  (p) =>
+    p.status === 'ACTIVE' ||
+    p.status === 'INACTIVE' ||
+    p.status === 'PENDING' ||           // deprecated 호환
+    p.status === 'PENDING_OUTGOING'     // 본인이 보낸 요청도 메인 노출
 );
 ```
 
-- 받은 요청 섹션: `bg-blue-50 border border-blue-200 rounded-xl`. 각 행에 [수락] [거절] 버튼.
-- 보낸 요청 섹션: `bg-yellow-50 border border-yellow-200 rounded-xl`. "수락 대기 중" 텍스트 + [요청 회수] 버튼 (window.confirm 후 reject 호출).
-- 메인 데이터 테이블은 `mainListPartners` 만 노출 — PENDING_OUTGOING/INCOMING 은 상단 섹션에서만.
+**버그 배경**: 이전 구조에선 `PENDING_OUTGOING` row 가 메인 리스트에서 제외되고 "보낸 요청" 별도 섹션에만 표시됐다. 그런데 동일한 거래 관계의 반대편(PENDING_INCOMING) 사용자에겐 "받은 요청" 섹션에 정상 노출 → 본인 메인 거래처 리스트에서 자기 보낸 요청을 못 찾는 비대칭이 발생. **수정**: PENDING_OUTGOING 을 메인 테이블에 통합 + 시각적 구분(opacity-60 + "승인 대기 중" 안내) + 빠른 액션(채팅/주문) 비활성. "보낸 요청" 별도 섹션은 제거.
 
-`useAcceptPartner` / `useRejectPartner` 훅은 mutation 성공 시 `['partners']` 만 invalidate. accept 는 양쪽 row 가 ACTIVE 로 전환되므로 자동으로 메인 리스트에 등장.
+- 받은 요청 섹션: `bg-blue-50 border border-blue-200 rounded-xl`. 각 행에 [수락] [거절] 버튼.
+- 메인 테이블의 PENDING_OUTGOING row:
+  - 업체명 셀에 `opacity-60` 적용, 부가 텍스트로 `· 승인 대기 중` (text-yellow-700) 노출
+  - StatusBadge 는 그대로 PARTNER_STATUS_CONFIG 의 "보낸 요청" (yellow) 뱃지 표시
+  - 즐겨찾기 토글 / 채팅 버튼 / 주문 작성 버튼 모두 `disabled + cursor-not-allowed opacity-40` (아직 거래처가 아니므로)
+  - 삭제 버튼은 활성 (라벨/툴팁만 "요청 회수" 로 변경, `aria-label` 도 동일)
+  - `handleDeletePartner` 가 status 검사해서 confirm 메시지를 다르게: `'X' 에게 보낸 거래처 요청을 회수하시겠습니까?` vs `'X' 거래처를 삭제하시겠습니까?\n진행 중인 정기배송이 일시정지됩니다.`
+- 행 클릭 → PartnerDetailModal 진입 가능. 모달 안에서도 동일한 잠금 처리.
+
+##### PartnerDetailModal — PENDING_OUTGOING 잠금 처리
+
+```tsx
+const isPendingOutgoing = partner.status === 'PENDING_OUTGOING';
+
+// 헤더의 즐겨찾기 / 채팅 시작 / 주문 작성 모두 disabled + opacity-40
+// 거래처 삭제 버튼은 활성, 라벨만 "요청 회수" 로
+{isPendingOutgoing ? '요청 회수' : '거래처 삭제'}
+
+// 안내 띠 (헤더 바로 아래)
+{isPendingOutgoing && (
+  <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-yellow-800">
+    <Clock /> 보낸 거래처 요청이 수락되기 전까지 ... 거래 액션을 사용할 수 없습니다.
+  </div>
+)}
+
+// 정기배송 관련 섹션은 전부 isPendingOutgoing 일 때 숨김
+{!isPendingOutgoing && incomingPendingSubs.length > 0 && (...)}
+{!isPendingOutgoing && outgoingPendingSubs.length > 0 && (...)}
+{!isPendingOutgoing && (<section>정기배송 ({sortedSubs.length})</section>)}
+```
+
+`useAcceptPartner` / `useRejectPartner` 훅은 mutation 성공 시 `['partners']` 만 invalidate. accept 는 양쪽 row 가 ACTIVE 로 전환되므로 자동으로 메인 리스트에서 PENDING_OUTGOING → ACTIVE 로 자연 전환된다(opacity-60 / 잠금 해제 자동 적용).
 
 ##### 정기배송 SubscriptionStatus 확장
 
@@ -1960,3 +2356,82 @@ seller/buyer 양쪽 orders/page.tsx 차이는 기존과 동일하게 한정:
 - 컴포넌트명 / 페이지 description / role-specific 컬럼명 (구매자 vs 판매자) / 채팅 라우트 / `myRole` ('SELLER' vs 'BUYER')
 - 정기배송 탭 컬럼은 양쪽이 거의 동일하지만 "구매자" vs "판매자" 라벨과 buyer_name/seller_name 필드만 다름
 - 액션 동작(수락/거절/회차 생성)은 양쪽 동일
+
+---
+
+#### 정기배송 전용 페이지 (`/{role}/subscriptions`) (검증됨, 2026-04-28)
+
+V1.6 이전엔 정기배송 마스터 자체 관리는 `PartnerDetailModal` 에서만 가능했고, 주문/견적 페이지의 "정기배송" 탭은 보조 진입점일 뿐이었다. 사용자가 정기배송을 한눈에 보고 관리할 페이지가 없어 신규 추가:
+- `frontend/app/(dashboard)/seller/subscriptions/page.tsx`
+- `frontend/app/(dashboard)/buyer/subscriptions/page.tsx`
+
+##### 사이드바 메뉴 추가 (`constants/menus.ts`)
+
+거래처 다음 위치에 추가 (거래처 → 정기배송 흐름이 자연스러움):
+```ts
+{ label: '정기배송', href: '/{role}/subscriptions', icon: Repeat },
+```
+아이콘은 `lucide-react` 의 `Repeat` 사용 — `RefreshCw` 보다 "반복 일정" 의미에 적합.
+
+##### 페이지 구조 — 카드 펼침 패턴 (Modal 대체)
+
+별도 SubscriptionDetailModal 이 아직 없어 인라인 펼침으로 구현. DataTable 대신 카드 리스트로 작성:
+```tsx
+const [expandedId, setExpandedId] = useState<string | null>(null);
+// 카드 헤더 클릭 → 토글
+// 펼침 영역에 모든 액션(회차 생성/일시정지/재개/수락/거절/해지/거래처 점프) 표시
+```
+탭/필터 변경 시 `setExpandedId(null)` 로 명시적으로 닫아야 다른 탭에서 잔존 펼침 상태 노출 안 됨.
+
+##### 상태 필터 — 백엔드 단일 status + 클라이언트 묶음 처리 (함정)
+
+백엔드 `GET /subscriptions?status=...` 는 단일 status 만 받음. "종료" 처럼 ENDED/CANCELLED/REJECTED 를 묶어 보여주려면 전체 fetch 후 클라이언트 필터링:
+```ts
+interface FilterDef {
+  key: string;
+  label: string;
+  status?: SubscriptionStatus;          // 서버 필터 (단일)
+  clientStatuses?: SubscriptionStatus[];// 클라이언트 묶음 필터
+}
+const useServerStatus = !!def?.status && !def.clientStatuses;
+useSubscriptions({ status: useServerStatus ? def.status : undefined });
+```
+
+정렬은 `STATUS_PRIORITY` 로 ACTIVE > PENDING > PAUSED > ENDED > CANCELLED > REJECTED, 동일 status 내부에서는 `next_delivery_date asc`.
+
+##### 조건부 액션 노출 규칙
+
+- `showAcceptReject = status === 'PENDING' && !isMyRequest` — created_by null 또는 본인이면 본인이 보낸 요청 (수락 불가)
+- `showGenerate = status === 'ACTIVE'` — 회차 생성 액션
+- `showPauseResume = status === 'ACTIVE' || status === 'PAUSED'`
+- `showDelete = status !== 'ENDED' && status !== 'CANCELLED' && status !== 'REJECTED'` — 종결 상태는 해지 버튼 숨김
+
+##### 거래처로 이동 — 모달 점프 + fallback 라우팅
+
+행 액션 "거래처로 이동" 클릭 시:
+1. `partners` 목록에서 `partner_user_id === counterpartUserId` 매칭
+2. 매칭되면 `setSelectedPartner(partner)` → PartnerDetailModal 오픈
+3. 매칭 실패 시 (거래처 미등록 등) `router.push(PARTNERS_ROUTE)` 로 fallback
+
+##### byte-identical 유지 규칙 (정기배송 페이지)
+
+seller/buyer 차이는 다음 4개 상수로만 한정 (diff 검증 완료):
+```ts
+const PAGE_ROLE: 'SELLER' | 'BUYER' = 'SELLER';  // or 'BUYER'
+const PARTNERS_ROUTE = '/seller/partners';        // or '/buyer/partners'
+const PAGE_DESCRIPTION = '거래처별 정기배송 일정을 관리하세요';  // or 공급처별...
+const COUNTERPART_LABEL = '구매자';                // or '판매자'
+```
+
+##### TypeScript strict — `as const` 함정 (중요)
+
+`PAGE_ROLE = 'SELLER' as const` 로 좁히면 같은 파일 내에서 `PAGE_ROLE === 'BUYER'` 비교가 TS2367 에러로 잡힌다 (literal 타입 narrowing). byte-identical 정책상 양쪽 페이지 본문이 똑같이 `PAGE_ROLE === 'SELLER' ? buyer_name : seller_name` 같은 분기를 써야 하므로 **반드시 union 타입 명시**:
+```ts
+// ✅ OK — 분기 비교가 양쪽 페이지에서 모두 컴파일 통과
+const PAGE_ROLE: 'SELLER' | 'BUYER' = 'SELLER';
+
+// ❌ NO — 'as const' 는 byte-identical 페이지의 분기 비교를 깨뜨림
+const PAGE_ROLE = 'SELLER' as const;
+```
+
+이 패턴은 다른 byte-identical 페이지에도 동일하게 적용 — myRole 류 상수는 항상 union 타입으로 선언.

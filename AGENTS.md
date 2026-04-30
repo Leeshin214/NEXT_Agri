@@ -52,7 +52,7 @@
 - **Validation**: Pydantic v2
 - **WebSocket**: FastAPI WebSocket (채팅)
 - **Background**: Celery + Redis (알림, 배치)
-- **AI**: Anthropic Codex API (Codex-3-5-sonnet-20241022)
+- **AI**: OpenAI API (gpt-4o-mini)
 
 ### Database / Infra
 - **Database**: Supabase (PostgreSQL 15)
@@ -213,7 +213,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_JWT_SECRET=
-ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
 REDIS_URL=redis://localhost:6379
 DATABASE_URL=postgresql+asyncpg://...
 ```

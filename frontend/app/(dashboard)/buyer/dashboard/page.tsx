@@ -13,6 +13,7 @@ import {
 import PageHeader from '@/components/common/PageHeader';
 import SummaryCard from '@/components/common/SummaryCard';
 import StatusBadge from '@/components/common/StatusBadge';
+import TodayTasksWidget from '@/components/dashboard/TodayTasksWidget';
 import { useOrders } from '@/hooks/useOrders';
 import { useChatRooms } from '@/hooks/useChat';
 import type { ChatRoom } from '@/types';
@@ -37,6 +38,9 @@ export default function BuyerDashboardPage() {
   return (
     <div>
       <PageHeader title="대시보드" description="구매 현황을 한눈에 확인하세요" />
+
+      {/* 오늘 할 일 위젯 — PageHeader 직후 상단 노출 */}
+      <TodayTasksWidget role="buyer" />
 
       {/* 요약 카드 */}
       <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -87,17 +91,25 @@ export default function BuyerDashboardPage() {
                   className="flex items-center justify-between rounded-lg border border-gray-100 p-3 hover:bg-gray-50 cursor-pointer"
                   onClick={() => router.push('/buyer/orders')}
                 >
-                  <div>
-                    <p className="text-sm font-medium text-gray-900">{order.order_number}</p>
-                    <p className="text-xs text-gray-500">
-                      {order.delivery_date ? `납품일: ${order.delivery_date}` : '납품일 미정'}
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-gray-900">
+                      {order.product_summary
+                        ?? order.items?.[0]?.product_name
+                        ?? '주문'}
+                    </p>
+                    <p className="mt-0.5 truncate text-xs text-gray-500">
+                      {(order.seller_company ?? order.seller_name ?? '거래처 미정')}
+                      {order.delivery_date ? ` · 납품 ${order.delivery_date}` : ' · 납품일 미정'}
                     </p>
                   </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-medium text-gray-900">
-                      {order.total_amount ? `${order.total_amount.toLocaleString()}원` : '-'}
-                    </span>
-                    <StatusBadge status={order.status} />
+                  <div className="flex flex-shrink-0 flex-col items-end gap-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-gray-900">
+                        {order.total_amount ? `${order.total_amount.toLocaleString()}원` : '-'}
+                      </span>
+                      <StatusBadge status={order.status} />
+                    </div>
+                    <span className="text-[10px] text-gray-400">{order.order_number}</span>
                   </div>
                 </div>
               ))}

@@ -119,6 +119,42 @@ def _flatten_subscription_row(row: dict) -> dict:
 
 
 # ===========================================
+# 정기배송 캘린더 자동 등록 유틸리티
+# ===========================================
+# AC: 정기배송 ACCEPT(PENDING→ACTIVE) / 수정 / 취소 / 회차 주문 생성 시 양 당사자
+#      각각의 calendar_events 에 SHIPMENT(seller) / DELIVERY(buyer) 이벤트 동기화.
+# 식별자: calendar_events.subscription_id 컬럼으로 정기배송 일정 식별.
+# 멱등성: subscription_id 기준 partial unique index 로 중복 INSERT 방지.
+
+def _build_subscription_event_title(items: list[dict]) -> str:
+    """이벤트 제목 — '정기배송 - {첫 상품명}{외 N건}'.
+
+    items 가 비어있거나 product_name 이 없으면 '정기배송' 으로 fallback.
+    """
+    names = [
+        item.get("product_name")
+        for item in items or []
+        if item.get("product_name")
+    ]
+    if not names:
+        return "정기배송"
+    if len(names) == 1:
+        return f"정기배송 - {names[0]}"
+    return f"정기배송 - {names[0]} 외 {len(names) - 1}건"
+
+
+def _coerce_iso_date(value) -> Optional[str]:
+    """date / datetime / str 을 'YYYY-MM-DD' ISO 문자열로 통일."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)[:10]
+
+
+# ===========================================
 # 서비스
 # ===========================================
 class SubscriptionService:
@@ -179,6 +215,229 @@ class SubscriptionService:
                 detail="Subscription not found",
             )
         return _flatten_subscription_row(result.data[0])
+
+    # ===========================================
+    # 캘린더 자동 동기화 (정기배송 일정)
+    # ===========================================
+    # 정책:
+    #   - 정기배송 1건 → 양 당사자 calendar_events 각각 1건씩 (subscription_id 로 식별)
+    #     판매자 측 = SHIPMENT, 구매자 측 = DELIVERY
+    #   - status='ACTIVE' 인 정기배송만 캘린더 등록 (PENDING 은 일정 X)
+    #   - 멱등성: subscription_id 기준 active row 가 이미 존재하면 INSERT 대신 UPDATE
+    #   - 실패 시: 정기배송 mutation 자체는 막지 않고 로그만 남김 (best-effort)
+    #
+    # 호출 시점:
+    #   - accept_subscription            : INSERT (PENDING→ACTIVE 전환 직후)
+    #   - update_subscription            : UPDATE (frequency / next_delivery_date 변경 등)
+    #                                      또는 status=CANCELLED/ENDED/REJECTED 시 cleanup
+    #   - delete_subscription            : cleanup (미래 일정 soft-delete)
+    #   - generate_order_for_round       : 새 next_delivery_date 의 신규 INSERT
+    #                                      (회차 주문은 별도 order-linked 이벤트가 따로 생김)
+
+    def _build_subscription_event_payload(
+        self,
+        *,
+        subscription_id: str,
+        user_id: str,
+        event_type: str,
+        event_date: str,
+        title: str,
+        description: str,
+    ) -> dict:
+        """subscription-only calendar_events INSERT/UPDATE payload."""
+        return {
+            "user_id": user_id,
+            "subscription_id": subscription_id,
+            "order_id": None,
+            "event_type": event_type,
+            "event_date": event_date,
+            "title": title,
+            "description": description,
+            "is_allday": True,
+        }
+
+    async def _upsert_subscription_event(
+        self,
+        *,
+        subscription_id: str,
+        user_id: str,
+        event_type: str,
+        event_date: str,
+        title: str,
+        description: str,
+    ) -> None:
+        """한 user 의 subscription-only 활성 이벤트 1건 보장 (INSERT or UPDATE).
+
+        - 같은 (subscription_id, user_id) 기준 active row 가 이미 있으면 그 row 를 UPDATE.
+        - 없으면 INSERT. partial unique index 충돌(23505) 발생 시 race 로 보고 무시.
+        """
+        # 기존 active row 조회 — partial unique index 가 보장하는 0~1개
+        existing_result = await asyncio.to_thread(
+            lambda: self.calendar_table.select("id, event_date")
+            .eq("subscription_id", subscription_id)
+            .eq("user_id", user_id)
+            .is_("deleted_at", None)
+            .limit(1)
+            .execute()
+        )
+        existing = (existing_result.data or [None])[0]
+
+        if existing:
+            # UPDATE — title/event_date/event_type/description 동기화
+            update_payload = {
+                "event_type": event_type,
+                "event_date": event_date,
+                "title": title,
+                "description": description,
+                "is_allday": True,
+                "order_id": None,
+            }
+            try:
+                await asyncio.to_thread(
+                    lambda: self.calendar_table.update(update_payload)
+                    .eq("id", existing["id"])
+                    .execute()
+                )
+            except Exception as e:
+                print(
+                    f"[subscription_service._upsert_subscription_event] UPDATE 실패 "
+                    f"sub={subscription_id} user={user_id}: {type(e).__name__}: {e}"
+                )
+            return
+
+        # INSERT
+        payload = self._build_subscription_event_payload(
+            subscription_id=subscription_id,
+            user_id=user_id,
+            event_type=event_type,
+            event_date=event_date,
+            title=title,
+            description=description,
+        )
+        try:
+            await asyncio.to_thread(
+                lambda: self.calendar_table.insert(payload).execute()
+            )
+        except Exception as e:
+            err_msg = str(e).lower()
+            # partial unique index 충돌(23505) — 다른 동시 호출이 먼저 INSERT.
+            # 정상 race 이므로 무시.
+            if "23505" in err_msg or "duplicate" in err_msg:
+                return
+            print(
+                f"[subscription_service._upsert_subscription_event] INSERT 실패 "
+                f"sub={subscription_id} user={user_id}: {type(e).__name__}: {e}"
+            )
+
+    async def _sync_subscription_calendar_events(
+        self, sub: dict, *, ignore_errors: bool = True
+    ) -> None:
+        """정기배송 → 양 당사자 calendar_events 동기화 (UPSERT).
+
+        - status != 'ACTIVE' 또는 next_delivery_date 누락이면 cleanup 만 수행 (활성 row 정리).
+        - status='ACTIVE' + next_delivery_date 있음 → seller=SHIPMENT, buyer=DELIVERY UPSERT.
+        - title 은 items 의 첫 product_name 기반.
+        """
+        try:
+            sub_id = str(sub.get("id"))
+            if not sub_id or sub_id == "None":
+                return
+
+            sub_status = sub.get("status")
+            next_date = _coerce_iso_date(sub.get("next_delivery_date"))
+
+            # ACTIVE 가 아니거나 다음 일정이 없으면 활성 일정 정리
+            if sub_status != "ACTIVE" or not next_date:
+                await self._cleanup_subscription_future_events(sub_id)
+                return
+
+            seller_id = str(sub.get("seller_id")) if sub.get("seller_id") else None
+            buyer_id = str(sub.get("buyer_id")) if sub.get("buyer_id") else None
+            items = sub.get("items") or []
+            title = _build_subscription_event_title(items)
+
+            # 부가 정보
+            description_parts = [f"정기배송 다음 회차 — {next_date}"]
+            total_amount = sub.get("total_amount")
+            if total_amount is not None:
+                try:
+                    description_parts.append(f"금액: {int(total_amount):,}원")
+                except (TypeError, ValueError):
+                    pass
+            frequency = sub.get("frequency")
+            if frequency:
+                description_parts.append(f"주기: {frequency}")
+            description = "\n".join(description_parts)
+
+            # 양쪽 user 동기화 — 한 쪽 실패해도 다른 쪽은 계속 진행
+            if seller_id:
+                try:
+                    await self._upsert_subscription_event(
+                        subscription_id=sub_id,
+                        user_id=seller_id,
+                        event_type="SHIPMENT",
+                        event_date=next_date,
+                        title=title,
+                        description=description,
+                    )
+                except Exception as e:
+                    print(
+                        f"[subscription_service._sync_subscription_calendar_events] "
+                        f"seller upsert 실패 (무시): {type(e).__name__}: {e}"
+                    )
+            if buyer_id:
+                try:
+                    await self._upsert_subscription_event(
+                        subscription_id=sub_id,
+                        user_id=buyer_id,
+                        event_type="DELIVERY",
+                        event_date=next_date,
+                        title=title,
+                        description=description,
+                    )
+                except Exception as e:
+                    print(
+                        f"[subscription_service._sync_subscription_calendar_events] "
+                        f"buyer upsert 실패 (무시): {type(e).__name__}: {e}"
+                    )
+        except Exception as e:
+            if ignore_errors:
+                print(
+                    f"[subscription_service._sync_subscription_calendar_events] "
+                    f"전체 실패 (무시): {type(e).__name__}: {e}"
+                )
+            else:
+                raise
+
+    async def _cleanup_subscription_future_events(
+        self, subscription_id: str, *, only_future: bool = True
+    ) -> None:
+        """정기배송에 연결된 미래 활성 이벤트 soft-delete.
+
+        only_future=True (기본):
+          event_date >= today 인 활성 이벤트만 정리.
+          (회차 주문이 이미 생성된 과거 일정은 이력 보존.)
+        only_future=False:
+          모든 활성 이벤트 정리 (사용 시 주의).
+        """
+        try:
+            deleted_at = datetime.now(timezone.utc).isoformat()
+            today_str = date.today().isoformat()
+
+            query = (
+                self.calendar_table.update({"deleted_at": deleted_at})
+                .eq("subscription_id", subscription_id)
+                .is_("deleted_at", None)
+            )
+            if only_future:
+                query = query.gte("event_date", today_str)
+
+            await asyncio.to_thread(lambda: query.execute())
+        except Exception as e:
+            print(
+                f"[subscription_service._cleanup_subscription_future_events] "
+                f"실패 (무시): sub={subscription_id}, {type(e).__name__}: {e}"
+            )
 
     # ===========================================
     # CRUD
@@ -430,7 +689,12 @@ class SubscriptionService:
             .is_("deleted_at", None)
             .execute()
         )
-        return await self._get_subscription_or_404(subscription_id)
+        # 캘린더 동기화 (AC 3, 4):
+        #   - status 가 ACTIVE 면 최신 next_delivery_date 로 UPSERT
+        #   - status 가 CANCELLED/ENDED/REJECTED/PAUSED 등 비활성 → 미래 일정 cleanup
+        updated_sub = await self._get_subscription_or_404(subscription_id)
+        await self._sync_subscription_calendar_events(updated_sub)
+        return updated_sub
 
     async def delete_subscription(
         self, subscription_id: UUID, user_id: UUID
@@ -446,6 +710,10 @@ class SubscriptionService:
             .is_("deleted_at", None)
             .execute()
         )
+        # AC 4 — 정기배송 삭제 시 미래 시점 calendar_events 정리
+        # (이미 회차 주문이 생성되어 과거 일정이 된 row 는 이력 보존)
+        if result.data:
+            await self._cleanup_subscription_future_events(str(subscription_id))
         return bool(result.data)
 
     # ===========================================
@@ -517,7 +785,10 @@ class SubscriptionService:
             .is_("deleted_at", None)
             .execute()
         )
-        return await self._get_subscription_or_404(subscription_id)
+        # ACTIVE 전환 후 최신 row 로 calendar_events 동기화 (AC 1, 2)
+        accepted_sub = await self._get_subscription_or_404(subscription_id)
+        await self._sync_subscription_calendar_events(accepted_sub)
+        return accepted_sub
 
     async def reject_subscription(
         self, subscription_id: UUID, user_id: UUID
@@ -554,6 +825,9 @@ class SubscriptionService:
             .is_("deleted_at", None)
             .execute()
         )
+        # REJECTED 상태로 전환되었으니 혹시 남아있을 미래 일정 정리 (방어적)
+        # 정상 흐름에서는 PENDING 상태였으므로 calendar_events 가 없어야 함.
+        await self._cleanup_subscription_future_events(str(subscription_id))
         return await self._get_subscription_or_404(subscription_id)
 
     # ===========================================
@@ -779,6 +1053,20 @@ class SubscriptionService:
             print(
                 f"[subscription_service.generate_order_for_round] "
                 f"next_delivery_date 갱신 실패 (무시): {type(e).__name__}: {e}"
+            )
+
+        # AC 5 — 회차 주문 생성으로 next_delivery_date 가 다음 회차로 이동했으니
+        # subscription-linked calendar_events 도 새 next_delivery_date 로 동기화.
+        # 기존 회차의 (이미 PAST 가 된) order-linked 일정은 위에서 이미 INSERT 됐으므로
+        # 그대로 두되, subscription-linked active row 만 새 날짜로 UPSERT.
+        # ENDED 로 전환된 경우엔 _sync_subscription_calendar_events 가 cleanup 분기를 탄다.
+        try:
+            refreshed_sub = await self._get_subscription_or_404(UUID(sub_id_str))
+            await self._sync_subscription_calendar_events(refreshed_sub)
+        except Exception as e:
+            print(
+                f"[subscription_service.generate_order_for_round] "
+                f"subscription calendar 동기화 실패 (무시): {type(e).__name__}: {e}"
             )
 
         # 최신 order 다시 조회해 반환

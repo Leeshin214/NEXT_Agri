@@ -8,6 +8,7 @@ import Modal from '@/components/common/Modal';
 import MessageBubble from '@/components/chat/MessageBubble';
 import OrderContextBanner from '@/components/chat/OrderContextBanner';
 import PriceOfferPopover from '@/components/chat/PriceOfferPopover';
+import DeliveryDatePopover from '@/components/chat/DeliveryDatePopover';
 import {
   useChatRooms,
   useMessagesWithWebSocket,
@@ -56,9 +57,11 @@ export default function SellerChatPage() {
 
   const selectedRoom = rooms.find((r) => r.id === selectedRoomId);
   const linkedOrderId = selectedRoom?.order_id ?? null;
-  // 헤더 배너에서 사용할 주문 합계를 가격 제시 popover 의 placeholder 로 재사용
+  // 헤더 배너에서 사용할 주문 정보를 빠른 액션 popover 들의 placeholder/가드로 재사용
   const { data: linkedOrderData } = useOrder(linkedOrderId ?? '');
   const linkedOrderTotal = linkedOrderData?.data?.total_amount ?? null;
+  const linkedOrderStatus = linkedOrderData?.data?.status ?? null;
+  const linkedOrderDeliveryDate = linkedOrderData?.data?.delivery_date ?? null;
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -338,6 +341,12 @@ export default function SellerChatPage() {
                     roomId={selectedRoomId}
                     orderId={linkedOrderId}
                     currentTotal={linkedOrderTotal}
+                  />
+                  <DeliveryDatePopover
+                    roomId={selectedRoomId}
+                    orderId={linkedOrderId}
+                    orderStatus={linkedOrderStatus}
+                    currentDeliveryDate={linkedOrderDeliveryDate}
                   />
                   <input
                     value={message}

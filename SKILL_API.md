@@ -71,8 +71,7 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_JWT_SECRET: str
-    ANTHROPIC_API_KEY: str
-    OPENAI_API_KEY: str = ""   # GPT 스케줄 에이전트용
+    OPENAI_API_KEY: str = ""   # 백엔드 LLM 호출 전부 OpenAI 통일 (gpt-4o-mini)
     DATABASE_URL: str
     REDIS_URL: str = "redis://localhost:6379"
     CORS_ORIGINS: list[str] = ["http://localhost:3000"]
@@ -234,6 +233,13 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 # GET /orders - 주문 목록 (역할에 따라 내 주문)
 #   - order_status: Optional[str]                     단일 상태 (backward compat)
 #   - status_in:    Optional[list[str]] = Query(None) 다중 상태 — ?status_in=A&status_in=B
+#   - partner_user_id: Optional[UUID] = Query(None)   특정 거래처 user.id 양방향 OR 매칭
+#                                                      (PM Report #8 작업 5 후속, 2026-04-28)
+#                                                      (me==buyer AND counterpart==seller) OR
+#                                                      (me==seller AND counterpart==buyer)
+#                                                      → 전달 시 역할 기반 자동 필터를 대체.
+#                                                      거래처 페이지 "최근 거래" 셀 클릭 시
+#                                                      `?partner_user_id=...` 라우팅과 1:1 매칭.
 #   - page:  Query(1, ge=1)
 #   - limit: Query(20, ge=1, le=2000)                 프론트가 탭별 전체 조회 시 1000~2000 사용
 #   둘 다 전달 시 status_in 이 우선 적용. 빈 list 면 단일 status fallback 안 함.
@@ -241,6 +247,36 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 # POST /orders - 견적 요청 (구매자만)
 # PATCH /orders/{id}/status - 상태 변경
 # POST /orders/{id}/items - 아이템 추가
+
+# 협상 (counter-offer) — 가격 협상
+# POST   /orders/{id}/counter-offers                       제시
+# POST   /orders/{id}/counter-offers/{offer_id}/accept     수락 → orders.total_amount 갱신
+# POST   /orders/{id}/counter-offers/{offer_id}/reject     거절
+# GET    /orders/{id}/counter-offers                       이력 (시간 역순)
+
+# 납품일 변경 (delivery-date-changes) — 2026-04-29 신규
+# POST   /orders/{id}/delivery-date-changes                            제시
+# POST   /orders/{id}/delivery-date-changes/{change_id}/accept         수락 → orders.delivery_date 갱신
+#                                                                       + calendar_events 재동기화
+#                                                                       + DELIVERY_DATE_ACCEPTED 채팅 메시지
+# POST   /orders/{id}/delivery-date-changes/{change_id}/reject         거절
+# GET    /orders/{id}/delivery-date-changes                            이력 (시간 역순)
+#
+# Body (POST /delivery-date-changes):
+#   { proposed_delivery_date: "YYYY-MM-DD",  # KST 기준 오늘 이상, 과거 → 422
+#     notes: Optional[str] }
+# Response: DeliveryDateChangeResponse {id, order_id, from_user_id, from_role,
+#   proposed_delivery_date, notes, status (PENDING|ACCEPTED|REJECTED|SUPERSEDED),
+#   responded_at, responded_by, created_at, updated_at,
+#   from_user_name?, from_user_company?  # 동적 주입 (list 시 N+1 회피 일괄 join)}
+#
+# 가드:
+#   - 주문 당사자(BUYER/SELLER)만 접근
+#   - 제시: 주문 status ∈ {QUOTE_REQUESTED, NEGOTIATING, CONFIRMED} 만 허용
+#           (PREPARING 이상은 출하 준비 단계라 차단)
+#   - 본인이 제시한 PENDING 은 본인이 accept/reject 불가 (상대방만)
+#   - 신규 제시 시 같은 주문의 이전 PENDING 은 모두 SUPERSEDED 마킹
+#     + messages.metadata.status 도 동기화 (negotiation 패턴과 동일)
 ```
 
 ### calendar.py (일정 API)
@@ -257,25 +293,16 @@ router = APIRouter(prefix="/calendar", tags=["calendar"])
 # PATCH /calendar/{id} - 일정 수정
 # DELETE /calendar/{id} - 일정 삭제 (soft)
 #
+# 응답 (CalendarEventResponse) — 정기배송 일정 식별 (2026-04-28):
+#   - subscription_id: Optional[UUID]
+#     정기배송으로 자동 등록된 일정이면 채워짐. 프론트는 이 필드로
+#     "정기배송 일정" 라벨/배지/색상 구분 가능.
+#   - subscription-only 일정은 order_id=NULL, event_type=SHIPMENT(seller)/DELIVERY(buyer)
+#
 # 호출 예:
 #   GET /api/v1/calendar                      → 전체 active 일정
 #   GET /api/v1/calendar?year=2026&month=5    → 5월만
 #   GET /api/v1/calendar?year=2026            → year 만 단독은 전체 반환 (month 없으면 year 무시)
-```
-
-### schedule_agent.py (GPT 스케줄 조율 에이전트 API)
-```python
-router = APIRouter(prefix="/schedule-agent", tags=["schedule-agent"])
-
-# POST /schedule-agent/recommend
-# Request:  { year: int, month: int }
-# Response: SuccessResponse[ScheduleRecommendResponse]
-#   - has_recommendation: bool
-#   - recommendations: list[ScheduleRecommendation]  (최대 3개)
-#   - message: str
-# 인증 필요 (get_current_user), 역할 무관 (SELLER/BUYER 모두 사용)
-# 내부적으로 calendar_events, products, orders를 조회해 GPT-4o-mini에게 전달
-# OPENAI_API_KEY 환경변수 필요
 ```
 
 ### ai_assistant.py (AI 도우미 API)
@@ -293,6 +320,21 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 # - DB에서 최근 대화 10개 조회 후 history로 전달
 # - 응답: SuccessResponse[dict] — { response: str, tools_used: list[str] }
 # - 대화 후 ai_conversations 테이블에 저장 (prompt_type = ",".join(tools_used))
+#
+# 라우터(orchestrator_node) 분류 4종 (2026-04-29 CALENDAR 분기 추가):
+#   - INVENTORY / ORDER → inventory_order_node (16개 tool)
+#   - CALENDAR + DATA   → calendar_data_node (TOOLS_CALENDAR 2개만 노출)
+#                          단순 일정 조회/등록 처리
+#   - CALENDAR + REASON → calendar_reason_node
+#                          schedule_agent.get_recommendation 으로 추천 데이터 받고 자연어화
+#   - GENERAL           → response_node
+# 라우터 응답 스키마 (LLM JSON):
+#   {"intent":"INVENTORY"} | {"intent":"ORDER"}
+#   {"intent":"CALENDAR","subtype":"DATA","target_year":YYYY,"target_month":MM}
+#   {"intent":"CALENDAR","subtype":"REASON","target_year":YYYY,"target_month":MM}
+#   {"intent":"GENERAL","response":"..."}
+# target_year/month 폴백: DATA=이번달, REASON=다음달 (라우터 LLM 추출 실패 시 datetime.now() 기준)
+# 응답 스키마는 변경 없음 — 프론트엔드 수정 불필요
 ```
 
 ### subscriptions.py (정기배송 API — V1.5 Phase 1, V1.6 양방향 승인 2026-04-28)
@@ -323,6 +365,55 @@ router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 #   3) calendar_events INSERT (양쪽 user; 실패해도 주문 살림)
 #   4) subscription.next_delivery_date 갱신 (compute_next_date)
 #   5) end_date 도달 시 status=ENDED 자동 전환
+#   6) subscription-linked calendar_events UPSERT (새 next_delivery_date 로)
+
+# 캘린더 자동 동기화 (2026-04-28, 마이그레이션 20260428000003):
+#   - calendar_events.subscription_id 컬럼으로 정기배송 일정 식별.
+#   - accept_subscription   : seller=SHIPMENT, buyer=DELIVERY 신규 INSERT
+#   - update_subscription   : ACTIVE 면 next_delivery_date 동기화, 비활성이면 미래 일정 cleanup
+#   - delete_subscription   : 미래 일정만 soft-delete (event_date >= today)
+#   - reject_subscription   : 방어적 cleanup (정상 흐름엔 일정 없음)
+#   - 멱등성: partial unique index uniq_calendar_events_active_subscription_user_date 로
+#            (subscription_id, user_id, event_date) 활성 행 1개 보장.
+#   - 실패 정책: best-effort, 주문/정기배송 자체는 막지 않고 로그만 남김.
+```
+
+### notifications.py (알림 API — 2026-04-29)
+```python
+router = APIRouter(prefix="/notifications", tags=["notifications"])
+
+# GET  /notifications?limit=30&only_unread=false
+#   응답: SuccessResponse[list[NotificationResponse]] + meta {unread_count, total}
+#   limit: 1~100 (기본 30)
+#   only_unread=True 면 미읽음만 (total = unread_count)
+# GET  /notifications/unread-count
+#   응답: SuccessResponse[{unread_count: int}]  — 가벼운 폴링 fallback
+# POST /notifications/{notification_id}/read
+#   응답: SuccessResponse[NotificationResponse] — 단건 읽음
+#   404: 본인 알림 아님 또는 존재하지 않음
+# POST /notifications/read-all
+#   응답: SuccessResponse[{updated: int}] — 미읽음 전체 읽음 처리
+
+# 알림 타입 (DB CHECK 제약과 1:1):
+#   NEW_MESSAGE, COUNTER_OFFER, OFFER_ACCEPTED, OFFER_REJECTED,
+#   DELIVERY_DATE_CHANGE, DELIVERY_DATE_ACCEPTED, DELIVERY_DATE_REJECTED,
+#   ORDER_STATUS
+
+# INSERT 는 외부 노출 없음 — 서버 내부 emit 만 (notification_service.emit):
+#   - order_service: 7곳 (counter offer 3 + delivery date 3 + status 1)
+#   - chat_service.send_message: 1곳 (TEXT 만, sender == receiver skip)
+# emit 시그니처:
+#   await notification_service.emit(
+#       user_id, type, title, body,
+#       link_url=None, order_id=None, room_id=None,
+#   )
+# - 실패해도 호출처(주문/채팅) 흐름 막지 않음 (try/except + logger.error)
+# - link_url 은 수신자 role 기준 (`/buyer/orders?id=...`, `/seller/chat?room_id=...`)
+# - 자기 자신에게는 발송 안 함 (sender == receiver 면 skip)
+
+# RLS: notifications_select_own / notifications_update_own (auth.uid() ↔ users.supabase_uid)
+# INSERT 정책 미정의 → service_role 만 INSERT 가능 (anon/authenticated 차단).
+# Supabase Realtime publication 등록 → 프론트가 종 아이콘 즉시 갱신 가능.
 ```
 
 ### partners.py (거래처 API — V1.6 양방향 승인 모델 2026-04-28)
@@ -438,8 +529,7 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 celery==5.4.0
 redis==5.2.1
-anthropic==0.42.0
-openai>=1.58.0
+openai>=1.0.0
 pytest==8.3.4
 pytest-asyncio==0.24.0
 pytest-cov==6.0.0
@@ -469,6 +559,13 @@ pytest-cov==6.0.0
 > 가설이나 일반적인 FastAPI 지식은 추가하지 않는다.
 
 ### 검증된 패턴
+
+- **응답 표기 정책 — 상품·거래처·날짜·상태 메인, 주문번호는 부가 (2026-04-29)**: 주문/배송/일정 응답에서 LLM·프론트 모두 `[상품명] · [거래처명(company_name 우선, name 폴백)] · [날짜] · [상태]` 를 메인으로 쓰고 `order_number` 는 부가 식별자다. AGENT_BASE_SYSTEM 안의 `[응답 표기 정책 — 중요]` 단락 + `calendar_data_node` / `calendar_reason_node` 시스템 프롬프트 끝부분의 "응답 형식: 상품명 · 거래처명 · 날짜 · 상태 순으로 자연스럽게 풀어 쓰고, 주문번호는 끝에 작게 부연한다." 한 줄로 LLM 가이드. 백엔드 응답 데이터 측에서는 다음 3 위치에 buyer/seller/product 평탄화 필드를 일관 추가:
+  - `CalendarEventResponse` (`schemas/calendar.py`) — `buyer_name/buyer_company/seller_name/seller_company` Optional 추가 (기존 `order_number/product_name/order_status` 옆).
+  - `calendar_service._flatten_event_row` + `CALENDAR_SELECT_WITH_JOINS` + `list_events` 의 batch orders select — `users!buyer_id(name,company_name)` / `users!seller_id(name,company_name)` 임베딩 추가.
+  - `agent_tools.get_orders` / `get_order_detail` / `get_calendar_events` — 동일 임베딩 + 평탄화. `get_orders` 는 `product_summary` ("{첫 상품명}" 또는 "{첫 상품명} 외 N건") + `items_count` 추가, `get_order_detail` items 는 `product_name`/`product_unit` 평탄화. LLM 토큰 절약을 위해 nested 임베딩 객체는 응답에서 제거하고 평탄화된 필드만 남긴다.
+
+- **OpenAI 클라이언트는 `app/core/llm.py` 헬퍼 통해서만 생성 (2026-04-29 통일)**: 백엔드의 모든 LLM 호출은 `get_openai_client()` (비동기) / `get_openai_sync_client()` (동기) 싱글톤을 사용한다. 다른 모듈에서 `AsyncOpenAI` / `openai.OpenAI` 를 직접 인스턴스화하지 않는다. 이유는 (1) 키/모델 정책 변경 시 한 곳만 고치면 됨, (2) `AsyncOpenAI` 의 내부 httpx 클라이언트가 첫 호출 시점의 이벤트 루프에 바인딩되므로 lazy 싱글톤이 안전. 기본 모델은 `DEFAULT_MODEL = "gpt-4o-mini"`. requirements.txt 는 `openai>=1.0.0` 만 두고 `anthropic` 패키지는 더 이상 사용하지 않음.
 
 - **HTTPBearer(auto_error=False)**: CORS preflight(OPTIONS) 요청은 Authorization 헤더를 보내지 않는다.
   기본값 `auto_error=True`이면 FastAPI가 OPTIONS 요청을 바로 400/403으로 차단한다.
@@ -535,6 +632,13 @@ pytest-cov==6.0.0
       messages=messages,
   )
   ```
+
+- **LangGraph 노드별 TOOLS 분리 시 시스템 프롬프트 동기화 필수 (2026-04-29 검증)**: 한 노드가 보유하던 도구를 별도 노드로 옮길 때(예: `inventory_order_node` 의 캘린더 도구 2개를 `calendar_data_node` 의 `TOOLS_CALENDAR` 로 이동), 도구 정의만 옮기고 원래 노드의 시스템 프롬프트를 그대로 두면 LLM 이 존재하지 않는 도구를 호출 시도해서 OpenAI API 가 tool 이름을 모른다고 거부하거나, 가이드와 실제 도구 노출이 어긋나 답변이 어색해진다. 반드시 다음 4 영역을 동시에 정리한다.
+  - 시스템 프롬프트 안의 `[사용 가능한 도구]` 목록에서 옮긴 도구 이름 삭제
+  - CASE 매트릭스에서 해당 도구 호출 케이스 통째 삭제 (CASE 번호 재정렬 권장)
+  - FEW_SHOT_EXAMPLES 의 시나리오 예시에서 해당 도구 호출 라인 삭제 또는 시나리오 자체 삭제
+  - "별도 분기로 라우팅된다" 한 줄을 추가해 LLM 이 옮긴 도구를 책임지지 않음을 명시
+  검증: `grep -n "<도구이름>" orchestrator.py` 결과가 `TOOLS_<NEW>` 정의·새 노드 docstring·새 노드 시스템 프롬프트 외에 남으면 안 된다. 또한 백엔드 자동 sync(예: `_sync_calendar_events_for_order_id`) 가 이미 도구 호출을 대체하고 있다면 시스템 프롬프트에 "백엔드 자동 sync 처리" 한 줄을 남겨 LLM 이 직접 등록하지 않도록 명시.
 
 ### 주의사항 & 함정
 
@@ -1024,3 +1128,8 @@ pytest-cov==6.0.0
   - `event_type='SHIPMENT'` 또는 `'ORDER'` 등 calendar_events.CHECK 제약과 일치해야 함.
   - DB 의 `uniq_calendar_events_active_order_user_date` partial unique index 와 충돌 시 23505 발생 가능 — try/except 로 무시 (정상 race).
   - manual event 만 다루는 calendar_service 와는 격리된 기능으로 본다.
+
+- **함수 파라미터로 builtin shadow 금지 — `type`, `id`, `list`, `dict` 등 (2026-04-29 latent bug 수정)**: Python 함수 시그니처에서 builtin 식별자를 그대로 파라미터명으로 쓰면 함수 본문 안에서 해당 builtin 호출이 차단된다. 특히 except 핸들러에서 `type(e).__name__` 같이 에러 분류 패턴을 쓰는데 시그니처에 `type: str` 이 있으면 `TypeError: 'str' object is not callable` 이 발생해 INSERT 실패 시 로그 자체가 깨진다. **검증된 사례**: `notification_service.emit(..., type: str, ...)` 가 105 line 의 `type(e).__name__` 를 파괴 — `notification_type: str` 으로 rename 하여 해결. 호출처(`chat_service.py`, `order_service.py`)도 keyword arg 를 `notification_type=` 으로 일괄 변경. **체크리스트**:
+  - 새 service 메서드 작성 시 파라미터명에 builtin 사용 금지 (`type` → `notification_type`/`event_type`/`message_type`, `id` → `resource_id`/`user_id`, `list` → `items`, `dict` → `payload`, `format` → `output_format`).
+  - 기존 코드 리뷰 시: `def fn(..., type: str, ...)` 같은 시그니처를 grep 으로 발견하면 우선 수정 대상.
+  - 로그 포맷 문자열 안의 `type=%s` 는 builtin 호출이 아니므로 문제 없음 — 시그니처 파라미터만 주의.

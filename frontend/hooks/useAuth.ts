@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation';
 import { useQueryClient } from '@tanstack/react-query';
 import { createClient } from '@/lib/supabase/client';
 import { useAuthStore } from '@/store/authStore';
+import { useAIChatStore } from '@/store/aiChatStore';
 
 /**
  * useAuth — TopBar 등에서 user 정보 조회와 signOut만 담당.
@@ -20,6 +21,8 @@ export function useAuth() {
     const supabase = createClient();
     await supabase.auth.signOut();
     queryClient.clear();
+    // AI 대화 캐시 초기화 — 다른 계정으로 로그인 시 이전 사용자 대화 노출 방지
+    useAIChatStore.getState().clearMessages();
     logout();
     router.replace('/login');
   };

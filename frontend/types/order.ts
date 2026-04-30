@@ -72,6 +72,8 @@ export interface Order {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  /** 백엔드가 제공하는 상품 요약 (예: "사과 외 2건"). 미제공 시 items[0].product_name 으로 폴백. */
+  product_summary?: string | null;
 }
 
 export interface OrderCreate {
@@ -107,4 +109,36 @@ export interface CounterOffer {
   responded_at: string | null;
   responded_by: string | null;
   created_at: string;
+}
+
+// 납품일 변경 요청 (delivery_date_change_history)
+// 백엔드 DeliveryDateChangeResponse Pydantic 스키마와 동기화.
+export type DeliveryDateChangeStatus =
+  | 'PENDING'
+  | 'ACCEPTED'
+  | 'REJECTED'
+  | 'SUPERSEDED';
+
+export interface DeliveryDateChange {
+  id: string;
+  order_id: string;
+  from_user_id: string;
+  from_role: FromRole;
+  /** YYYY-MM-DD */
+  proposed_delivery_date: string;
+  notes: string | null;
+  status: DeliveryDateChangeStatus;
+  responded_at: string | null;
+  responded_by: string | null;
+  created_at: string;
+  updated_at: string;
+  // 백엔드 join 필드 — users 임베딩에서 평탄화
+  from_user_name: string | null;
+  from_user_company: string | null;
+}
+
+export interface DeliveryDateChangeCreate {
+  /** YYYY-MM-DD */
+  proposed_delivery_date: string;
+  notes?: string;
 }

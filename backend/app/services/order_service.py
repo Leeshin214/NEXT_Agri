@@ -12,6 +12,8 @@ from app.core.supabase import get_supabase_client
 from app.schemas.common import PaginationMeta
 # chat_service 는 order_service 를 import 하지 않으므로 순환 import 안전 (Option A)
 from app.services.chat_service import chat_service
+# notification_service 도 단방향 의존 — 알림 INSERT 만 수행 (역참조 없음)
+from app.services.notification_service import notification_service
 from app.websocket.connection_manager import manager as ws_manager
 
 
@@ -125,6 +127,10 @@ class OrderService:
     @property
     def negotiations(self):
         return self.client.table("negotiation_history")
+
+    @property
+    def delivery_date_changes(self):
+        return self.client.table("delivery_date_change_history")
 
     @property
     def calendar_events(self):
@@ -505,6 +511,89 @@ class OrderService:
         except Exception as e:
             print(f"[order_service] _emit_chat_event 실패: {type(e).__name__}: {e}")
 
+    # ===========================================
+    # 알림(Notification) emit 헬퍼
+    # ===========================================
+    async def _get_user_meta(self, user_id: str) -> dict:
+        """notification 발신자 표시용 사용자 정보 조회 (name, company_name, role).
+
+        조회 실패 시 빈 dict — emit 흐름은 끊지 않고 계속.
+        """
+        try:
+            result = await asyncio.to_thread(
+                lambda: self.client.table("users")
+                .select("id, name, company_name, role")
+                .eq("id", user_id)
+                .single()
+                .execute()
+            )
+            return result.data or {}
+        except Exception as e:
+            print(
+                f"[order_service._get_user_meta] 조회 실패 (무시): "
+                f"user_id={user_id}, error={type(e).__name__}: {e}"
+            )
+            return {}
+
+    @staticmethod
+    def _build_order_link(order_id: str, recipient_role: str) -> str:
+        """알림 link_url — 수신자 역할 기준 (buyer/seller) 으로 라우팅."""
+        prefix = "buyer" if recipient_role == "BUYER" else "seller"
+        return f"/{prefix}/orders?id={order_id}"
+
+    async def _emit_order_notification(
+        self,
+        *,
+        order: dict,
+        sender_id: str,
+        notif_type: str,
+        title: str,
+        body: str,
+    ) -> None:
+        """주문 관련 알림을 상대방(수신자) 한 명에게 emit.
+
+        - order 의 buyer_id/seller_id 중 sender_id 가 아닌 쪽이 수신자.
+        - 자기 자신에게는 보내지 않음 (sender_id == receiver_id 면 skip).
+        - 실패해도 다른 흐름 막지 않음 (try/except + 로그).
+        """
+        try:
+            buyer_id = str(order.get("buyer_id") or "")
+            seller_id = str(order.get("seller_id") or "")
+            order_id = str(order.get("id") or "")
+            sender_id_str = str(sender_id)
+
+            if not order_id or not buyer_id or not seller_id:
+                return
+
+            # 수신자 결정
+            if sender_id_str == buyer_id:
+                receiver_id = seller_id
+                receiver_role = "SELLER"
+            elif sender_id_str == seller_id:
+                receiver_id = buyer_id
+                receiver_role = "BUYER"
+            else:
+                # sender 가 주문 당사자가 아님 → 어디로 보낼지 모름, skip
+                return
+
+            # 자기 자신 skip
+            if receiver_id == sender_id_str:
+                return
+
+            await notification_service.emit(
+                user_id=receiver_id,
+                notification_type=notif_type,
+                title=title,
+                body=body,
+                link_url=self._build_order_link(order_id, receiver_role),
+                order_id=order_id,
+            )
+        except Exception as e:
+            print(
+                f"[order_service._emit_order_notification] 실패 (무시): "
+                f"type={notif_type}, error={type(e).__name__}: {e}"
+            )
+
     async def list_orders(
         self,
         *,
@@ -512,14 +601,23 @@ class OrderService:
         role: str,
         status: Optional[str] = None,
         status_in: Optional[list[str]] = None,
+        partner_user_id: Optional[UUID] = None,
         page: int = 1,
         limit: int = 20,
     ) -> tuple[list[dict], PaginationMeta]:
         # join 임베딩으로 한 번에 buyer/seller/products 정보까지 가져온다 (N+1 제거)
         query = self.orders.select(ORDER_SELECT_WITH_JOINS, count="exact").is_("deleted_at", None)
 
-        # 역할에 따라 필터
-        if role == "BUYER":
+        # 역할에 따라 필터 (단, partner_user_id 가 있으면 양방향 OR 가 우선)
+        # 양방향 패턴은 partner_service.get_stats / _attach_last_trades 와 동일 — me ↔ counterpart.
+        if partner_user_id is not None:
+            user_id_str = str(user_id)
+            counterpart_str = str(partner_user_id)
+            query = query.or_(
+                f"and(buyer_id.eq.{user_id_str},seller_id.eq.{counterpart_str}),"
+                f"and(seller_id.eq.{user_id_str},buyer_id.eq.{counterpart_str})"
+            )
+        elif role == "BUYER":
             query = query.eq("buyer_id", str(user_id))
         else:
             query = query.eq("seller_id", str(user_id))
@@ -711,15 +809,15 @@ class OrderService:
         # NEGOTIATING 으로의 전환은 협상가 메시지로 이미 표현됨
         notify_statuses = {"CONFIRMED", "PREPARING", "SHIPPING", "COMPLETED"}
         if new_status in notify_statuses:
+            label = {
+                "CONFIRMED": "확정",
+                "PREPARING": "준비 중",
+                "SHIPPING": "배송 중",
+                "COMPLETED": "완료",
+            }.get(new_status, new_status)
             try:
                 room = await self._ensure_chat_room_for_order(order)
                 if room:
-                    label = {
-                        "CONFIRMED": "확정",
-                        "PREPARING": "준비 중",
-                        "SHIPPING": "배송 중",
-                        "COMPLETED": "완료",
-                    }.get(new_status, new_status)
                     await self._emit_chat_event(
                         room=room,
                         sender_id=user_id_str,
@@ -737,6 +835,16 @@ class OrderService:
                     f"[order_service.update_status] chat event 실패 (무시): "
                     f"{type(e).__name__}: {e}"
                 )
+
+            # 알림 emit — 상대방에게 (상태 변경자가 아닌 쪽)
+            order_number = order.get("order_number", "")
+            await self._emit_order_notification(
+                order=order,
+                sender_id=user_id_str,
+                notif_type="ORDER_STATUS",
+                title="주문 상태 변경",
+                body=f"주문 #{order_number} → {label}",
+            )
 
         return updated_order
 
@@ -950,10 +1058,10 @@ class OrderService:
             await self._sync_calendar_events_for_order(updated_order)
 
         # 채팅에 협상가 제시 이벤트 발송
+        amount = int(payload["proposed_total_amount"])
         try:
             room = await self._ensure_chat_room_for_order(order)
             if room:
-                amount = int(payload["proposed_total_amount"])
                 role_label = "판매자" if actor_role == "SELLER" else "구매자"
                 await self._emit_chat_event(
                     room=room,
@@ -974,6 +1082,21 @@ class OrderService:
                 f"[order_service.submit_counter_offer] chat event 실패 (무시): "
                 f"{type(e).__name__}: {e}"
             )
+
+        # 알림 emit — 상대방에게 (제시자가 아닌 쪽)
+        sender_meta = await self._get_user_meta(user_id_str)
+        sender_name = (
+            sender_meta.get("name")
+            or sender_meta.get("company_name")
+            or ("판매자" if actor_role == "SELLER" else "구매자")
+        )
+        await self._emit_order_notification(
+            order=order,
+            sender_id=user_id_str,
+            notif_type="COUNTER_OFFER",
+            title="새 가격 제안",
+            body=f"{sender_name}님이 {amount:,}원 제안했습니다",
+        )
 
         return new_offer
 
@@ -1064,10 +1187,10 @@ class OrderService:
             await self._sync_calendar_events_for_order(updated_order)
 
         # 채팅에 협상가 수락 이벤트 발송
+        accepted_amount = int(offer["proposed_total_amount"])
         try:
             room = await self._ensure_chat_room_for_order(order)
             if room:
-                accepted_amount = int(offer["proposed_total_amount"])
                 role_label = "구매자" if user_id_str == order["buyer_id"] else "판매자"
                 await self._emit_chat_event(
                     room=room,
@@ -1086,6 +1209,21 @@ class OrderService:
                 f"[order_service.accept_counter_offer] chat event 실패 (무시): "
                 f"{type(e).__name__}: {e}"
             )
+
+        # 알림 emit — 제안 발신자(상대방)에게 수락 사실 전달
+        sender_meta = await self._get_user_meta(user_id_str)
+        sender_name = (
+            sender_meta.get("name")
+            or sender_meta.get("company_name")
+            or ("구매자" if user_id_str == order["buyer_id"] else "판매자")
+        )
+        await self._emit_order_notification(
+            order=order,
+            sender_id=user_id_str,
+            notif_type="OFFER_ACCEPTED",
+            title="가격 제안 수락",
+            body=f"{sender_name}님이 가격을 수락했습니다 ({accepted_amount:,}원)",
+        )
 
         # 주문 상태는 NEGOTIATING 유지 (별도 update_status 로 CONFIRMED 진행)
         return await self._get_offer_or_404(order_id, offer_id)
@@ -1128,10 +1266,10 @@ class OrderService:
         await self._sync_offer_status_in_messages(offer_id, "REJECTED")
 
         # 채팅에 협상가 거절 이벤트 발송
+        rejected_amount = int(offer.get("proposed_total_amount") or 0)
         try:
             room = await self._ensure_chat_room_for_order(order)
             if room:
-                rejected_amount = int(offer.get("proposed_total_amount") or 0)
                 role_label = "구매자" if user_id_str == order["buyer_id"] else "판매자"
                 await self._emit_chat_event(
                     room=room,
@@ -1151,6 +1289,21 @@ class OrderService:
                 f"{type(e).__name__}: {e}"
             )
 
+        # 알림 emit — 제안 발신자(상대방)에게 거절 사실 전달
+        sender_meta = await self._get_user_meta(user_id_str)
+        sender_name = (
+            sender_meta.get("name")
+            or sender_meta.get("company_name")
+            or ("구매자" if user_id_str == order["buyer_id"] else "판매자")
+        )
+        await self._emit_order_notification(
+            order=order,
+            sender_id=user_id_str,
+            notif_type="OFFER_REJECTED",
+            title="가격 제안 거절",
+            body=f"{sender_name}님이 가격 제안을 거절했습니다 ({rejected_amount:,}원)",
+        )
+
         return await self._get_offer_or_404(order_id, offer_id)
 
     async def list_negotiation_history(
@@ -1168,6 +1321,418 @@ class OrderService:
             .execute()
         )
         return result.data or []
+
+    # ===========================================
+    # 납품일 변경 (delivery date change)
+    # ===========================================
+
+    async def _sync_delivery_date_change_status_in_messages(
+        self, change_id: UUID | str, new_status: str
+    ) -> None:
+        """messages.metadata.change_id 가 일치하는 행들의 metadata.status 동기화.
+
+        납품일 변경 요청이 ACCEPTED/REJECTED/SUPERSEDED 로 전환될 때 호출.
+        프론트가 metadata.status === 'PENDING' 일 때만 수락/거절 버튼을 노출하므로
+        동기화하지 않으면 stale UI 가 남는다 (negotiation 의 _sync_offer_status_in_messages 패턴).
+
+        실패해도 흐름은 막지 않음 (예외 무시 + 로그).
+        """
+        change_id_str = str(change_id)
+        try:
+            rows = await asyncio.to_thread(
+                lambda: self.client.table("messages")
+                .select("id, metadata")
+                .eq("metadata->>change_id", change_id_str)
+                .execute()
+            )
+            for row in rows.data or []:
+                meta = dict(row.get("metadata") or {})
+                meta["status"] = new_status
+                row_id = row["id"]
+                await asyncio.to_thread(
+                    lambda rid=row_id, m=meta: self.client.table("messages")
+                    .update({"metadata": m})
+                    .eq("id", rid)
+                    .execute()
+                )
+        except Exception as e:
+            print(
+                f"[order_service._sync_delivery_date_change_status_in_messages] "
+                f"실패 (무시): change_id={change_id_str}, new_status={new_status}, "
+                f"error={type(e).__name__}: {e}"
+            )
+
+    async def _get_delivery_change_or_404(
+        self, order_id: UUID, change_id: UUID
+    ) -> dict:
+        result = await asyncio.to_thread(
+            lambda: self.delivery_date_changes.select("*")
+            .eq("id", str(change_id))
+            .eq("order_id", str(order_id))
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Delivery date change request not found",
+            )
+        return result.data[0]
+
+    async def submit_delivery_date_change(
+        self, order_id: UUID, payload: dict, user: dict
+    ) -> dict:
+        """납품일 변경 요청 — 주문 당사자, QUOTE_REQUESTED/NEGOTIATING/CONFIRMED 상태.
+
+        PREPARING 이상은 이미 출하 준비 중이므로 차단 (도메인 가드).
+        이전 PENDING 변경 요청은 SUPERSEDED 처리 + 같은 change_id 의 메시지 metadata.status 동기화.
+        proposed_delivery_date 는 오늘 이상이어야 함 (router 단에서 422 검증).
+        """
+        order = await self._get_order_or_404(order_id)
+        user_id_str = str(user["id"])
+        actor_role = self._assert_participant(order, user_id_str)
+
+        if order["status"] not in ("QUOTE_REQUESTED", "NEGOTIATING", "CONFIRMED"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Delivery date change is only allowed in "
+                    "QUOTE_REQUESTED, NEGOTIATING, or CONFIRMED status"
+                ),
+            )
+
+        proposed_date = payload["proposed_delivery_date"]
+        # date 또는 ISO 문자열로 들어옴 (router model_dump(mode='json') 시 문자열)
+        proposed_date_str = (
+            proposed_date.isoformat()
+            if hasattr(proposed_date, "isoformat")
+            else str(proposed_date)[:10]
+        )
+
+        # 이전 PENDING 변경 요청 ID 들 조회 (메시지 동기화용)
+        prev_pending = await asyncio.to_thread(
+            lambda: self.delivery_date_changes.select("id")
+            .eq("order_id", str(order_id))
+            .eq("status", "PENDING")
+            .execute()
+        )
+        superseded_ids: list[str] = [r["id"] for r in (prev_pending.data or [])]
+
+        # 이전 PENDING 모두 SUPERSEDED 처리
+        await asyncio.to_thread(
+            lambda: self.delivery_date_changes.update({"status": "SUPERSEDED"})
+            .eq("order_id", str(order_id))
+            .eq("status", "PENDING")
+            .execute()
+        )
+
+        # 같은 change_id 를 metadata 에 가진 messages 의 status 도 SUPERSEDED 동기화
+        for prev_id in superseded_ids:
+            await self._sync_delivery_date_change_status_in_messages(
+                prev_id, "SUPERSEDED"
+            )
+
+        insert_payload = {
+            "order_id": str(order_id),
+            "from_user_id": user_id_str,
+            "from_role": actor_role,
+            "proposed_delivery_date": proposed_date_str,
+            "notes": payload.get("notes"),
+            "status": "PENDING",
+        }
+        result = await asyncio.to_thread(
+            lambda: self.delivery_date_changes.insert(insert_payload).execute()
+        )
+        new_change = result.data[0]
+
+        # 채팅에 납품일 변경 요청 이벤트 발송
+        try:
+            room = await self._ensure_chat_room_for_order(order)
+            if room:
+                role_label = "판매자" if actor_role == "SELLER" else "구매자"
+                content = (
+                    f"{role_label}이(가) 납품일을 {proposed_date_str} 로 변경 요청"
+                )
+                await self._emit_chat_event(
+                    room=room,
+                    sender_id=user_id_str,
+                    message_type="DELIVERY_DATE_CHANGE",
+                    content=content,
+                    metadata={
+                        "change_id": str(new_change["id"]),
+                        "order_id": str(order_id),
+                        "order_number": order.get("order_number"),
+                        "proposed_delivery_date": proposed_date_str,
+                        "previous_delivery_date": self._date_only(
+                            order.get("delivery_date")
+                        ),
+                        "from_role": actor_role,
+                        "notes": payload.get("notes"),
+                        "status": "PENDING",
+                    },
+                )
+        except Exception as e:
+            print(
+                f"[order_service.submit_delivery_date_change] chat event 실패 "
+                f"(무시): {type(e).__name__}: {e}"
+            )
+
+        # 알림 emit — 상대방에게 (제시자가 아닌 쪽)
+        sender_meta = await self._get_user_meta(user_id_str)
+        sender_name = (
+            sender_meta.get("name")
+            or sender_meta.get("company_name")
+            or ("판매자" if actor_role == "SELLER" else "구매자")
+        )
+        await self._emit_order_notification(
+            order=order,
+            sender_id=user_id_str,
+            notif_type="DELIVERY_DATE_CHANGE",
+            title="납품일 변경 요청",
+            body=f"{sender_name}님이 {proposed_date_str} 로 변경 요청했습니다",
+        )
+
+        return new_change
+
+    async def accept_delivery_date_change(
+        self, order_id: UUID, change_id: UUID, user: dict
+    ) -> dict:
+        """납품일 변경 수락 — 본인이 제시한 PENDING 은 수락 불가 (상대방만).
+
+        orders.delivery_date 갱신 → _sync_calendar_events_for_order 호출 (캘린더 재동기화)
+        → messages.metadata.status 동기화 → DELIVERY_DATE_ACCEPTED 채팅 이벤트.
+        """
+        order = await self._get_order_or_404(order_id)
+        user_id_str = str(user["id"])
+        self._assert_participant(order, user_id_str)
+
+        change = await self._get_delivery_change_or_404(order_id, change_id)
+
+        if change["status"] != "PENDING":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot accept delivery date change in {change['status']} status",
+            )
+        if change["from_user_id"] == user_id_str:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot accept your own delivery date change request",
+            )
+
+        responded_at = datetime.now(timezone.utc).isoformat()
+        proposed_date = change["proposed_delivery_date"]
+        proposed_date_str = (
+            proposed_date.isoformat()
+            if hasattr(proposed_date, "isoformat")
+            else str(proposed_date)[:10]
+        )
+
+        # 변경 요청 행 ACCEPTED 처리
+        await asyncio.to_thread(
+            lambda: self.delivery_date_changes.update(
+                {
+                    "status": "ACCEPTED",
+                    "responded_at": responded_at,
+                    "responded_by": user_id_str,
+                }
+            )
+            .eq("id", str(change_id))
+            .execute()
+        )
+
+        # 같은 change_id 를 metadata 에 가진 messages 의 status 도 ACCEPTED 동기화
+        await self._sync_delivery_date_change_status_in_messages(
+            change_id, "ACCEPTED"
+        )
+
+        # orders.delivery_date 갱신 (가장 중요한 부수효과)
+        await asyncio.to_thread(
+            lambda: self.orders.update({"delivery_date": proposed_date_str})
+            .eq("id", str(order_id))
+            .is_("deleted_at", None)
+            .execute()
+        )
+
+        # 캘린더 재동기화 — order 양 당사자의 active calendar_events 가
+        # 새 delivery_date 로 옮겨가고 옛 event_date 의 row 는 soft-delete 된다
+        # (_sync_calendar_events_for_order_sync 내부 로직)
+        updated_order = await self.get_order(order_id)
+        if updated_order:
+            await self._sync_calendar_events_for_order(updated_order)
+
+        # 채팅에 수락 이벤트 발송
+        try:
+            room = await self._ensure_chat_room_for_order(order)
+            if room:
+                role_label = "구매자" if user_id_str == order["buyer_id"] else "판매자"
+                await self._emit_chat_event(
+                    room=room,
+                    sender_id=user_id_str,
+                    message_type="DELIVERY_DATE_ACCEPTED",
+                    content=(
+                        f"{role_label}이(가) 납품일 변경 수락 → {proposed_date_str}"
+                    ),
+                    metadata={
+                        "change_id": str(change_id),
+                        "order_id": str(order_id),
+                        "order_number": order.get("order_number"),
+                        "accepted_delivery_date": proposed_date_str,
+                        "previous_delivery_date": self._date_only(
+                            order.get("delivery_date")
+                        ),
+                        "accepted_by": user_id_str,
+                    },
+                )
+        except Exception as e:
+            print(
+                f"[order_service.accept_delivery_date_change] chat event 실패 "
+                f"(무시): {type(e).__name__}: {e}"
+            )
+
+        # 알림 emit — 변경 요청 발신자(상대방)에게 수락 사실 전달
+        sender_meta = await self._get_user_meta(user_id_str)
+        sender_name = (
+            sender_meta.get("name")
+            or sender_meta.get("company_name")
+            or ("구매자" if user_id_str == order["buyer_id"] else "판매자")
+        )
+        await self._emit_order_notification(
+            order=order,
+            sender_id=user_id_str,
+            notif_type="DELIVERY_DATE_ACCEPTED",
+            title="납품일 변경 수락",
+            body=f"{sender_name}님이 납품일 변경을 수락했습니다 ({proposed_date_str})",
+        )
+
+        return await self._get_delivery_change_or_404(order_id, change_id)
+
+    async def reject_delivery_date_change(
+        self, order_id: UUID, change_id: UUID, user: dict
+    ) -> dict:
+        """납품일 변경 거절 — 본인이 제시한 PENDING 은 거절 불가 (상대방만)."""
+        order = await self._get_order_or_404(order_id)
+        user_id_str = str(user["id"])
+        self._assert_participant(order, user_id_str)
+
+        change = await self._get_delivery_change_or_404(order_id, change_id)
+
+        if change["status"] != "PENDING":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot reject delivery date change in {change['status']} status",
+            )
+        if change["from_user_id"] == user_id_str:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot reject your own delivery date change request",
+            )
+
+        responded_at = datetime.now(timezone.utc).isoformat()
+        proposed_date = change["proposed_delivery_date"]
+        proposed_date_str = (
+            proposed_date.isoformat()
+            if hasattr(proposed_date, "isoformat")
+            else str(proposed_date)[:10]
+        )
+
+        await asyncio.to_thread(
+            lambda: self.delivery_date_changes.update(
+                {
+                    "status": "REJECTED",
+                    "responded_at": responded_at,
+                    "responded_by": user_id_str,
+                }
+            )
+            .eq("id", str(change_id))
+            .execute()
+        )
+
+        # 같은 change_id 를 metadata 에 가진 messages 의 status 도 REJECTED 동기화
+        await self._sync_delivery_date_change_status_in_messages(
+            change_id, "REJECTED"
+        )
+
+        # 채팅에 거절 이벤트 발송
+        try:
+            room = await self._ensure_chat_room_for_order(order)
+            if room:
+                role_label = "구매자" if user_id_str == order["buyer_id"] else "판매자"
+                await self._emit_chat_event(
+                    room=room,
+                    sender_id=user_id_str,
+                    message_type="DELIVERY_DATE_REJECTED",
+                    content=(
+                        f"{role_label}이(가) 납품일 {proposed_date_str} 변경 요청을 거절"
+                    ),
+                    metadata={
+                        "change_id": str(change_id),
+                        "order_id": str(order_id),
+                        "order_number": order.get("order_number"),
+                        "rejected_delivery_date": proposed_date_str,
+                        "rejected_by": user_id_str,
+                    },
+                )
+        except Exception as e:
+            print(
+                f"[order_service.reject_delivery_date_change] chat event 실패 "
+                f"(무시): {type(e).__name__}: {e}"
+            )
+
+        # 알림 emit — 변경 요청 발신자(상대방)에게 거절 사실 전달
+        sender_meta = await self._get_user_meta(user_id_str)
+        sender_name = (
+            sender_meta.get("name")
+            or sender_meta.get("company_name")
+            or ("구매자" if user_id_str == order["buyer_id"] else "판매자")
+        )
+        await self._emit_order_notification(
+            order=order,
+            sender_id=user_id_str,
+            notif_type="DELIVERY_DATE_REJECTED",
+            title="납품일 변경 거절",
+            body=f"{sender_name}님이 납품일 변경을 거절했습니다 ({proposed_date_str})",
+        )
+
+        return await self._get_delivery_change_or_404(order_id, change_id)
+
+    async def list_delivery_date_changes(
+        self, order_id: UUID, user: dict
+    ) -> list[dict]:
+        """납품일 변경 요청 이력 — 주문 당사자만, created_at DESC (시간 역순).
+
+        from_user_name / from_user_company 를 동적 주입한다 (users 테이블 별도 조회).
+        """
+        order = await self._get_order_or_404(order_id)
+        user_id_str = str(user["id"])
+        self._assert_participant(order, user_id_str)
+
+        result = await asyncio.to_thread(
+            lambda: self.delivery_date_changes.select("*")
+            .eq("order_id", str(order_id))
+            .order("created_at", desc=True)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return []
+
+        # from_user_id 별 사용자 정보 일괄 조회 (N+1 회피)
+        from_user_ids = list({str(r["from_user_id"]) for r in rows if r.get("from_user_id")})
+        users_map: dict[str, dict] = {}
+        if from_user_ids:
+            users_result = await asyncio.to_thread(
+                lambda: self.client.table("users")
+                .select("id, name, company_name")
+                .in_("id", from_user_ids)
+                .execute()
+            )
+            for u in users_result.data or []:
+                users_map[str(u["id"])] = u
+
+        for r in rows:
+            u = users_map.get(str(r.get("from_user_id"))) or {}
+            r["from_user_name"] = u.get("name")
+            r["from_user_company"] = u.get("company_name")
+        return rows
 
 
 order_service = OrderService()

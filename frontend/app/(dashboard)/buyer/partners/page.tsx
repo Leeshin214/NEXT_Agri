@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Star, Plus, MessageCircle, FileText, Trash2, Inbox, Clock } from 'lucide-react';
+import { Star, Plus, MessageCircle, FileText, Trash2, Inbox } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import DataTable, { type Column } from '@/components/common/DataTable';
 import SearchFilterBar from '@/components/common/SearchFilterBar';
@@ -44,27 +44,31 @@ export default function BuyerPartnersPage() {
 
   // 서버 사이드 필터로 통일 (seller 페이지와 동일 패턴)
   // V1.5 Phase 3: is_favorite 필터는 백엔드 list_partners 가 미지원 → 클라이언트 필터링
+  // V1.7 (PM Report #8 작업 5): 거래처 페이지에서만 last_trade_date / last_trade_amount 가
+  // 필요하므로 include_last_trade=true 명시. 다른 페이지의 usePartners() 호출은 추가 쿼리
+  // 비용을 발생시키지 않도록 그대로 둔다.
   const { data, isLoading } = usePartners({
     partner_status: statusFilter || undefined,
     search: search || undefined,
+    include_last_trade: true,
   });
   const partners = data?.data ?? [];
 
-  // V1.6 — 양방향 승인: 받은 요청 / 보낸 요청 / 활성으로 분리
+  // V1.6 — 양방향 승인: 받은 요청만 별도 섹션, 보낸 요청은 메인 리스트에 통합 노출
   const incomingRequests = useMemo(
     () => partners.filter((p) => p.status === 'PENDING_INCOMING'),
     [partners]
   );
-  const outgoingRequests = useMemo(
-    () => partners.filter((p) => p.status === 'PENDING_OUTGOING'),
-    [partners]
-  );
-  // 메인 리스트는 ACTIVE/INACTIVE/PENDING(deprecated) 만 노출
+  // 메인 리스트는 ACTIVE/INACTIVE/PENDING(deprecated)/PENDING_OUTGOING 노출
+  // (PENDING_INCOMING 만 위쪽 별도 섹션이 수락/거절 액션을 담당)
   const mainListPartners = useMemo(
     () =>
       partners.filter(
         (p) =>
-          p.status !== 'PENDING_OUTGOING' && p.status !== 'PENDING_INCOMING'
+          p.status === 'ACTIVE' ||
+          p.status === 'INACTIVE' ||
+          p.status === 'PENDING' ||
+          p.status === 'PENDING_OUTGOING'
       ),
     [partners]
   );
@@ -145,11 +149,20 @@ export default function BuyerPartnersPage() {
    * - 활성 정기배송이 있으면 먼저 PAUSED 로 전환 (데이터 보존을 위해 삭제하지 않음)
    * - 그 후 거래처 자체를 soft-delete
    * - 모달이 열려 있으면 닫음
+   * - V1.6: PENDING_OUTGOING(보낸 요청) 상태에선 "요청 회수" 라벨로 안내
    */
   const handleDeletePartner = async (partner: Partner) => {
     if (deletePendingId) return;
+    const isPendingOutgoing = partner.status === 'PENDING_OUTGOING';
+    const label =
+      partner.nickname ||
+      partner.partner_company ||
+      partner.partner_name ||
+      '';
     const confirmed = window.confirm(
-      `'${partner.nickname || partner.partner_company || partner.partner_name || ''}' 거래처를 삭제하시겠습니까?\n진행 중인 정기배송이 일시정지됩니다.`
+      isPendingOutgoing
+        ? `'${label}' 에게 보낸 거래처 요청을 회수하시겠습니까?`
+        : `'${label}' 거래처를 삭제하시겠습니까?\n진행 중인 정기배송이 일시정지됩니다.`
     );
     if (!confirmed) return;
 
@@ -189,43 +202,62 @@ export default function BuyerPartnersPage() {
       key: 'is_favorite',
       header: '',
       className: 'w-10',
-      render: (item) => (
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            handleToggleFavorite(item);
-          }}
-          className="text-gray-300 hover:text-yellow-400"
-          aria-label={item.is_favorite ? '즐겨찾기 해제' : '즐겨찾기 등록'}
-        >
-          <Star
-            className={`h-4 w-4 ${item.is_favorite ? 'fill-yellow-400 text-yellow-400' : ''}`}
-          />
-        </button>
-      ),
+      render: (item) => {
+        const isPendingOutgoing = item.status === 'PENDING_OUTGOING';
+        return (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!isPendingOutgoing) handleToggleFavorite(item);
+            }}
+            disabled={isPendingOutgoing}
+            className={`text-gray-300 ${
+              isPendingOutgoing
+                ? 'cursor-not-allowed opacity-40'
+                : 'hover:text-yellow-400'
+            }`}
+            aria-label={item.is_favorite ? '즐겨찾기 해제' : '즐겨찾기 등록'}
+            title={isPendingOutgoing ? '승인 대기 중' : undefined}
+          >
+            <Star
+              className={`h-4 w-4 ${item.is_favorite ? 'fill-yellow-400 text-yellow-400' : ''}`}
+            />
+          </button>
+        );
+      },
     },
     {
       key: 'partner_company',
       header: '업체명',
-      render: (item) => (
-        <div>
-          <p className="font-medium text-gray-900">
-            {item.nickname || item.partner_company || '-'}
-          </p>
-          <p className="text-xs text-gray-500">
-            {item.partner_name ?? ''}
-            {item.nickname && item.partner_company
-              ? ` · ${item.partner_company}`
-              : ''}
-          </p>
-        </div>
-      ),
+      render: (item) => {
+        const isPendingOutgoing = item.status === 'PENDING_OUTGOING';
+        return (
+          <div className={isPendingOutgoing ? 'opacity-60' : ''}>
+            <p className="font-medium text-gray-900">
+              {item.nickname || item.partner_company || '-'}
+            </p>
+            <p className="text-xs text-gray-500">
+              {item.partner_name ?? ''}
+              {item.nickname && item.partner_company
+                ? ` · ${item.partner_company}`
+                : ''}
+              {isPendingOutgoing ? (
+                <span className="ml-1 text-yellow-700">· 승인 대기 중</span>
+              ) : null}
+            </p>
+          </div>
+        );
+      },
     },
     {
       key: 'partner_role',
       header: '유형',
       render: (item) => (
-        <span className="text-xs text-gray-500">
+        <span
+          className={`text-xs text-gray-500 ${
+            item.status === 'PENDING_OUTGOING' ? 'opacity-60' : ''
+          }`}
+        >
           {item.partner_role === 'BUYER' ? '구매자' : '판매자'}
         </span>
       ),
@@ -234,10 +266,62 @@ export default function BuyerPartnersPage() {
       key: 'created_at',
       header: '등록일',
       render: (item) => (
-        <span className="text-sm text-gray-600">
+        <span
+          className={`text-sm text-gray-600 ${
+            item.status === 'PENDING_OUTGOING' ? 'opacity-60' : ''
+          }`}
+        >
           {formatDate(item.created_at)}
         </span>
       ),
+    },
+    {
+      // PM Report #8 작업 5 — 최근 거래 요약 ("YYYY. MM. DD. · 1,200,000원")
+      // 클릭 시 해당 거래처 필터로 주문 목록 페이지 이동 (행 onClick 차단)
+      key: 'last_trade',
+      header: '최근 거래',
+      render: (item) => {
+        const isPendingOutgoing = item.status === 'PENDING_OUTGOING';
+        const isPreTrade =
+          item.status === 'PENDING_OUTGOING' ||
+          item.status === 'PENDING_INCOMING';
+        const hasTrade =
+          !isPreTrade &&
+          item.last_trade_date != null &&
+          item.last_trade_amount != null;
+
+        if (!hasTrade) {
+          return (
+            <span
+              className={`text-sm text-gray-400 ${
+                isPendingOutgoing ? 'opacity-60' : ''
+              }`}
+            >
+              아직 거래 없음
+            </span>
+          );
+        }
+
+        return (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              router.push(
+                `/buyer/orders?partner_user_id=${item.partner_user_id}`
+              );
+            }}
+            className={`text-left text-sm text-gray-700 hover:text-primary-700 hover:underline ${
+              isPendingOutgoing ? 'opacity-60' : ''
+            }`}
+            title="이 거래처의 주문 목록 보기"
+          >
+            {formatDate(item.last_trade_date as string)}
+            {' · '}
+            {(item.last_trade_amount as number).toLocaleString('ko-KR')}원
+          </button>
+        );
+      },
     },
     {
       key: 'status',
@@ -248,49 +332,67 @@ export default function BuyerPartnersPage() {
       key: 'actions',
       header: '',
       className: 'text-right',
-      render: (item) => (
-        <div className="flex items-center justify-end gap-1">
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              handleStartChat(item);
-            }}
-            disabled={chatPendingId === item.id || !!chatPendingId}
-            title="채팅 시작"
-            className="inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-2.5 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-          >
-            <MessageCircle className="h-3.5 w-3.5" />
-            채팅
-          </button>
-          {showCreateOrderAction && (
+      render: (item) => {
+        const isPendingOutgoing = item.status === 'PENDING_OUTGOING';
+        return (
+          <div className="flex items-center justify-end gap-1">
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                router.push(
-                  `/buyer/browse?seller_id=${item.partner_user_id}`
-                );
+                if (!isPendingOutgoing) handleStartChat(item);
               }}
-              title="주문 작성"
-              className="inline-flex items-center gap-1 rounded-lg bg-primary-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-primary-700"
+              disabled={
+                isPendingOutgoing ||
+                chatPendingId === item.id ||
+                !!chatPendingId
+              }
+              title={isPendingOutgoing ? '승인 대기 중' : '채팅 시작'}
+              className={`inline-flex items-center gap-1 rounded-lg border border-gray-300 bg-white px-2.5 py-1 text-xs font-medium text-gray-700 ${
+                isPendingOutgoing
+                  ? 'cursor-not-allowed opacity-40'
+                  : 'hover:bg-gray-50 disabled:opacity-50'
+              }`}
             >
-              <FileText className="h-3.5 w-3.5" />
-              주문 작성
+              <MessageCircle className="h-3.5 w-3.5" />
+              채팅
             </button>
-          )}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              handleDeletePartner(item);
-            }}
-            disabled={deletePendingId === item.id || !!deletePendingId}
-            title="거래처 삭제"
-            aria-label="거래처 삭제"
-            className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-400 hover:border-red-300 hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </button>
-        </div>
-      ),
+            {showCreateOrderAction && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!isPendingOutgoing) {
+                    router.push(
+                      `/buyer/browse?seller_id=${item.partner_user_id}`
+                    );
+                  }
+                }}
+                disabled={isPendingOutgoing}
+                title={isPendingOutgoing ? '승인 대기 중' : '주문 작성'}
+                className={`inline-flex items-center gap-1 rounded-lg bg-primary-600 px-2.5 py-1 text-xs font-medium text-white ${
+                  isPendingOutgoing
+                    ? 'cursor-not-allowed opacity-40'
+                    : 'hover:bg-primary-700'
+                }`}
+              >
+                <FileText className="h-3.5 w-3.5" />
+                주문 작성
+              </button>
+            )}
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                handleDeletePartner(item);
+              }}
+              disabled={deletePendingId === item.id || !!deletePendingId}
+              title={isPendingOutgoing ? '요청 회수' : '거래처 삭제'}
+              aria-label={isPendingOutgoing ? '요청 회수' : '거래처 삭제'}
+              className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-400 hover:border-red-300 hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        );
+      },
     },
   ];
 
@@ -351,52 +453,6 @@ export default function BuyerPartnersPage() {
                     className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
                   >
                     거절
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {/* V1.6 — 보낸 거래처 요청 (수락 대기 중) */}
-      {outgoingRequests.length > 0 && (
-        <section className="rounded-xl border border-yellow-200 bg-yellow-50 p-4">
-          <h3 className="flex items-center gap-2 text-sm font-semibold text-yellow-900">
-            <Clock className="h-4 w-4" />
-            보낸 거래처 요청 ({outgoingRequests.length})
-          </h3>
-          <ul className="mt-3 space-y-2">
-            {outgoingRequests.map((p) => (
-              <li
-                key={p.id}
-                className="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-white p-3"
-              >
-                <div className="min-w-0 flex-1">
-                  <p className="font-medium text-gray-900">
-                    {p.partner_name ?? '-'}
-                  </p>
-                  <p className="text-xs text-gray-500">
-                    {p.partner_company ?? ''}
-                    {p.partner_company && p.partner_role
-                      ? ' · '
-                      : ''}
-                    {p.partner_role === 'BUYER' ? '구매자' : '판매자'}
-                  </p>
-                </div>
-                <div className="flex flex-shrink-0 items-center gap-2">
-                  <span className="text-xs text-yellow-700">수락 대기 중</span>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (window.confirm('이 거래처 요청을 회수하시겠습니까?')) {
-                        rejectPartner.mutate(p.id);
-                      }
-                    }}
-                    disabled={rejectPartner.isPending}
-                    className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                  >
-                    요청 회수
                   </button>
                 </div>
               </li>

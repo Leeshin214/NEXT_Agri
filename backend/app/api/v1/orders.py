@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -8,6 +9,8 @@ from app.schemas.common import SuccessResponse
 from app.schemas.order import (
     CounterOfferCreate,
     CounterOfferResponse,
+    DeliveryDateChangeCreate,
+    DeliveryDateChangeResponse,
     NegotiationHistoryResponse,
     OrderCancel,
     OrderCreate,
@@ -17,6 +20,14 @@ from app.schemas.order import (
 )
 from app.services.order_service import order_service
 
+
+# KST 기준 오늘 날짜 (납품일 검증용 — UTC 자정 부근 하루 어긋남 방지)
+_KST_TZ = timezone(timedelta(hours=9))
+
+
+def _today_kst():
+    return datetime.now(_KST_TZ).date()
+
 router = APIRouter(prefix="/orders", tags=["orders"])
 
 
@@ -24,6 +35,13 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 async def list_orders(
     order_status: Optional[str] = None,
     status_in: Optional[list[str]] = Query(None),
+    partner_user_id: Optional[UUID] = Query(
+        None,
+        description=(
+            "특정 거래처(partner의 user_id) 와의 주문만 필터. "
+            "내가 buyer이고 상대가 seller, 또는 그 역까지 양방향 매칭."
+        ),
+    ),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=2000),
     current_user: dict = Depends(get_current_user),
@@ -33,6 +51,10 @@ async def list_orders(
     - order_status: 단일 상태 필터 (backward compat)
     - status_in: 다중 상태 필터 — `?status_in=COMPLETED&status_in=CANCELLED`
                  둘 다 전달 시 status_in 이 우선
+    - partner_user_id: 특정 거래처(상대 user.id) 와의 주문만 (양방향 OR 매칭).
+                       역할 기반 자동 필터(buyer_id/seller_id) 와 AND 결합되어
+                       (me==buyer AND counterpart==seller) OR
+                       (me==seller AND counterpart==buyer) 형태로 적용된다.
     - limit: 운영 안전을 위해 최대 2000 으로 제한
     """
     data, meta = await order_service.list_orders(
@@ -40,6 +62,7 @@ async def list_orders(
         role=current_user["role"],
         status=order_status,
         status_in=status_in,
+        partner_user_id=partner_user_id,
         page=page,
         limit=limit,
     )
@@ -203,6 +226,100 @@ async def list_counter_offers(
 ):
     """주문 협상 이력 조회 — 주문 당사자만"""
     history = await order_service.list_negotiation_history(
+        order_id=order_id,
+        user=current_user,
+    )
+    return {"data": history}
+
+
+# ===========================================
+# 납품일 변경 (delivery date change) 엔드포인트
+# ===========================================
+
+
+@router.post(
+    "/{order_id}/delivery-date-changes",
+    response_model=SuccessResponse[DeliveryDateChangeResponse],
+    status_code=201,
+)
+async def submit_delivery_date_change(
+    order_id: UUID,
+    data: DeliveryDateChangeCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """납품일 변경 요청 제시 — 주문 당사자, QUOTE_REQUESTED/NEGOTIATING/CONFIRMED 상태일 때만.
+
+    proposed_delivery_date 는 KST 기준 오늘 이상이어야 함 (과거 날짜 불가 → 422).
+    이전 PENDING 변경 요청은 SUPERSEDED 처리되고 채팅 메시지 status 도 함께 동기화된다.
+    """
+    today_kst = _today_kst()
+    if data.proposed_delivery_date < today_kst:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="proposed_delivery_date must be today or later (KST)",
+        )
+
+    # mode="json": date → ISO 문자열. supabase-py(httpx) JSON 직렬화 호환.
+    change = await order_service.submit_delivery_date_change(
+        order_id=order_id,
+        payload=data.model_dump(mode="json"),
+        user=current_user,
+    )
+    return {"data": change}
+
+
+@router.post(
+    "/{order_id}/delivery-date-changes/{change_id}/accept",
+    response_model=SuccessResponse[DeliveryDateChangeResponse],
+)
+async def accept_delivery_date_change(
+    order_id: UUID,
+    change_id: UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    """납품일 변경 수락 — 상대방이 제시한 PENDING 만.
+
+    수락 시 부수 효과:
+      1) orders.delivery_date 가 proposed_delivery_date 로 갱신
+      2) calendar_events 가 양 당사자 새 날짜로 재동기화 (옛 event_date row soft-delete)
+      3) DELIVERY_DATE_ACCEPTED 채팅 시스템 메시지 발송
+    """
+    change = await order_service.accept_delivery_date_change(
+        order_id=order_id,
+        change_id=change_id,
+        user=current_user,
+    )
+    return {"data": change}
+
+
+@router.post(
+    "/{order_id}/delivery-date-changes/{change_id}/reject",
+    response_model=SuccessResponse[DeliveryDateChangeResponse],
+)
+async def reject_delivery_date_change(
+    order_id: UUID,
+    change_id: UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    """납품일 변경 거절 — 상대방이 제시한 PENDING 만"""
+    change = await order_service.reject_delivery_date_change(
+        order_id=order_id,
+        change_id=change_id,
+        user=current_user,
+    )
+    return {"data": change}
+
+
+@router.get(
+    "/{order_id}/delivery-date-changes",
+    response_model=SuccessResponse[list[DeliveryDateChangeResponse]],
+)
+async def list_delivery_date_changes(
+    order_id: UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    """납품일 변경 요청 이력 — 주문 당사자만, 시간 역순"""
+    history = await order_service.list_delivery_date_changes(
         order_id=order_id,
         user=current_user,
     )

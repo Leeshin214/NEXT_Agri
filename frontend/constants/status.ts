@@ -167,12 +167,19 @@ export function getStatusConfig(status: string): StatusConfig {
 
 /**
  * 캘린더 일정 색상 클래스
+ * - 정기배송 일정(subscription_id 있음)이면 보라색 고정 (event_type 이 SHIPMENT/DELIVERY 라도 우선 적용)
  * - 주문 일정(order_status 있음)이면 ORDER_STATUS_CONFIG.solidClassName 사용 (주문/견적 페이지와 색 일치)
  * - 그 외(MEETING 등)는 EVENT_TYPE_COLOR_CLASS fallback
+ *
+ * V1.6 — 정기배송 자동 등록 일정은 백엔드가 SHIPMENT(판매자) / DELIVERY(구매자) 로 송출하므로
+ * subscription_id 우선 매핑이 필수 (없으면 일반 출하/입고 색과 구분 불가).
  */
 export function getCalendarEventColorClass(
-  event: Pick<CalendarEvent, 'event_type' | 'order_status'>
+  event: Pick<CalendarEvent, 'event_type' | 'order_status' | 'subscription_id'>
 ): string {
+  if (event.subscription_id) {
+    return EVENT_TYPE_COLOR_CLASS.SUBSCRIPTION;
+  }
   if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
     return ORDER_STATUS_CONFIG[event.order_status].solidClassName;
   }
@@ -181,6 +188,7 @@ export function getCalendarEventColorClass(
 
 /**
  * 캘린더 일정 한글 라벨
+ * - 정기배송 일정(subscription_id 있음)이면 '정기배송' 고정
  * - 주문 일정이면 ORDER_STATUS_CONFIG.label (견적대기, 협상중, 주문확정 등)
  * - 그 외는 EVENT_TYPE_LABEL (출하, 입고, 미팅 등)
  *
@@ -188,8 +196,11 @@ export function getCalendarEventColorClass(
  * order_status 우선 매핑이 필수 (없으면 모든 주문 일정이 '주문'으로 표시됨).
  */
 export function getCalendarEventLabel(
-  event: Pick<CalendarEvent, 'event_type' | 'order_status'>
+  event: Pick<CalendarEvent, 'event_type' | 'order_status' | 'subscription_id'>
 ): string {
+  if (event.subscription_id) {
+    return EVENT_TYPE_LABEL.SUBSCRIPTION;
+  }
   if (event.order_status && event.order_status in ORDER_STATUS_CONFIG) {
     return ORDER_STATUS_CONFIG[event.order_status].label;
   }

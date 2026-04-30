@@ -150,8 +150,7 @@ query.is_("deleted_at", None)
 | calendar.py | PATCH | `/api/v1/calendar/{event_id}` | 정상 |
 | calendar.py | DELETE | `/api/v1/calendar/{event_id}` | 정상 |
 | ai_assistant.py | POST | `/api/v1/ai/chat` | **⛔ 제거 대상 — 미사용 중복 (L55)** |
-| ai_assistant.py | POST | `/api/v1/ai/summarize-chat` | 정상 (Claude) |
-| ai_assistant.py | POST | `/api/v1/ai/daily-summary` | 정상 (Claude) |
+| ai_assistant.py | POST | `/api/v1/ai/summarize-chat` | 정상 (OpenAI) |
 | ai_assistant.py | POST | `/api/v1/ai/agent/chat` | **메인 AI 오케스트레이터** (프론트 연결됨) |
 | ai_assistant.py | GET | `/api/v1/ai/history` | 정상 |
 | schedule_agent.py | POST | `/api/v1/schedule-agent/recommend` | 정상 |
