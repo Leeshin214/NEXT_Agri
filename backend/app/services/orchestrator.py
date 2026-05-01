@@ -668,8 +668,10 @@ def _build_router_system() -> str:
 - GENERAL: 인사, 날씨, 농산물 시세 일반 질문 등 위 세 가지와 완전히 무관한 경우만
   예시: "안녕", "오늘 날씨", "AgriFlow가 뭐야"
   → 품목명이 하나라도 언급되면 GENERAL이 아닌 INVENTORY로 분류할 것
-- CHAT: 채팅방 조회 및 메시지 관련 요청.
-  예시: "내 채팅방 목록 보여줘", "진행 중인 대화 있어?", "판매자랑 대화한 거 찾아줘"
+- CHAT: 채팅방 조회, 대화 내용 확인, 그리고 **상대방에게 메시지를 보내거나 답장하는** 모든 요청.[cite: 2]
+  예시: "내 채팅방 목록 보여줘", "진행 중인 대화 있어?", "배추 채팅방 대화 보여줘", 
+        "test2한테 '안녕하세요'라고 보내줘", "답장 보내줘", "메시지 전송해줘"[cite: 2]
+  → 중요: "~라고 보내줘", "~라고 전송해줘", "~라고 답장해줘" 같은 문장 패턴이 나오면 품목 언급 여부와 상관없이 무조건 CHAT으로 분류하세요.[cite: 2]
 
 [모호성 해결]
 - (최우선 규칙) "일정", "캘린더", "스케줄", "달력" 이라는 단어가 문장에 하나라도 포함되어 있으면, 주저하지 말고 무조건 CALENDAR 로 분류하세요.
@@ -816,6 +818,37 @@ TOOLS_CHAT = [
                     "user_id": {"type": "string", "description": "사용자 UUID"}
                 },
                 "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_messages",
+            "description": "특정 채팅방의 상세 대화 내역을 조회한다. room_id를 모르면 먼저 get_chat_rooms를 호출하라.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room_id": {"type": "string", "description": "채팅방 UUID"},
+                    "limit": {"type": "integer", "description": "가져올 메시지 수 (기본 20)"}
+                },
+                "required": ["room_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_chat_message",
+            "description": "채팅방에 메시지를 보낸다. 답장할 때 사용하라.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room_id": {"type": "string", "description": "채팅방 UUID"},
+                    "sender_id": {"type": "string", "description": "보내는 사람 UUID (현재 사용자)"},
+                    "content": {"type": "string", "description": "메시지 내용"}
+                },
+                "required": ["room_id", "sender_id", "content"],
             },
         },
     }
@@ -1033,18 +1066,25 @@ _UUID_RE = _re.compile(
 
 
 def _fix_id_params(tool_name: str, tool_input: dict[str, Any], user_id: str) -> dict[str, Any]:
-    """
-    LLM이 id 파라미터를 null이거나 UUID가 아닌 값으로 보낸 경우 user_id로 자동 교체한다.
-    """
     func = TOOL_FUNCTION_MAP.get(tool_name)
     if func is None:
         return tool_input
     params = set(_inspect.signature(func).parameters.keys())
-    for id_field in ("seller_id", "user_id", "buyer_id"):
+    
+    # 1. 사람 관련 ID는 user_id로 교정 가능
+    for id_field in ("seller_id", "user_id", "buyer_id", "sender_id"):
         if id_field in params:
             val = tool_input.get(id_field)
             if not val or not _UUID_RE.match(str(val)):
                 tool_input[id_field] = user_id
+    
+    # 2. room_id는 절대 임의로 채우지 않음 (잘못된 값이면 AI가 다시 찾게 유도)
+    if "room_id" in params:
+        val = tool_input.get("room_id")
+        if not val or not _UUID_RE.match(str(val)):
+            # 비워두거나 제거하여 AI가 get_chat_rooms를 다시 호출하게 만듦
+            tool_input.pop("room_id", None) 
+            
     return tool_input
 
 
@@ -1210,6 +1250,7 @@ async def inventory_order_node(state: AgentState) -> dict:
             if choice.finish_reason == "stop":
                 # tool 호출 없이 답변 완료
                 final_text = choice.message.content or ""
+                fianl_text = final_text.replace("**", "").replace("- [", "[")
                 new_messages.append({"role": "assistant", "content": final_text})
                 # tool_results가 있으면 response_node가 요약, 없으면 직접 final_response 설정
                 if not all_tool_results:
@@ -1577,21 +1618,31 @@ async def calendar_reason_node(state: AgentState) -> dict:
         "final_response": final_text,
     }
 
-# ... (calendar_reason_node 종료 지점) ...
 
-# 👈 여기에 복붙하세요!
 async def chat_node(state: AgentState) -> dict:
     print("\n🏢 [부서 출입문] 채팅 관리 부서에 들어왔습니다!")
     client = get_openai_client()
     model = "gpt-4o-mini"
+    MAX_TOOL_ROUNDS = 6
 
     user_id = state.get("user_id", "")
+
     system_prompt = (
-        "당신은 AgriFlow 채팅 관리 전문가입니다.\n"
-        "[원칙]\n"
-        "- `get_chat_rooms` 도구로 사용자의 채팅 목록을 조회하세요.\n"
-        "- 결과가 나오면 상대방 이름, 회사명, 마지막 메시지를 리스트 형태로 친절하게 안내하세요.\n"
-        "- 불필요한 사족은 빼고 핵심 정보만 전달하세요."
+        "당신은 AgriFlow의 채팅 비서입니다.\n"
+        "[절대 금지 사항 - 위반 시 시스템 오류 발생]\n"
+        "1. 리스트 기호(-, *, 1.) 사용을 절대 금지합니다. 문장 처음에 기호를 쓰지 마세요.\n"
+        "2. 마크다운 별표(**) 사용을 절대 금지합니다. 텍스트를 굵게 만들지 마세요.\n"
+        "3. 모든 대화는 한 줄에 하나씩, 생 텍스트(Plain Text)로만 작성하세요.\n"
+        "\n"
+        "[동작 로직]\n"
+        "- `send_chat_message` 성공 시 즉시 대화를 종료하고 전송 결과만 짧게 보고하세요.\n"
+        "- 대화 내역 조회 시에는 반드시 [시각] 이름 : 내용 형식을 지키세요.\n"
+        "\n"
+        "[출력 예시 - 이대로만 하세요]\n"
+        "─── 2026-05-01 ───\n"
+        "[오전 04:25] test : 안녕하세요\n"
+        "[오전 04:51] test2 : 반갑습니다\n"
+        "현재 배송 중인 상태입니다."
     )
 
     agent_messages = [
@@ -1600,33 +1651,55 @@ async def chat_node(state: AgentState) -> dict:
         {"role": "user", "content": state.get("message", "")},
     ]
 
-    # 도구 실행 루프 (단순 조회를 위해 1회만 실행)
-    response = await client.chat.completions.create(
-        model=model,
-        messages=agent_messages,
-        tools=TOOLS_CHAT,
-        tool_choice={"type": "function", "function": {"name": "get_chat_rooms"}}
-    )
-
-    choice = response.choices[0]
-    if choice.message.tool_calls:
-        tc = choice.message.tool_calls[0]
-        tool_input = json.loads(tc.function.arguments)
-        tool_input = _fix_id_params(tc.function.name, tool_input, user_id)
-        
-        result_content = _execute_tool(tc.function.name, tool_input)
-        
-        # 결과를 바탕으로 최종 답변 생성
-        final_response = await client.chat.completions.create(
+    tools_used = list(state.get("tools_used", []))
+    
+    for round_idx in range(MAX_TOOL_ROUNDS):
+        response = await client.chat.completions.create(
             model=model,
-            messages=agent_messages + [
-                choice.message,
-                {"role": "tool", "tool_call_id": tc.id, "content": result_content}
-            ]
+            messages=agent_messages,
+            tools=TOOLS_CHAT,
+            tool_choice="auto"  # 👈 AI가 스스로 판단하게 맡깁니다!
         )
-        return {"final_response": final_response.choices[0].message.content}
 
-    return {"final_response": choice.message.content}
+        choice = response.choices[0]
+
+        if choice.message.tool_calls:
+            agent_messages.append(choice.message)
+            
+            for tc in choice.message.tool_calls:
+                tool_name = tc.function.name
+                tool_input = json.loads(tc.function.arguments)
+                tool_input = _fix_id_params(tool_name, tool_input, user_id)
+                
+                if tool_name not in tools_used:
+                    tools_used.append(tool_name)
+                
+                result_content = _execute_tool(tool_name, tool_input)
+                
+                if tool_name == "send_chat_message" and '"success": true' in result_content.lower():
+                    return {
+                        "tools_used": tools_used,
+                        "final_response": "메시지를 성공적으로 전송했습니다!"
+                    }
+            
+                # 🕵️‍♂️ CCTV 로그 출력
+                print(f"🕵️‍♂️ [CCTV] {tool_name} 호출 결과: {result_content[:100]}")
+                
+                agent_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_content
+                })
+            continue 
+        
+        final_text = choice.message.content.replace("**", "").replace("- [", "[")
+        
+        return {
+            "tools_used": tools_used,
+            "final_response": final_text
+        }
+    
+    return {"final_response": "채팅 처리를 마무리하지 못했습니다. 다시 시도해 주세요!"}
 
 async def validator_node(state: AgentState) -> dict:
     """

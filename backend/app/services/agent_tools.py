@@ -948,6 +948,7 @@ def open_chat_room(user_id: str, partner_user_id: str) -> dict:
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+    
 def get_chat_rooms(user_id: str) -> dict:
     """사용자가 참여 중인 채팅방 목록을 조회한다."""
     try:
@@ -991,6 +992,52 @@ def get_chat_rooms(user_id: str) -> dict:
     except Exception as e:
         return {"success": False, "error": str(e), "rooms": [], "count": 0}
 
+def get_chat_messages(room_id: str, limit: int = 20) -> dict:
+    """특정 채팅방의 최근 대화 내용을 불러온다."""
+    try:
+        supabase = get_supabase_client()
+        result = (
+            supabase.table("messages")
+            .select("sender_id, content, created_at, sender:users!sender_id(name)")
+            .eq("room_id", room_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        
+        # 최신순으로 가져온 뒤 시간순(과거->현재)으로 뒤집기
+        messages = list(reversed(result.data or []))
+        
+        return {
+            "success": True,
+            "messages": messages,
+            "count": len(messages)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def send_chat_message(room_id: str, sender_id: str, content: str) -> dict:
+    """채팅방에 새 메시지를 전송한다."""
+    try:
+        supabase = get_supabase_client()
+        
+        # 1) 메시지 저장
+        msg_result = (
+            supabase.table("messages")
+            .insert({"room_id": room_id, "sender_id": sender_id, "content": content})
+            .execute()
+        )
+        
+        # 2) 채팅방의 'last_message' 업데이트 (목록에서 바로 보이게)
+        supabase.table("chat_rooms").update({"last_message": content}).eq("id", room_id).execute()
+        
+        return {
+            "success": True,
+            "message": "메시지가 전송되었습니다.",
+            "sent_at": msg_result.data[0]["created_at"] if msg_result.data else None
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ─────────────────────────────────────────────
 # 캘린더 도구
@@ -1645,6 +1692,8 @@ TOOL_FUNCTION_MAP = {
     "find_buyers_by_product": find_buyers_by_product,
     "open_chat_room": open_chat_room,
     "get_chat_rooms": get_chat_rooms,
+    "get_chat_messages": get_chat_messages,
+    "send_chat_message": send_chat_message,
     "get_calendar_events": get_calendar_events,
     "create_calendar_event": create_calendar_event,
     "update_calendar_event": update_calendar_event,
