@@ -668,6 +668,8 @@ def _build_router_system() -> str:
 - GENERAL: 인사, 날씨, 농산물 시세 일반 질문 등 위 세 가지와 완전히 무관한 경우만
   예시: "안녕", "오늘 날씨", "AgriFlow가 뭐야"
   → 품목명이 하나라도 언급되면 GENERAL이 아닌 INVENTORY로 분류할 것
+- CHAT: 채팅방 조회 및 메시지 관련 요청.
+  예시: "내 채팅방 목록 보여줘", "진행 중인 대화 있어?", "판매자랑 대화한 거 찾아줘"
 
 [모호성 해결]
 - (최우선 규칙) "일정", "캘린더", "스케줄", "달력" 이라는 단어가 문장에 하나라도 포함되어 있으면, 주저하지 말고 무조건 CALENDAR 로 분류하세요.
@@ -800,6 +802,23 @@ TOOLS_CALENDAR = [
             },
         },
     },
+]
+
+TOOLS_CHAT = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_rooms",
+            "description": "현재 사용자가 참여하고 있는 모든 채팅방 목록을 가져온다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "사용자 UUID"}
+                },
+                "required": ["user_id"],
+            },
+        },
+    }
 ]
 
 # ─────────────────────────────────────────────
@@ -1062,7 +1081,7 @@ async def orchestrator_node(state: AgentState) -> dict:
         parsed = {"intent": "GENERAL", "response": content}
 
     intent = parsed.get("intent", "GENERAL").upper()
-    if intent not in ("INVENTORY", "ORDER", "CALENDAR", "GENERAL"):
+    if intent not in ("INVENTORY", "ORDER", "CALENDAR", "CHAT", "GENERAL"): # 👈 CHAT 추가
         intent = "GENERAL"
 
     print(f"🚨 [라우터 판정 결과] 이 질문은 '{intent}' 부서로 갑니다!")
@@ -1558,6 +1577,57 @@ async def calendar_reason_node(state: AgentState) -> dict:
         "final_response": final_text,
     }
 
+# ... (calendar_reason_node 종료 지점) ...
+
+# 👈 여기에 복붙하세요!
+async def chat_node(state: AgentState) -> dict:
+    print("\n🏢 [부서 출입문] 채팅 관리 부서에 들어왔습니다!")
+    client = get_openai_client()
+    model = "gpt-4o-mini"
+
+    user_id = state.get("user_id", "")
+    system_prompt = (
+        "당신은 AgriFlow 채팅 관리 전문가입니다.\n"
+        "[원칙]\n"
+        "- `get_chat_rooms` 도구로 사용자의 채팅 목록을 조회하세요.\n"
+        "- 결과가 나오면 상대방 이름, 회사명, 마지막 메시지를 리스트 형태로 친절하게 안내하세요.\n"
+        "- 불필요한 사족은 빼고 핵심 정보만 전달하세요."
+    )
+
+    agent_messages = [
+        {"role": "system", "content": system_prompt},
+        *state.get("history", []),
+        {"role": "user", "content": state.get("message", "")},
+    ]
+
+    # 도구 실행 루프 (단순 조회를 위해 1회만 실행)
+    response = await client.chat.completions.create(
+        model=model,
+        messages=agent_messages,
+        tools=TOOLS_CHAT,
+        tool_choice={"type": "function", "function": {"name": "get_chat_rooms"}}
+    )
+
+    choice = response.choices[0]
+    if choice.message.tool_calls:
+        tc = choice.message.tool_calls[0]
+        tool_input = json.loads(tc.function.arguments)
+        tool_input = _fix_id_params(tc.function.name, tool_input, user_id)
+        
+        result_content = _execute_tool(tc.function.name, tool_input)
+        
+        # 결과를 바탕으로 최종 답변 생성
+        final_response = await client.chat.completions.create(
+            model=model,
+            messages=agent_messages + [
+                choice.message,
+                {"role": "tool", "tool_call_id": tc.id, "content": result_content}
+            ]
+        )
+        return {"final_response": final_response.choices[0].message.content}
+
+    return {"final_response": choice.message.content}
+
 async def validator_node(state: AgentState) -> dict:
     """
     TEA 방식 검증 노드.
@@ -1713,6 +1783,8 @@ def route_after_orchestrator(state: AgentState) -> str:
         if subtype == "REASON":
             return "calendar_reason_node"
         return "calendar_data_node"
+    if intent == "CHAT":
+        return "chat_node"
     return "response_node"
 
 
@@ -1739,6 +1811,7 @@ def _build_graph():
     graph.add_node("inventory_order_node", inventory_order_node)
     graph.add_node("calendar_data_node", calendar_data_node)
     graph.add_node("calendar_reason_node", calendar_reason_node)
+    graph.add_node("chat_node", chat_node)
     graph.add_node("validator_node", validator_node)
     graph.add_node("response_node", response_node)
 
@@ -1751,6 +1824,7 @@ def _build_graph():
             "inventory_order_node": "inventory_order_node",
             "calendar_data_node": "calendar_data_node",
             "calendar_reason_node": "calendar_reason_node",
+            "chat_node": "chat_node",
             "response_node": "response_node",
         },
     )
@@ -1766,6 +1840,7 @@ def _build_graph():
     # 캘린더 노드들은 자체적으로 final_response 를 채우므로 바로 response_node 로
     graph.add_edge("calendar_data_node", "response_node")
     graph.add_edge("calendar_reason_node", "response_node")
+    graph.add_edge("chat_node", "response_node")
     graph.add_edge("response_node", END)
 
     return graph.compile()

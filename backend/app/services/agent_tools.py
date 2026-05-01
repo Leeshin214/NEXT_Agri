@@ -948,6 +948,48 @@ def open_chat_room(user_id: str, partner_user_id: str) -> dict:
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+def get_chat_rooms(user_id: str) -> dict:
+    """사용자가 참여 중인 채팅방 목록을 조회한다."""
+    try:
+        supabase = get_supabase_client()
+        
+        # 사용자가 구매자 혹은 판매자인 채팅방을 모두 가져옴
+        result = (
+            supabase.table("chat_rooms")
+            .select(
+                "id, last_message, created_at, "
+                "buyer:users!buyer_id(name, company_name), "
+                "seller:users!seller_id(name, company_name)"
+            )
+            .or_(f"buyer_id.eq.{user_id},seller_id.eq.{user_id}")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        
+        rooms = result.data or []
+        flattened = []
+        
+        for r in rooms:
+            buyer = r.get("buyer") or {}
+            seller = r.get("seller") or {}
+            
+            flattened.append({
+                "room_id": r["id"],
+                "last_message": r.get("last_message"),
+                "created_at": r["created_at"],
+                "buyer_name": buyer.get("name"),
+                "buyer_company": buyer.get("company_name"),
+                "seller_name": seller.get("name"),
+                "seller_company": seller.get("company_name"),
+            })
+
+        return {
+            "success": True,
+            "rooms": flattened,
+            "count": len(flattened),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "rooms": [], "count": 0}
 
 
 # ─────────────────────────────────────────────
@@ -1602,6 +1644,7 @@ TOOL_FUNCTION_MAP = {
     "find_sellers_by_product": find_sellers_by_product,
     "find_buyers_by_product": find_buyers_by_product,
     "open_chat_room": open_chat_room,
+    "get_chat_rooms": get_chat_rooms,
     "get_calendar_events": get_calendar_events,
     "create_calendar_event": create_calendar_event,
     "update_calendar_event": update_calendar_event,
