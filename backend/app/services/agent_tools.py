@@ -570,6 +570,12 @@ def update_order_status(order_id: str, new_status: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+_UUID_PATTERN = __import__('re').compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    __import__('re').IGNORECASE,
+)
+
+
 def create_order(
     buyer_id: str,
     seller_id: str,
@@ -584,12 +590,55 @@ def create_order(
 
     order_number UNIQUE 충돌 (PostgreSQL 23505) 발생 시 최대 3회 재시도.
     동시 합의 자동 주문 (chat_ws._handle_consensus) 흐름에서 동일 초 + 동일 random 4자리 시 발생 가능.
+    product_id가 UUID가 아닌 상품명으로 들어온 경우 자동으로 이름 검색해 UUID로 변환한다.
     """
     # 지연 import — 모듈 임포트 시점 의존성 회피
     from postgrest.exceptions import APIError as PostgrestAPIError
 
     try:
         supabase = get_supabase_client()
+
+        # product_id가 UUID가 아니면 상품명으로 자동 검색
+        if product_id and not _UUID_PATTERN.match(str(product_id)):
+            found = _find_product_by_name(supabase, product_id, seller_id)
+            if not found:
+                return {"success": False, "error": f"'{product_id}' 상품을 찾을 수 없습니다. 상품명을 확인해주세요."}
+            product_id = found["id"]
+        elif product_id and _UUID_PATTERN.match(str(product_id)):
+            # UUID가 맞더라도 해당 seller의 상품인지 검증
+            verify = (
+                supabase.table("products")
+                .select("id, name, price_per_unit, unit")
+                .eq("id", product_id)
+                .eq("seller_id", seller_id)
+                .is_("deleted_at", None)
+                .execute()
+            )
+            if not verify.data:
+                # seller 소속 상품이 아님 → 올바른 상품 찾아서 에러에 힌트 포함
+                correct = _find_product_by_name(supabase, "", seller_id)
+                # seller 전체 상품 조회해서 힌트 제공
+                all_products = (
+                    supabase.table("products")
+                    .select("id, name, price_per_unit, unit")
+                    .eq("seller_id", seller_id)
+                    .is_("deleted_at", None)
+                    .limit(10)
+                    .execute()
+                )
+                hint = ", ".join(
+                    f"{p['name']}(id:{p['id']}, {p['price_per_unit']}원/{p['unit']})"
+                    for p in (all_products.data or [])
+                )
+                return {
+                    "success": False,
+                    "llm_retry": True,
+                    "error": (
+                        f"product_id '{product_id}'는 seller_id '{seller_id}'의 상품이 아닙니다. "
+                        f"이 판매자의 실제 상품 목록: [{hint}]. "
+                        "올바른 product_id를 사용해 다시 create_order를 호출하세요."
+                    ),
+                }
 
         subtotal = quantity * unit_price
         total_amount = subtotal
@@ -905,6 +954,8 @@ def open_chat_room(user_id: str, partner_user_id: str) -> dict:
 # 캘린더 도구
 # ─────────────────────────────────────────────
 
+import re
+
 def get_calendar_events(user_id: str, year: int, month: int) -> dict:
     """해당 월의 캘린더 일정을 조회한다.
     날짜 범위: YYYY-MM-01 ~ YYYY-MM-{말일}
@@ -918,6 +969,11 @@ def get_calendar_events(user_id: str, year: int, month: int) -> dict:
     반환: {success, events, count}
     """
     try:
+        year_str = re.sub(r'\D', '', str(year))
+        month_str = re.sub(r'\D', '', str(month))
+        
+        year = int(year_str) if year_str else datetime.now().year
+        month = int(month_str) if month_str else datetime.now().month
         supabase = get_supabase_client()
 
         last_day = monthrange(year, month)[1]
@@ -931,7 +987,7 @@ def get_calendar_events(user_id: str, year: int, month: int) -> dict:
                 "orders(order_number, status, "
                 "buyer:users!buyer_id(name,company_name), "
                 "seller:users!seller_id(name,company_name), "
-                "order_items(quantity, unit, products(name)))"
+                "order_items(quantity, products(name)))"
             )
             .eq("user_id", user_id)
             .gte("event_date", date_from)
@@ -1040,7 +1096,57 @@ def create_calendar_event(
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+def update_calendar_event(
+    user_id: str,
+    event_id: str,
+    title: Optional[str] = None,
+    event_date: Optional[str] = None,
+    event_type: Optional[str] = None,
+    description: Optional[str] = None,
+) -> dict:
+    """캘린더 일정을 수정한다."""
+    VALID_EVENT_TYPES = {"SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER", "OTHER"}
+    if event_type and event_type not in VALID_EVENT_TYPES:
+        return {"success": False, "error": f"유효하지 않은 event_type입니다."}
 
+    try:
+        supabase = get_supabase_client()
+        check = supabase.table("calendar_events").select("id, user_id, title").eq("id", event_id).is_("deleted_at", None).execute()
+        if not check.data:
+            return {"success": False, "error": "해당 일정을 찾을 수 없습니다."}
+        if check.data[0]["user_id"] != user_id:
+            return {"success": False, "error": "권한 없음: 본인의 일정만 수정할 수 있습니다."}
+
+        update_data: dict = {}
+        if title is not None: update_data["title"] = title
+        if event_date is not None: update_data["event_date"] = event_date
+        if event_type is not None: update_data["event_type"] = event_type
+        if description is not None: update_data["description"] = description
+
+        if not update_data:
+            return {"success": False, "error": "수정할 내용이 없습니다."}
+
+        supabase.table("calendar_events").update(update_data).eq("id", event_id).execute()
+        return {"success": True, "event_id": event_id, "message": f"일정 '{check.data[0]['title']}'이(가) 수정되었습니다."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def delete_calendar_event(user_id: str, event_id: str) -> dict:
+    """캘린더 일정을 삭제한다 (soft delete)."""
+    try:
+        supabase = get_supabase_client()
+        check = supabase.table("calendar_events").select("id, user_id, title").eq("id", event_id).is_("deleted_at", None).execute()
+        if not check.data:
+            return {"success": False, "error": "해당 일정을 찾을 수 없습니다."}
+        if check.data[0]["user_id"] != user_id:
+            return {"success": False, "error": "권한 없음: 본인의 일정만 삭제할 수 있습니다."}
+
+        now_utc = datetime.now(timezone.utc).isoformat()
+        supabase.table("calendar_events").update({"deleted_at": now_utc}).eq("id", event_id).execute()
+        return {"success": True, "event_id": event_id, "message": f"일정 '{check.data[0]['title']}'이(가) 삭제되었습니다."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
 # ─────────────────────────────────────────────
 # 대체 거래처 탐색 도구
 # ─────────────────────────────────────────────
@@ -1498,6 +1604,8 @@ TOOL_FUNCTION_MAP = {
     "open_chat_room": open_chat_room,
     "get_calendar_events": get_calendar_events,
     "create_calendar_event": create_calendar_event,
+    "update_calendar_event": update_calendar_event,
+    "delete_calendar_event": delete_calendar_event,
     "find_alternative_partners": find_alternative_partners,
     "get_user_profile": get_user_profile,
 }

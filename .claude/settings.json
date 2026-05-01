@@ -1,4 +1,30 @@
 {
+  "permissions": {
+    "allow": [
+      "Read(//Users/l.s.h/workspace/NEXT_2026/web/**)",
+      "Bash(npx tsc *)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0,'.'\\);  import app.main\")",
+      "Bash(git fetch *)",
+      "Bash(git stash *)",
+      "Bash(git checkout *)",
+      "Bash(git pull *)",
+      "Bash(grep -rn \"api\\\\.\\\\\\(get\\\\|post\\\\|put\\\\|patch\\\\|delete\\\\\\)\\\\|fetch\\\\|axios\\\\|\\\\`/api\\\\|'/api\\\\|\\\\\"/api\" /c/Users/User/Desktop/NEXT_Agri_/frontend/hooks/ /c/Users/User/Desktop/NEXT_Agri_/frontend/lib/)",
+      "Bash(xargs grep *)",
+      "Bash(git merge *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('c:/Users/User/Desktop/NEXT_Agri_/backend/app/services/orchestrator.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Python syntax OK'\\)\")",
+      "Bash(python -c \"import ast; tree = ast.parse\\(open\\('c:/Users/User/Desktop/NEXT_Agri_/backend/app/services/orchestrator.py', encoding='utf-8'\\).read\\(\\)\\); print\\('AST parse OK, top-level statements:', len\\(tree.body\\)\\)\")",
+      "Bash(python -m py_compile app/services/orchestrator.py)",
+      "Bash(xargs -0 -n1 python -m py_compile)",
+      "Bash(python -c \"import app.main\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/services/orchestrator.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/services/agent_tools.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/services/agent_tools.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('app/services/orchestrator.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/api/v1/chat.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(python -c \"import app.services.orchestrator as o; print\\('IMPORT_OK'\\); print\\('TOOLS_CALENDAR_LEN=', len\\(o.TOOLS_CALENDAR\\)\\); print\\('calendar_data_node=', o.calendar_data_node\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  },
   "hooks": {
     "PostToolUse": [
       {
