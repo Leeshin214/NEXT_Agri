@@ -539,8 +539,10 @@ TOOLS = [
         "function": {
             "name": "open_chat_room",
             "description": (
-                "사용자의 요청에 따라 판매자와의 1:1 채팅방을 즉시 생성합니다. "
-                "너는 이 시스템의 운영자로서 채팅방을 개설할 전권이 있습니다. "
+                "사용자의 요청에 따라 판매자와의 1:1 채팅방을 생성합니다. "
+                "직전 create_order 결과가 있거나 사용자가 '이 주문 건', '방금 주문', '방금 견적'이라고 말한 경우에는 "
+                "반드시 order_id를 함께 전달해야 합니다. "
+                "order_id 없이 호출하면 일반 채팅방이 열리므로, 주문/견적 맥락에서는 order_id 없는 호출을 금지합니다. "
                 "상대방의 partner_user_id를 모를 경우, 반드시 get_user_profile 도구를 먼저 호출하여 "
                 "업체명(company_name)으로 ID를 조회한 뒤 이 도구를 연달아 호출하세요."
             ),
@@ -702,6 +704,7 @@ def _build_router_system() -> str:
   예시: "내 채팅방 목록 보여줘", "진행 중인 대화 있어?", "배추 채팅방 대화 보여줘", 
         "test2한테 '안녕하세요'라고 보내줘", "답장 보내줘", "메시지 전송해줘"[cite: 2]
   → 중요: "~라고 보내줘", "~라고 전송해줘", "~라고 답장해줘" 같은 문장 패턴이 나오면 품목 언급 여부와 상관없이 무조건 CHAT으로 분류하세요.[cite: 2]
+    단, "채팅방 열어줘", "채팅 연결해줘", "판매자랑 얘기하고 싶어"가 직전 주문/견적/구매 의사와 이어지는 경우에는 CHAT이 아니라 ORDER로 분류한다. CHAT은 이미 존재하는 채팅방 목록 조회, 대화 내용 조회, 특정 방에 메시지 전송/답장할 때만 사용한다.
 
 [모호성 해결]
 - (최우선 절대 규칙) 문장 내에 오타가 있더라도 "일정", "캘린더", "스케줄", "달력" 이라는 단어(또는 비슷한 발음/철자)가 존재하면 무조건 CALENDAR 로 분류하세요.
@@ -951,17 +954,31 @@ BUYER_ROLE_APPENDIX = """
 - **모르면 찾아라**: UUID를 모르거나 정보가 부족하다고 느껴진다면, "없다"고 말하지 말고 즉시 `get_user_profile(company_name="업체명")`을 호출하여 정보를 갱신하세요. 
 - **22P02 에러 방지**: ID 칸에 "test3" 같은 이름을 넣지 마세요. 무조건 UUID(`8-4-4-4-12` 형식)를 확보한 뒤 도구를 실행하세요.
 
-[🚨 주문-협상-채팅 '풀코스' 실행 로직]
-사용자가 "채팅방 열어줘" 또는 "해줘"라고 하면, 너는 **기존 기억을 의심하고** 아래 콤보를 단 하나의 메시지 안에서 연달아(Multi-tool call) 호출해야 합니다.
+[🚨 주문 생성 후 채팅방 연결 규칙 — 매우 중요]
 
-1. **ID 확보**: `get_user_profile(company_name="직전 언급된 업체명")`을 호출해 진짜 UUID를 가져온다.
-2. **주문 생성**: 확보한 UUID와 상품명(옥수수), 수량(30kg)으로 `create_order`를 실행한다.
-3. **상태 변경**: 생성된 주문 ID의 상태를 즉시 'NEGOTIATING'으로 변경한다.
-4. **방 개설**: 확보한 판매자 UUID로 `open_chat_room`을 실행한다. 이때 2단계에서 반환된 order_id를 반드시 `order_id` 파라미터로 전달한다.
-5. **메시지 전송**: 생성된 방에 "{상품} {수량} 견적 요청드립니다."라고 첫 메시지를 보낸다.
+사용자가 "주문해줘", "발주 넣어줘", "견적 요청해줘"라고 해서 create_order를 실행한 직후,
+이후 사용자가 "채팅방 열어줘", "판매자랑 얘기할래", "채팅 연결해줘"라고 말하면
+절대 일반 채팅방을 열면 안 된다.
+
+반드시 직전 create_order tool 결과에서 생성된 주문 ID를 찾아서 open_chat_room의 order_id에 넣어라.
+
+실행 순서:
+1. create_order 실행
+2. create_order 결과의 최상위 필드 order_id를 저장한다.
+3. 사용자가 이어서 "채팅방 열어줘"라고 하면 open_chat_room을 호출한다.
+4. 이때 반드시:
+   - partner_user_id = 직전 create_order 결과의 최상위 seller_id
+   - order_id = 직전 create_order 결과의 최상위 order_id
+   를 함께 전달한다.
+5. open_chat_room 이후 send_chat_message로 첫 견적/주문 메시지를 보낸다.
+6. 이 시점에서는 주문 상태를 NEGOTIATING으로 바꾸지 않는다. 판매자가 해당 채팅방에 답변하면 그때 NEGOTIATING으로 변경한다.
+금지:
+- order_id 없이 open_chat_room 호출 금지
+- 같은 판매자와의 기존 일반 채팅방 재사용 금지
+- "채팅방 열어줘"를 단순 일반 채팅으로 해석 금지
 
 [🗣️ 성공 시 응답 대본]
-- "옥수수 30kg 견적 생성부터 협상중 상태 변경, 그리고 test3님과의 채팅방 연결까지 완벽하게 처리했습니다! 첫 인사 메시지도 남겨두었으니 채팅방을 확인해 보세요."
+- 옥수수 30kg 견적 요청을 생성했고, test3님과 해당 주문에 연결된 채팅방까지 열어두었습니다. 첫 메시지도 남겨두었으니 채팅방에서 이어서 협의하시면 됩니다.
 """
 
 # 합성 — BASE + ROLE_APPENDIX + FEW_SHOT_EXAMPLES
@@ -1112,8 +1129,17 @@ def _fix_id_params(tool_name: str, tool_input: dict[str, Any], user_id: str) -> 
     for id_field in ("seller_id", "user_id", "buyer_id", "sender_id"):
         if id_field in params:
             val = tool_input.get(id_field)
-            if not val or not _UUID_RE.match(str(val)):
-                tool_input[id_field] = user_id
+
+            if val and _UUID_RE.match(str(val)):
+                continue
+
+            # create_order에서 seller_id를 현재 구매자 user_id로 덮어쓰면 안 됨.
+            # seller_id가 없거나 UUID가 아니면 tool이 실패하게 두고,
+            # LLM이 get_user_profile / find_sellers_by_product로 판매자 UUID를 다시 찾도록 유도한다.
+            if tool_name == "create_order" and id_field == "seller_id":
+                continue
+
+            tool_input[id_field] = user_id
     
     # 2. room_id는 절대 임의로 채우지 않음 (잘못된 값이면 AI가 다시 찾게 유도)
     if "room_id" in params:
@@ -1426,8 +1452,10 @@ async def calendar_data_node(state: AgentState) -> dict:
         "- 일정 등록은 create_calendar_event 호출 전 같은 날짜 중복을 get_calendar_events 로 확인.\n"
         "- 일정 변경/수정은 update_calendar_event 호출 (수정할 event_id를 모르면 먼저 조회할 것).\n"
         "- 일정 취소/삭제는 delete_calendar_event 호출 (삭제할 event_id를 모르면 먼저 조회할 것).\n"
-        "- (중요) 사용자가 특정 주문의 일정을 추가/수정해달라고 하면, 반드시 get_calendar_events로 해당 주문과 관련된 기존 일정이 있는지 먼저 확인하세요. 만약 일정이 이미 존재한다면 새로 만들지 말고 update_calendar_event를 사용해 기존 일정의 날짜나 내용을 수정해야 합니다.\n"
-        "- 단, '배송 일정을 3일에서 7일로 미뤄줘'처럼 기존에 등록된 '동일한 성격'의 일정을 바꾸는 경우에만 update_calendar_event를 사용하세요.\n"
+        "- (중요) 주문 상태(ORDER) 일정과 배송/납품(DELIVERY/SHIPMENT) 일정은 **서로 다른 일정**입니다.\n"
+        "- 주문 상태(ORDER) 일정은 기존 것을 유지하세요(ORDER를 DELIVERY로 바꾸거나 날짜를 옮기지 마세요).\n"
+        "- 사용자가 배송/납품 일정을 '추가'하길 원하면, ORDER 일정이 이미 있어도 **create_calendar_event로 새 DELIVERY/SHIPMENT 일정을 생성**하세요.\n"
+        "- 사용자가 배송/납품 일정을 '변경/미루기'처럼 기존 배송 일정 자체를 바꾸길 원하면, 해당 DELIVERY/SHIPMENT 이벤트를 찾아 update_calendar_event로 수정하세요.\n"
         "- 일정 변경/수정은 update_calendar_event 호출 (수정할 event_id를 모르면 먼저 조회할 것).\n"
         "- 일정 취소/삭제는 delete_calendar_event 호출 (삭제할 event_id를 모르면 먼저 조회할 것).\n"
         "- (중요) 사용자가 특정 일정을 '삭제'해달라고 하면, get_calendar_events 로 조회한 뒤 해당 일정의 'id'를 찾아 즉시 delete_calendar_event 를 한 번만 실행하세요. 절대 중복해서 조회만 반복하지 마세요.\n"

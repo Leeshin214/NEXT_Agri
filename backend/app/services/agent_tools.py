@@ -9,11 +9,18 @@ agent_tools.py — LangGraph 오케스트레이터에서 실제로 호출되는 
 import asyncio
 import json
 import random
+import re
 from calendar import monthrange
 from datetime import datetime, timezone
 from typing import Optional
 
 from app.core.supabase import get_supabase_client
+
+
+_UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
 
 
 def _sync_calendar_events_for_order_id(order_id: str) -> None:
@@ -534,6 +541,148 @@ def get_order_detail(order_id: str) -> dict:
     except Exception as e:
         return {"success": False, "error": str(e), "order": None}
 
+def _deduct_seller_stock_for_order(supabase, order_id: str) -> dict:
+    """
+    주문이 CONFIRMED 상태로 확정될 때 판매자 재고를 차감한다.
+    orders.inventory_deducted_at 값으로 중복 차감을 방지한다.
+    """
+    try:
+        # 1. 주문 조회: 이미 재고 차감된 주문인지 확인
+        order_result = (
+            supabase.table("orders")
+            .select("id, inventory_deducted_at")
+            .eq("id", order_id)
+            .is_("deleted_at", None)
+            .execute()
+        )
+
+        if not order_result.data:
+            return {
+                "success": False,
+                "error": "재고 차감 대상 주문을 찾을 수 없습니다.",
+            }
+
+        order = order_result.data[0]
+
+        # 이미 차감된 주문이면 다시 차감하지 않음
+        if order.get("inventory_deducted_at"):
+            return {
+                "success": True,
+                "message": "이미 재고가 차감된 주문입니다.",
+                "already_deducted": True,
+            }
+
+        # 2. 주문 항목 조회
+        items_result = (
+            supabase.table("order_items")
+            .select("id, product_id, quantity")
+            .eq("order_id", order_id)
+            .execute()
+        )
+
+        order_items = items_result.data or []
+
+        if not order_items:
+            return {
+                "success": False,
+                "error": "주문 항목이 없어 재고를 차감할 수 없습니다.",
+            }
+
+        # 3. 모든 상품 재고가 충분한지 먼저 검사
+        #    중간에 하나라도 부족하면 아무 상품도 차감하지 않기 위함
+        stock_checks = []
+
+        for item in order_items:
+            product_id = item.get("product_id")
+            quantity = item.get("quantity")
+
+            if not product_id or quantity is None:
+                return {
+                    "success": False,
+                    "error": "주문 항목에 product_id 또는 quantity가 없습니다.",
+                }
+
+            product_result = (
+                supabase.table("products")
+                .select("id, name, stock_quantity, status")
+                .eq("id", product_id)
+                .is_("deleted_at", None)
+                .execute()
+            )
+
+            if not product_result.data:
+                return {
+                    "success": False,
+                    "error": f"상품을 찾을 수 없습니다. product_id={product_id}",
+                }
+
+            product = product_result.data[0]
+            current_stock = int(product.get("stock_quantity") or 0)
+            order_quantity = int(quantity)
+
+            if current_stock < order_quantity:
+                return {
+                    "success": False,
+                    "error": (
+                        f"'{product.get('name')}' 재고가 부족합니다. "
+                        f"현재 재고: {current_stock}, 확정 수량: {order_quantity}"
+                    ),
+                }
+
+            stock_checks.append({
+                "product_id": product_id,
+                "product_name": product.get("name"),
+                "current_stock": current_stock,
+                "order_quantity": order_quantity,
+                "new_stock": current_stock - order_quantity,
+            })
+
+        # 4. 재고 차감 실행
+        deducted_items = []
+
+        for stock in stock_checks:
+            new_stock = stock["new_stock"]
+
+            if new_stock == 0:
+                new_status = "OUT_OF_STOCK"
+            elif new_stock < 10:
+                new_status = "LOW_STOCK"
+            else:
+                new_status = "NORMAL"
+
+            supabase.table("products").update({
+                "stock_quantity": new_stock,
+                "status": new_status,
+            }).eq("id", stock["product_id"]).execute()
+
+            deducted_items.append({
+                "product_id": stock["product_id"],
+                "product_name": stock["product_name"],
+                "before_quantity": stock["current_stock"],
+                "deducted_quantity": stock["order_quantity"],
+                "after_quantity": new_stock,
+                "new_status": new_status,
+            })
+
+        # 5. 주문에 재고 차감 완료 시각 기록
+        now_utc = datetime.now(timezone.utc).isoformat()
+
+        supabase.table("orders").update({
+            "inventory_deducted_at": now_utc,
+        }).eq("id", order_id).execute()
+
+        return {
+            "success": True,
+            "message": "판매자 재고가 차감되었습니다.",
+            "deducted_items": deducted_items,
+            "inventory_deducted_at": now_utc,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"재고 차감 중 오류가 발생했습니다: {str(e)}",
+        }
 
 def update_order_status(order_id: str, new_status: str) -> dict:
     """주문의 상태를 변경한다. 유효한 상태값인지 먼저 검증한다."""
@@ -558,22 +707,56 @@ def update_order_status(order_id: str, new_status: str) -> dict:
 
         supabase = get_supabase_client()
 
+        # 1. 주문 존재 여부와 현재 상태 확인
+        order_check = (
+            supabase.table("orders")
+            .select("id, status")
+            .eq("id", order_id)
+            .is_("deleted_at", None)
+            .execute()
+        )
+
+        if not order_check.data:
+            return {
+                "success": False,
+                "error": "해당 주문을 찾을 수 없습니다.",
+            }
+
+        current_status = order_check.data[0].get("status")
+
+        # 2. 주문 확정 상태로 변경되는 순간 판매자 재고 차감
+        #    이미 CONFIRMED였던 주문을 다시 CONFIRMED로 바꾸는 경우는 헬퍼 함수에서 중복 차감 방지
+        inventory_result = None
+
+        if new_status == "CONFIRMED":
+            inventory_result = _deduct_seller_stock_for_order(
+                supabase=supabase,
+                order_id=order_id,
+            )
+
+            if not inventory_result.get("success"):
+                return inventory_result
+
+        # 3. 주문 상태 업데이트
         supabase.table("orders").update({"status": new_status}).eq("id", order_id).execute()
+
+        # 4. 캘린더 동기화
         _sync_calendar_events_for_order_id(order_id)
 
-        return {
+        response = {
             "success": True,
             "order_id": order_id,
+            "previous_status": current_status,
             "new_status": new_status,
         }
+
+        if inventory_result is not None:
+            response["inventory_deduction"] = inventory_result
+
+        return response
+
     except Exception as e:
         return {"success": False, "error": str(e)}
-
-
-_UUID_PATTERN = __import__('re').compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-    __import__('re').IGNORECASE,
-)
 
 
 def update_order(
@@ -767,9 +950,21 @@ def create_order(
         return {
             "success": True,
             "order": order,
+            "order_id": order_id,
+            "order_number": order_number,
+            "seller_id": seller_id,
+            "buyer_id": buyer_id,
+            "product_id": product_id,
+            "quantity": quantity,
+            "unit_price": unit_price,
             "order_items": items_result.data or [],
             "message": f"주문 {order_number}이 생성되었습니다.",
+            "next_action_hint": (
+                "사용자가 이어서 '채팅방 열어줘'라고 하면 "
+                "open_chat_room 호출 시 반드시 이 order_id와 seller_id를 함께 사용하세요."
+            ),
         }
+    
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -946,10 +1141,12 @@ def open_chat_room(user_id: str, partner_user_id: str, order_id: Optional[str] =
     1) self-chat 거부 (user_id == partner_user_id)
     2) partner 존재 + deleted_at IS NULL 확인 — 없으면 partner_not_found
 
-    chat_rooms 테이블에서 seller_id/buyer_id 조합으로 검색하며,
-    두 사용자 중 누가 판매자·구매자인지 알 수 없으므로 역할 기반으로 결정한다.
-    기존 방이 항상 검색되므로 동일 (seller, buyer) 페어는 1개만 존재할 수밖에 없는 구조 →
-    rate-limit throttle 은 dead code 였으므로 제거.
+    chat_rooms 테이블에서 역할에 따라 seller_id/buyer_id를 결정한다.
+
+    주문별 채팅방 정책:
+    - order_id가 있으면 seller_id + buyer_id + order_id 조합으로 방을 찾는다.
+    - order_id가 없으면 seller_id + buyer_id + order_id IS NULL인 일반 채팅방만 찾는다.
+    - 기존 일반 채팅방이나 다른 주문 채팅방에 order_id를 덮어쓰지 않는다.
     반환: {success, room_id, is_new, partner_name} 또는 {success: False, error, message?}
     """
     # partner_user_id가 UUID가 아니면 이름/회사명으로 자동 검색
@@ -1016,38 +1213,50 @@ def open_chat_room(user_id: str, partner_user_id: str, order_id: Optional[str] =
         else:
             seller_id, buyer_id = partner_user_id, user_id
 
-        # 기존 방 검색
-        existing = (
-            supabase.table("chat_rooms")
-            .select("id")
-            .eq("seller_id", seller_id)
-            .eq("buyer_id", buyer_id)
-            .execute()
-        )
+        if order_id:
+            existing = (
+                supabase.table("chat_rooms")
+                .select("id")
+                .eq("seller_id", seller_id)
+                .eq("buyer_id", buyer_id)
+                .eq("order_id", order_id)
+                .execute()
+            )
+        else:
+            existing = (
+                supabase.table("chat_rooms")
+                .select("id")
+                .eq("seller_id", seller_id)
+                .eq("buyer_id", buyer_id)
+                .is_("order_id", None)
+                .execute()
+            )
+
         if existing.data:
             room_id = existing.data[0]["id"]
-            # order_id가 주어졌으면 기존 방에도 업데이트
-            if order_id:
-                supabase.table("chat_rooms").update({"order_id": order_id}).eq("id", room_id).execute()
             return {
                 "success": True,
                 "room_id": room_id,
                 "is_new": False,
                 "partner_name": partner_name,
+                "order_id": order_id,
             }
 
-        # C-5: 24h rate-limit throttle 제거 — 기존 방이 항상 검색되므로 동일 페어는 1개만
-        # 존재할 수밖에 없어 dead code 였음.
-
         # 새 채팅방 생성
-        insert_payload: dict = {"seller_id": seller_id, "buyer_id": buyer_id}
+        insert_payload: dict = {
+            "seller_id": seller_id,
+            "buyer_id": buyer_id,
+        }
+
         if order_id:
             insert_payload["order_id"] = order_id
+
         created = (
             supabase.table("chat_rooms")
             .insert(insert_payload)
             .execute()
         )
+
         if not created.data:
             return {"success": False, "error": "채팅방 생성에 실패했습니다."}
 
@@ -1056,7 +1265,9 @@ def open_chat_room(user_id: str, partner_user_id: str, order_id: Optional[str] =
             "room_id": created.data[0]["id"],
             "is_new": True,
             "partner_name": partner_name,
+            "order_id": order_id,
         }
+    
     except Exception as e:
         return {"success": False, "error": str(e)}
     
@@ -1153,9 +1364,6 @@ def send_chat_message(room_id: str, sender_id: str, content: str) -> dict:
 # ─────────────────────────────────────────────
 # 캘린더 도구
 # ─────────────────────────────────────────────
-
-import re
-
 def get_calendar_events(user_id: str, year: int, month: int) -> dict:
     """해당 월의 캘린더 일정을 조회한다.
     날짜 범위: YYYY-MM-01 ~ YYYY-MM-{말일}
@@ -1339,11 +1547,27 @@ def update_calendar_event(
 
     try:
         supabase = get_supabase_client()
-        check = supabase.table("calendar_events").select("id, user_id, title").eq("id", event_id).is_("deleted_at", None).execute()
+        check = (
+            supabase.table("calendar_events")
+            .select("id, user_id, title, event_type, order_id")
+            .eq("id", event_id)
+            .is_("deleted_at", None)
+            .execute()
+        )
         if not check.data:
             return {"success": False, "error": "해당 일정을 찾을 수 없습니다."}
         if check.data[0]["user_id"] != user_id:
             return {"success": False, "error": "권한 없음: 본인의 일정만 수정할 수 있습니다."}
+
+        # 주문 상태(ORDER) 이벤트는 시스템 동기화 대상이므로, 날짜/타입을 바꿔치기하는 업데이트를 금지한다.
+        # (배송/납품 일정은 별도의 DELIVERY/SHIPMENT 이벤트로 새로 등록해야 함)
+        existing = check.data[0]
+        if existing.get("order_id") and existing.get("event_type") == "ORDER":
+            if event_date is not None or (event_type is not None and event_type != "ORDER"):
+                return {
+                    "success": False,
+                    "error": "주문 상태(ORDER) 일정은 날짜/유형을 변경할 수 없습니다. 배송 일정은 새 일정으로 등록하세요.",
+                }
 
         update_data: dict = {}
         if title is not None: update_data["title"] = title
@@ -1355,7 +1579,7 @@ def update_calendar_event(
             return {"success": False, "error": "수정할 내용이 없습니다."}
 
         supabase.table("calendar_events").update(update_data).eq("id", event_id).execute()
-        return {"success": True, "event_id": event_id, "message": f"일정 '{check.data[0]['title']}'이(가) 수정되었습니다."}
+        return {"success": True, "event_id": event_id, "message": f"일정 '{existing['title']}'이(가) 수정되었습니다."}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
