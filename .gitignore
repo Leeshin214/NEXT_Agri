@@ -91,3 +91,6 @@ supabase/.temp/
 
 # 로컬 설정만 제외 (settings.json, agents/ 는 커밋 대상)
 .claude/settings.local.json
+.claude/settings.json
+
+.omc
