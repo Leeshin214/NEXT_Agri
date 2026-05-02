@@ -453,13 +453,41 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
             row["seller_company"] = seller.get("company_name")
 
             product_names: list[str] = []
-            for item in items:
+            item_summaries: list[str] = []
+
+            row["primary_product_name"] = None
+            row["primary_quantity"] = None
+            row["primary_unit_price"] = None
+            row["primary_subtotal"] = None
+
+            for idx, item in enumerate(items):
                 product = item.get("products") if isinstance(item, dict) else None
                 if not product:
                     continue
+
                 name = product.get("name")
+                quantity = item.get("quantity")
+                unit_price = item.get("unit_price")
+
                 if name:
                     product_names.append(name)
+
+                    if quantity is not None and unit_price is not None:
+                        item_summaries.append(f"{name} {quantity}kg x {unit_price:,}원")
+                    elif quantity is not None:
+                        item_summaries.append(f"{name} {quantity}kg")
+                    else:
+                        item_summaries.append(name)
+
+                if idx == 0:
+                    row["primary_product_name"] = name
+                    row["primary_quantity"] = quantity
+                    row["primary_unit_price"] = unit_price
+                    row["primary_subtotal"] = (
+                        quantity * unit_price
+                        if quantity is not None and unit_price is not None
+                        else None
+                    )
 
             if not product_names:
                 row["product_summary"] = None
@@ -468,6 +496,7 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
             else:
                 row["product_summary"] = f"{product_names[0]} 외 {len(product_names) - 1}건"
 
+            row["item_summary"] = ", ".join(item_summaries) if item_summaries else None
             row["items_count"] = len(items)
             flattened.append(row)
 
@@ -684,7 +713,11 @@ def _deduct_seller_stock_for_order(supabase, order_id: str) -> dict:
             "error": f"재고 차감 중 오류가 발생했습니다: {str(e)}",
         }
 
-def update_order_status(order_id: str, new_status: str) -> dict:
+def update_order_status(
+    order_id: str = "",
+    new_status: str = "",
+    order_number: str = "",
+) -> dict:
     """주문의 상태를 변경한다. 유효한 상태값인지 먼저 검증한다."""
     # 허용된 주문 상태 목록 (도메인 규칙)
     VALID_STATUSES = [
@@ -707,6 +740,37 @@ def update_order_status(order_id: str, new_status: str) -> dict:
 
         supabase = get_supabase_client()
 
+        # order_id가 없거나 UUID가 아니면 order_number로 주문 UUID를 찾는다.
+        if not order_id or not _UUID_PATTERN.match(str(order_id)):
+            if not order_number:
+                return {
+                    "success": False,
+                    "llm_retry": True,
+                    "error": (
+                        "order_id가 UUID 형식이 아닙니다. "
+                        "주문번호를 알고 있다면 order_number에 넣어 다시 호출하세요. "
+                        "주문번호도 모르면 get_orders로 주문을 먼저 조회하세요."
+                    ),
+                }
+
+            lookup = (
+                supabase.table("orders")
+                .select("id, order_number")
+                .eq("order_number", order_number)
+                .is_("deleted_at", None)
+                .limit(1)
+                .execute()
+            )
+
+            if not lookup.data:
+                return {
+                    "success": False,
+                    "llm_retry": True,
+                    "error": f"주문번호 '{order_number}'에 해당하는 주문을 찾을 수 없습니다.",
+                }
+
+            order_id = lookup.data[0]["id"]
+
         # 1. 주문 존재 여부와 현재 상태 확인
         order_check = (
             supabase.table("orders")
@@ -724,6 +788,16 @@ def update_order_status(order_id: str, new_status: str) -> dict:
 
         current_status = order_check.data[0].get("status")
 
+        if current_status == new_status:
+            return {
+                "success": True,
+                "already_same_status": True,
+                "order_id": order_id,
+                "previous_status": current_status,
+                "new_status": new_status,
+                "message": f"이미 {new_status} 상태인 주문입니다. 다른 주문을 대상으로 한 요청인지 확인이 필요합니다.",
+            }
+        
         # 2. 주문 확정 상태로 변경되는 순간 판매자 재고 차감
         #    이미 CONFIRMED였던 주문을 다시 CONFIRMED로 바꾸는 경우는 헬퍼 함수에서 중복 차감 방지
         inventory_result = None
@@ -1280,32 +1354,91 @@ def get_chat_rooms(user_id: str) -> dict:
         result = (
             supabase.table("chat_rooms")
             .select(
-                "id, last_message, created_at, "
+                "id, order_id, last_message, created_at, last_message_at, "
                 "buyer:users!buyer_id(name, company_name), "
-                "seller:users!seller_id(name, company_name)"
+                "seller:users!seller_id(name, company_name), "
+                "orders("
+                "id, order_number, status, total_amount, created_at, "
+                "order_items(quantity, unit_price, products(name, unit))"
+                ")"
             )
             .or_(f"buyer_id.eq.{user_id},seller_id.eq.{user_id}")
-            .order("created_at", desc=True)
+            .order("last_message_at", desc=True)
             .execute()
         )
         
         rooms = result.data or []
         flattened = []
-        
+
         for r in rooms:
             buyer = r.get("buyer") or {}
             seller = r.get("seller") or {}
-            
+            order = r.get("orders") or {}
+
+            items = order.get("order_items") if isinstance(order, dict) else []
+            items = items or []
+
+            product_names: list[str] = []
+            item_summaries: list[str] = []
+
+            primary_product_name = None
+            primary_quantity = None
+            primary_unit_price = None
+
+            for idx, item in enumerate(items):
+                product = item.get("products") if isinstance(item, dict) else None
+                product = product or {}
+
+                name = product.get("name")
+                unit = product.get("unit") or "kg"
+                quantity = item.get("quantity")
+                unit_price = item.get("unit_price")
+
+                if name:
+                    product_names.append(name)
+
+                if name and quantity is not None and unit_price is not None:
+                    item_summaries.append(f"{name} {quantity}{unit} x {unit_price:,}원")
+                elif name and quantity is not None:
+                    item_summaries.append(f"{name} {quantity}{unit}")
+                elif name:
+                    item_summaries.append(name)
+
+                if idx == 0:
+                    primary_product_name = name
+                    primary_quantity = quantity
+                    primary_unit_price = unit_price
+
+            if not product_names:
+                product_summary = None
+            elif len(product_names) == 1:
+                product_summary = product_names[0]
+            else:
+                product_summary = f"{product_names[0]} 외 {len(product_names) - 1}건"
+
             flattened.append({
                 "room_id": r["id"],
+                "order_id": r.get("order_id"),
                 "last_message": r.get("last_message"),
-                "created_at": r["created_at"],
+                "created_at": r.get("created_at"),
+                "last_message_at": r.get("last_message_at"),
+
                 "buyer_name": buyer.get("name"),
                 "buyer_company": buyer.get("company_name"),
                 "seller_name": seller.get("name"),
                 "seller_company": seller.get("company_name"),
-            })
 
+                "order_number": order.get("order_number") if isinstance(order, dict) else None,
+                "order_status": order.get("status") if isinstance(order, dict) else None,
+                "order_total_amount": order.get("total_amount") if isinstance(order, dict) else None,
+
+                "product_summary": product_summary,
+                "primary_product_name": primary_product_name,
+                "primary_quantity": primary_quantity,
+                "primary_unit_price": primary_unit_price,
+                "item_summary": ", ".join(item_summaries) if item_summaries else None,
+            })
+            
         return {
             "success": True,
             "rooms": flattened,

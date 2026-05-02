@@ -578,6 +578,38 @@ export interface Message {
 `switch (type)` 으로 단일 컴포넌트에서 분기. 본인/상대 판별은 **`sender_id === user.id` 우선**
 (metadata.from_role 만으로는 같은 역할 두 사용자 구분 불가).
 
+#### MessageBubble currentUserId prop 패턴 (검증됨)
+
+`useAuthStore` 는 Zustand persist 사용으로 첫 렌더 시점에 user 가 null 일 수 있다.
+이 상태에서 `isMine` 이 false 로 고정되면 본인 메시지가 모두 왼쪽에 표시되는 버그가 발생한다
+(새로고침하면 정상 — persist 하이드레이션 완료 후이므로).
+
+해결: 부모 페이지에서 `user?.id` 를 `currentUserId` prop 으로 직접 내려준다.
+MessageBubble 내부에서는 `currentUserId ?? user?.id` 로 우선순위 처리.
+
+```tsx
+// MessageBubble props
+interface MessageBubbleProps {
+  message: Message;
+  currentUserId?: string;
+}
+
+export default function MessageBubble({ message, currentUserId }: MessageBubbleProps) {
+  const { user } = useAuthStore();
+  const effectiveUserId = currentUserId ?? user?.id;
+  const isMine = !!effectiveUserId && message.sender_id === effectiveUserId;
+  // ...
+}
+
+// seller/chat/page.tsx, buyer/chat/page.tsx — 호출부
+<MessageBubble key={msg.id} message={msg} currentUserId={user?.id} />
+// 시스템 메시지 변환 분기에도 동일하게 prop 전달
+<MessageBubble key={msg.id} message={{ ...msg, message_type: 'SYSTEM' }} currentUserId={user?.id} />
+```
+
+부모 컴포넌트는 `useAuthStore` 호출 후 React Query 가 `user` 변경 시 자동 리렌더되므로,
+prop 으로 흘려주는 패턴이 안정적이다.
+
 | type | 렌더 |
 |---|---|
 | `TEXT` | 일반 말풍선 (mine: bg-primary-600 text-white / 상대: bg-gray-100) |
@@ -809,6 +841,41 @@ if (msgType === 'DELIVERY_DATE_CHANGE' ||
     queryClient.invalidateQueries({ queryKey: ['calendar'] });
   }
 }
+```
+
+#### ChatHeaderStatusControl — 헤더 우측 주문 상태 변경 드롭다운 (components/chat/ChatHeaderStatusControl.tsx)
+
+채팅 헤더 우측 (AI 요약 버튼 옆)에 노출되는 컴포넌트. 채팅방에 연결된 주문이 있을 때
+StatusBadge + ChevronDown 버튼으로 표시되고, 클릭 시 다음으로 전환 가능한 상태를 드롭다운으로 보여준다.
+
+전환 규칙은 `seller/orders/page.tsx` 의 `sellerNextStatusMap` 과 정합성을 유지한다:
+- **seller**: CONFIRMED → PREPARING → SHIPPING → COMPLETED (CONFIRMED 진입은 buyer 전용)
+- **buyer**: QUOTE_REQUESTED → NEGOTIATING → CONFIRMED, SHIPPING → COMPLETED
+
+```tsx
+<ChatHeaderStatusControl
+  orderId={linkedOrderId}      // selectedRoom?.order_id ?? null
+  currentStatus={linkedOrderStatus}  // useOrder(linkedOrderId).data?.data?.status
+  role="seller"  // 또는 "buyer"
+/>
+```
+
+내부 동작:
+- orderId 또는 currentStatus 가 null 이면 렌더 안 함 (주문 없는 채팅방은 깔끔)
+- 다음 상태 후보가 비면 배지만 표시 (변경 불가 상태 = COMPLETED, CANCELLED 등)
+- 외부 클릭 mousedown 으로 드롭다운 자동 닫힘 (PriceOfferPopover 와 동일 패턴)
+- `useUpdateOrderStatus` 훅 사용 — `PATCH /orders/{id}/status` body `{status}` 호출
+- 변경 성공 시 React Query 가 ['orders'], ['order', id] 자동 invalidate → 같은 페이지의 OrderContextBanner 도 함께 새로고침
+
+채팅 헤더 레이아웃 (양 페이지 공통):
+```tsx
+<div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+  <div className="flex items-center gap-2">{/* 뒤로가기 + 상대방 이름 */}</div>
+  <div className="flex items-center gap-2">
+    <ChatHeaderStatusControl orderId={...} currentStatus={...} role="..." />
+    <button>AI 요약</button>
+  </div>
+</div>
 ```
 
 #### 채팅 입력창 빠른 액션 — DeliveryDatePopover (components/chat/DeliveryDatePopover.tsx)

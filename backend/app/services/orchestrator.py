@@ -212,40 +212,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "update_calendar_event",
-            "description": "기존 캘린더 일정을 수정한다. 수정할 일정의 event_id와 변경할 내용만 전달한다. event_id를 모르면 먼저 get_calendar_events를 호출해서 찾아라.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string"},
-                    "event_id": {"type": "string", "description": "수정할 일정의 UUID"},
-                    "title": {"type": "string", "description": "변경할 제목 (선택)"},
-                    "event_date": {"type": "string", "description": "변경할 날짜 YYYY-MM-DD (선택)"},
-                    "event_type": {"type": "string", "description": "변경할 유형 (선택)"},
-                    "description": {"type": "string", "description": "변경할 설명 (선택)"},
-                },
-                "required": ["user_id", "event_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_calendar_event",
-            "description": "기존 캘린더 일정을 삭제한다. 삭제할 일정의 event_id가 필요하다. 모르면 먼저 get_calendar_events를 호출해서 찾아라.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string"},
-                    "event_id": {"type": "string", "description": "삭제할 일정의 UUID"},
-                },
-                "required": ["user_id", "event_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "delete_product",
             "description": (
                 "상품을 삭제한다(soft delete). deleted_at을 현재 시간으로 설정하며, "
@@ -278,14 +244,16 @@ TOOLS = [
             "description": (
                 "상품 정보를 수정한다. 전달된 필드만 업데이트된다. "
                 "seller_id가 일치해야만 수정 가능하다. "
-                "수정 가능 필드: name, price_per_unit, category, origin, spec, description."
+                "수정 가능 필드: name, price_per_unit, category, origin, spec, description. "
+                "중요: product_id를 몰라도 product_name에 상품명을 넣으면 agent_tools.update_product가 해당 판매자의 상품을 이름으로 찾아 수정한다. "
+                "따라서 '감자 단가 2700원으로 바꿔줘'처럼 상품명과 변경값이 있으면 확인 질문 없이 즉시 update_product를 호출하라."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "product_id": {
                         "type": "string",
-                        "description": "수정할 상품의 UUID. 모르면 빈 문자열로 전달.",
+                        "description": "수정할 상품의 UUID. 모르면 빈 문자열로 전달하고 product_name을 반드시 사용한다.",
                     },
                     "seller_id": {
                         "type": "string",
@@ -293,7 +261,7 @@ TOOLS = [
                     },
                     "product_name": {
                         "type": "string",
-                        "description": "수정할 상품명 (product_id 모를 때 사용)",
+                        "description": "수정할 상품명. product_id를 모를 때 반드시 사용한다. 예: 감자, 옥수수",
                     },
                     "name": {
                         "type": "string",
@@ -381,17 +349,33 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "update_order_status",
-            "description": "주문의 진행 상태를 변경한다. (예: 견적 요청 후 협상중으로 바꿀 때 사용)",
+            "description": (
+                "주문의 진행 상태를 변경한다. order_id UUID 또는 order_number로 주문을 찾아 변경할 수 있다. "
+                "판매자가 '출고 준비 완료', '배송 보냈어', '배송 시작했어', '납품 완료'라고 말하면 이 도구를 사용한다. "
+                "상태 매핑: 출고 준비 완료=PREPARING, 배송 보냈어/배송 시작/출하 완료=SHIPPING, 납품 완료/배송 완료=COMPLETED. "
+                "상태 변경 후 캘린더 일정은 자동 동기화된다. "
+                "주의: SHIPPING, PREPARING, COMPLETED는 calendar event_type이 아니라 orders.status 값이다."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {"type": "string", "description": "상태를 변경할 주문의 UUID"},
+                    "order_id": {
+                        "type": "string",
+                        "description": "상태를 변경할 주문의 UUID. 모르면 빈 문자열로 두고 order_number를 사용한다.",
+                    },
+                    "order_number": {
+                        "type": "string",
+                        "description": "주문 번호. 예: ORD-20260502-3617. order_id를 모를 때 사용한다.",
+                    },
                     "new_status": {
                         "type": "string",
-                        "description": "변경할 상태값 (QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING, COMPLETED, CANCELLED)"
+                        "description": (
+                            "변경할 상태값. "
+                            "QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING, COMPLETED, CANCELLED 중 하나."
+                        ),
                     },
                 },
-                "required": ["order_id", "new_status"],
+                "required": ["new_status"],
             },
         },
     },
@@ -686,8 +670,14 @@ def _build_router_system() -> str:
         "채팅방 파줘", "채팅 연결해줘", "거래처 연결해줘", "그 농원이랑 얘기하고 싶어"
   → 특정 품목을 사거나 찾거나 확인하려는 의도가 조금이라도 있으면 무조건 INVENTORY
   → "채팅", "연결", "거래처", "얘기해보고 싶어" 키워드가 있으면 GENERAL이 아닌 INVENTORY로 분류
-- ORDER: 주문, 견적, 발주, 납품 관련 요청 (주문 조회, 상태 변경, 주문 생성/삭제 등)
-  예시: "주문 넣어줘", "발주 확인해줘", "주문 취소"
+  → "단가 바꿔줘", "가격 수정해줘", "kg당 얼마로 바꿔줘", "상품명 바꿔줘", "상품 내려줘"는 주문이 아니라 상품 관리이므로 반드시 INVENTORY로 분류한다.
+  → "방금 올린 감자 단가 2700원으로 바꿔줘"는 INVENTORY다. ORDER가 아니다.
+- ORDER: 주문, 견적, 발주, 납품, 출고, 배송 상태 변경 관련 요청
+  예시: "주문 넣어줘", "발주 확인해줘", "주문 취소",
+        "출고 준비 완료됐어", "배송 보냈어", "배송 시작했어",
+        "출하 완료", "배송 중으로 바꿔줘", "주문 완료 처리해줘"
+  → 주문의 상태를 바꾸는 말이면 CALENDAR가 아니라 반드시 ORDER로 분류한다.
+  → "출고 준비", "배송 보냄", "배송 시작", "출하 완료", "납품 완료"는 일정 생성이 아니라 주문 상태 변경이다.
 - CALENDAR: 캘린더/일정 관련 요청. 두 가지 subtype 으로 세분.
   - DATA: 단순 일정 데이터 조회·생성·수정·취소·삭제. 답이 데이터 그 자체이거나 데이터를 변경하는 경우면 DATA.
     예시: "내일 일정 뭐 있어?", "이번 주 캘린더 보여줘", "5월 일정 알려줘",
@@ -715,6 +705,8 @@ def _build_router_system() -> str:
 - (수량 연계 채팅): "채팅방 열어줘", "연결해줘"라는 요청이 구매 의사(수량 언급) 직후에 나왔다면, 이는 단순 상담이 아닌 '견적 협상'입니다. 반드시 ORDER 부서로 분류하세요.
 - (판매자 탐색 캐치): "누가 팔아", "누가 파는데", "어느 업체" 등의 질문은 품목명이 생략되었더라도 거래처를 찾는 맥락이므로 반드시 INVENTORY로 분류하세요.
 - (답변 맥락 보호): "채팅방 열어줘"는 단순 대화가 아니라 앞선 "30kg" 주문의 연장선입니다. 이 경우 AI는 과거 채팅방 유무와 상관없이 반드시 새로운 견적 요청이 포함된 구매 프로세스(ORDER)를 끝까지 완수해야 합니다.
+- "오늘 들어온 80kg 옥수수건 출고 준비 완료됐고 방금 배송 보냈어"처럼 특정 주문의 진행 상태를 보고하는 문장은 CALENDAR가 아니라 ORDER다. 반드시 get_orders 또는 get_order_detail로 해당 주문을 찾고 update_order_status를 호출해야 한다.
+- "방금 올린 감자 단가 2700원으로 바꿔줘"처럼 상품 자체의 가격·단가·이름·설명·재고를 바꾸는 요청은 반드시 INVENTORY다. 주문 상태 변경이나 주문 수정으로 해석하지 마라.
 
 [CALENDAR 시점 추출 (target_year, target_month)]
 - 사용자가 시점을 명시하면 그 값 사용 (예: "5월" → 현재 연도의 5월).
@@ -930,56 +922,92 @@ AGENT_BASE_SYSTEM = """당신은 AgriFlow 농산물 B2B 유통 플랫폼의 유�
 SELLER_ROLE_APPENDIX = """
 [판매자(SELLER) 전용 가이드]
 
-- 가용 도구: 상품/재고 조회(get_products, check_stock), 상품 관리(create_product, update_product, delete_product, update_stock), 주문 관리(get_orders, get_order_detail, update_order_status, delete_order), 거래처 탐색(find_alternative_partners, open_chat_room), 프로필 조회(get_user_profile)
+- 판매자는 본인 상품/재고를 등록·수정·삭제할 수 있다.
+- 판매자는 받은 주문을 조회하고, 주문 상태를 변경할 수 있다.
+- 판매자는 구매자에게 채팅을 보내거나, 구매자를 탐색할 수 있다.
+- 판매자는 구매 주문을 생성할 수 없다.
 
-[외부 구매 의도 처리 — 중요]
-판매자가 "다른 농장에서 사고 싶다", "옆 농장 사과 발주 넣어줘", "어디서 구매할 수 있어?" 등 외부에서 상품을 구매하려는 의도를 보이면:
-- 자기 재고를 조회하지 마라. 재고 확인이 아닌 구매 요청이다.
-- "판매자 계정으로는 구매 발주를 생성할 수 없습니다. 구매자 계정으로 접속하시거나, 해당 농장에 직접 채팅으로 문의해보세요."라고 안내한다.
-- 단, 채팅방 개설은 가능하므로 원하면 open_chat_room으로 연결해줄 수 있다.
+[🚨 상품 수정 즉시 실행 규칙]
+판매자가 "감자 단가 2700원으로 바꿔줘", "옥수수 재고 200kg으로 맞춰줘", "상품명 바꿔줘"처럼 상품명과 변경값을 함께 말하면 확인 질문을 하지 말고 즉시 도구를 호출한다.
 
-[판매자 응답 팁]
-- 상품 등록 시 필수 정보(이름, 카테고리, 단가, 수량, 단위) 중 빠진 게 있다면, 에러를 뿜지 말고 "어떤 카테고리로 올릴까요?", "단가는 얼마로 할까요?"처럼 자연스럽게 되물어보세요.
-- "재고 수정(update_stock)"과 "새 상품 등록(create_product)" 상황을 눈치껏 잘 구분하세요.
-- 실무 용어: 출하, 납품, 도매가 등의 용어를 자연스럽게 사용하세요.
-- 철자 주의: 사용자가 말한 상품명 철자(예: '새우', '풋사과')는 검색 도구에 입력할 때 절대 임의로 바꾸지 마세요.
+실행 규칙:
+- 단가/가격 변경 → update_product
+- 재고 수량 변경 → update_stock
+- 상품명/카테고리/설명/산지/규격 변경 → update_product
+- 상품 삭제/내리기 → delete_product
+
+product_id를 모르면 빈 문자열로 두고 product_name에 상품명을 넣어라.
+"상품 ID가 필요합니다"라고 답하지 마라.
+이미 "바꿔줘"라고 했으면 다시 확인 질문하지 마라.
+
+[🚨 주문 특정 규칙]
+판매자가 "방금 들어온 옥수수 40kg 주문 확정해줘"처럼 상품명과 수량을 함께 말하면 get_orders 결과에서 다음 조건을 동시에 만족하는 주문을 찾아라.
+
+우선순위:
+1. product_summary 또는 primary_product_name이 상품명과 일치
+2. primary_quantity가 수량과 일치
+3. "확정해줘" 요청이면 이미 CONFIRMED, SHIPPING, COMPLETED인 주문은 제외
+4. QUOTE_REQUESTED 또는 NEGOTIATING 상태를 우선 선택
+5. "방금 들어온"이면 created_at이 가장 최근인 주문 우선
+
+후보가 여러 개면 주문번호를 물어본다.
+
+[🚨 주문 확정 실행 규칙]
+판매자가 "주문 확정해줘", "확정 처리해줘", "수락해줘"라고 말하면 반드시 update_order_status를 호출한다.
+
+실행 순서:
+1. get_orders(user_id=현재 판매자 ID, role="SELLER")로 주문 후보 조회
+2. 상품명, 수량, 금액, 상태로 정확한 주문 선택
+3. 이미 CONFIRMED, SHIPPING, COMPLETED인 주문은 확정 후보에서 제외
+4. 선택한 주문에 대해 update_order_status(order_id=주문 UUID, new_status="CONFIRMED") 호출
+5. update_order_status 결과가 success=True일 때만 "확정했습니다"라고 답한다.
+
+get_orders, get_order_detail, check_stock만 호출하고 "확정했습니다"라고 답하지 마라.
+
+[🚨 배송/출고 상태 변경 규칙]
+판매자가 "출고 준비 완료", "배송 보냈어", "배송 시작했어", "출하 완료", "납품 완료"라고 말하면 캘린더 일정만 수정하지 말고 반드시 주문 상태 변경으로 처리한다.
+
+상태 매핑:
+- 출고 준비 완료, 준비 완료, 포장 완료 → PREPARING
+- 배송 보냈어, 배송 시작, 출하 완료, 배송 중 → SHIPPING
+- 납품 완료, 배송 완료, 거래 완료 → COMPLETED
+
+실행 순서:
+1. get_orders(user_id=현재 판매자 ID, role="SELLER")로 최근 주문 조회
+2. 상품명, 수량, 오늘 들어온 주문, 최근 주문 맥락으로 주문 특정
+3. 주문이 하나로 특정되면 update_order_status 호출
+4. 여러 개면 주문번호 확인 요청
+5. update_order_status 성공 후 캘린더는 자동 동기화되므로 create_calendar_event만 호출하고 끝내지 않는다.
 """
 
 BUYER_ROLE_APPENDIX = """
 [구매자(BUYER) 전용 가이드]
-- 너는 AgriFlow 플랫폼의 데이터 무결성을 보장하는 지능형 오퍼레이터입니다.
+- 구매자는 상품을 검색하고, 판매자를 찾고, 견적/주문을 생성하고, 주문 건 채팅방을 열 수 있다.
+- 구매자는 상품 등록/수정/삭제, 판매자 재고 수정, 출고/배송 처리 권한이 없다.
 
-[🚨 핑계 금지 및 강제 실행 규칙 (CRITICAL)]
-- **"상품이 없다", "판매자가 없다"는 답변 절대 금지**: 직전 대화에서 상품(예: 옥수수)과 업체명(예: test3)이 언급되었다면 시스템에 반드시 존재하는 것입니다.
-- **모르면 찾아라**: UUID를 모르거나 정보가 부족하다고 느껴진다면, "없다"고 말하지 말고 즉시 `get_user_profile(company_name="업체명")`을 호출하여 정보를 갱신하세요. 
-- **22P02 에러 방지**: ID 칸에 "test3" 같은 이름을 넣지 마세요. 무조건 UUID(`8-4-4-4-12` 형식)를 확보한 뒤 도구를 실행하세요.
+[🚨 구매자 주문/견적 생성 규칙]
+사용자가 "주문해줘", "발주 넣어줘", "견적 요청해줘"라고 명확히 말하면 create_order를 실행한다.
+단, 사용자가 수량만 말한 경우에는 바로 주문하지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인한다.
 
-[🚨 주문 생성 후 채팅방 연결 규칙 — 매우 중요]
-
-사용자가 "주문해줘", "발주 넣어줘", "견적 요청해줘"라고 해서 create_order를 실행한 직후,
-이후 사용자가 "채팅방 열어줘", "판매자랑 얘기할래", "채팅 연결해줘"라고 말하면
-절대 일반 채팅방을 열면 안 된다.
-
-반드시 직전 create_order tool 결과에서 생성된 주문 ID를 찾아서 open_chat_room의 order_id에 넣어라.
+[🚨 주문 생성 후 채팅방 연결 규칙]
+create_order 실행 직후 사용자가 "채팅방 열어줘", "판매자랑 얘기할래", "채팅 연결해줘"라고 말하면 일반 채팅방을 열지 말고, 직전 create_order 결과의 order_id를 open_chat_room에 반드시 전달한다.
 
 실행 순서:
 1. create_order 실행
-2. create_order 결과의 최상위 필드 order_id를 저장한다.
-3. 사용자가 이어서 "채팅방 열어줘"라고 하면 open_chat_room을 호출한다.
-4. 이때 반드시:
-   - partner_user_id = 직전 create_order 결과의 최상위 seller_id
-   - order_id = 직전 create_order 결과의 최상위 order_id
-   를 함께 전달한다.
-5. open_chat_room 이후 send_chat_message로 첫 견적/주문 메시지를 보낸다.
-6. 이 시점에서는 주문 상태를 NEGOTIATING으로 바꾸지 않는다. 판매자가 해당 채팅방에 답변하면 그때 NEGOTIATING으로 변경한다.
-금지:
-- order_id 없이 open_chat_room 호출 금지
-- 같은 판매자와의 기존 일반 채팅방 재사용 금지
-- "채팅방 열어줘"를 단순 일반 채팅으로 해석 금지
+2. create_order 결과의 최상위 order_id, seller_id를 저장한다.
+3. open_chat_room 호출 시:
+   - partner_user_id = 직전 create_order 결과의 seller_id
+   - order_id = 직전 create_order 결과의 order_id
+4. 이후 send_chat_message로 첫 견적/주문 메시지를 보낸다.
+5. 이 시점에서는 주문 상태를 NEGOTIATING으로 바꾸지 않는다. 판매자가 답변하면 그때 NEGOTIATING으로 변경한다.
 
-[🗣️ 성공 시 응답 대본]
-- 옥수수 30kg 견적 요청을 생성했고, test3님과 해당 주문에 연결된 채팅방까지 열어두었습니다. 첫 메시지도 남겨두었으니 채팅방에서 이어서 협의하시면 됩니다.
+금지:
+- order_id 없이 주문/견적 채팅방 열기 금지
+- 기존 일반 채팅방 재사용 금지
+- "채팅방 열어줘"를 단순 일반 채팅으로 해석 금지
 """
+
+
 
 # 합성 — BASE + ROLE_APPENDIX + FEW_SHOT_EXAMPLES
 # {role_label}, {case*_action}, {auth_product_rule}, {ambiguity_modify_rule} 는
@@ -1365,6 +1393,11 @@ async def inventory_order_node(state: AgentState) -> dict:
 
                     # tool 실행
                     result_content = _execute_tool(tool_name, tool_input)
+                    
+                    print(f"\n🕵️‍♂️ [ORDER/INVENTORY TOOL]")
+                    print(f"🛠️ tool_name = {tool_name}")
+                    print(f"📥 tool_input = {tool_input}")
+                    print(f"📤 result = {result_content[:1000]}\n")
 
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
@@ -1712,6 +1745,16 @@ async def chat_node(state: AgentState) -> dict:
         "[오전 04:25] test : 안녕하세요\n"
         "[오전 04:51] test2 : 반갑습니다\n"
         "현재 배송 중인 상태입니다."
+                "\n"
+        "[채팅방 선택 규칙 - 매우 중요]\n"
+        "- 사용자가 특정 상대방 이름과 메시지를 함께 말하면 먼저 get_chat_rooms로 채팅방 목록을 확인하세요.\n"
+        "- 같은 상대방과 여러 채팅방이 있으면 일반방(order_id 없음)보다 주문 연결방(order_id 있음)을 우선 고려하세요.\n"
+        "- 사용자가 '옥수수', '40kg', '80kg', '방금 주문', '배송 완료', '주문 건'처럼 주문 맥락을 말하면 "
+        "get_chat_rooms 결과의 order_number, order_status, product_summary, primary_quantity, item_summary를 기준으로 가장 맞는 주문 채팅방을 선택하세요.\n"
+        "- 예: 'test4한테 방금 옥수수 배송 완료됐다고 보내줘'는 test4와의 아무 일반방이 아니라, "
+        "옥수수 주문이 연결된 가장 최근 주문 채팅방에 보내야 합니다.\n"
+        "- 적절한 주문 채팅방을 확정할 수 없으면 메시지를 보내지 말고, 어떤 주문번호 채팅방에 보낼지 물어보세요.\n"
+        "- order_id가 null인 일반 채팅방은 사용자가 주문/상품/배송 맥락을 말하지 않았을 때만 선택하세요.\n"
     )
 
     agent_messages = [
@@ -1765,7 +1808,7 @@ async def chat_node(state: AgentState) -> dict:
         
         return {
             "tools_used": tools_used,
-            "final_response": final_text
+            "final_response": "요청하신 메시지를 해당 채팅방에 전송했습니다."
         }
     
     return {"final_response": "채팅 처리를 마무리하지 못했습니다. 다시 시도해 주세요!"}
@@ -1804,6 +1847,36 @@ async def response_node(state: AgentState) -> dict:
     tool 결과들을 바탕으로 LLM에게 최종 답변을 생성하도록 요청한다.
     이미 final_response가 있으면 (GENERAL intent 또는 inventory_order_node 직접 답변) 그대로 반환한다.
     """
+    original_message = state.get("message", "")
+    tools_used = state.get("tools_used", [])
+    intent = state.get("intent", "")
+
+    status_change_keywords = [
+        "확정", "주문확정", "수락",
+        "출고", "배송 보냈", "배송 시작",
+        "배송중", "배송 중",
+        "납품 완료", "배송 완료 처리", "완료 처리"
+    ]
+
+    message_send_patterns = [
+        "보내줘", "전송해줘", "답장해줘", "말해줘", "알려줘"
+    ]
+
+    # CHAT 요청에서는 상태 변경 방어 로직을 적용하지 않는다.
+    # 예: "test4한테 배송 완료됐다고 보내줘"는 상태 변경이 아니라 메시지 전송이다.
+    if intent != "CHAT":
+        is_status_change_request = any(k in original_message for k in status_change_keywords)
+        is_message_send_request = any(p in original_message for p in message_send_patterns)
+
+        if is_status_change_request and not is_message_send_request:
+            if "update_order_status" not in tools_used:
+                return {
+                    "final_response": (
+                        "주문 상태 변경 요청으로 이해했지만, 실제 상태 변경 도구가 실행되지 않았습니다. "
+                        "주문번호를 확인해서 다시 처리해 주세요."
+                    )
+                }
+            
     # orchestrator_node 또는 inventory_order_node에서 이미 답변이 생성된 경우
     if state.get("final_response"):
         return {}
