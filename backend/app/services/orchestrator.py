@@ -381,25 +381,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "update_order_status",
-            "description": (
-                "주문의 상태를 변경한다. "
-                "예: 견적 수락 시 QUOTE_REQUESTED → NEGOTIATING, "
-                "출하 시작 시 PREPARING → SHIPPING."
-            ),
+            "description": "주문의 진행 상태를 변경한다. (예: 견적 요청 후 협상중으로 바꿀 때 사용)",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {
-                        "type": "string",
-                        "description": "상태를 변경할 주문의 UUID",
-                    },
+                    "order_id": {"type": "string", "description": "상태를 변경할 주문의 UUID"},
                     "new_status": {
                         "type": "string",
-                        "description": (
-                            "변경할 상태값: "
-                            "QUOTE_REQUESTED / NEGOTIATING / CONFIRMED / "
-                            "PREPARING / SHIPPING / COMPLETED / CANCELLED"
-                        ),
+                        "description": "변경할 상태값 (QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING, COMPLETED, CANCELLED)"
                     },
                 },
                 "required": ["order_id", "new_status"],
@@ -409,12 +398,32 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "update_order",
+            "description": "기존 주문의 수량·단가·납품일·메모를 수정한다. order_id 또는 order_number로 주문을 찾아 수정한다. subtotal과 total_amount는 자동 재계산된다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {"type": "string", "description": "수정할 주문의 UUID (없으면 order_number 사용)"},
+                    "buyer_id": {"type": "string", "description": "구매자 UUID (권한 검증용)"},
+                    "order_number": {"type": "string", "description": "주문 번호 (예: ORD-20260502-8640). order_id 모를 때 사용"},
+                    "new_quantity": {"type": "integer", "description": "변경할 수량"},
+                    "new_unit_price": {"type": "integer", "description": "변경할 단가 (원)"},
+                    "delivery_date": {"type": "string", "description": "변경할 납품일 (YYYY-MM-DD)"},
+                    "notes": {"type": "string", "description": "변경할 메모/요청사항"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_order",
             "description": (
                 "새 주문을 생성한다. "
-                "buyer_id, seller_id, 상품 ID, 수량, 단가는 필수. "
-                "주문 상태는 QUOTE_REQUESTED로 시작된다. "
-                "order_items에도 자동으로 항목이 등록된다."
+                "[절대 주의] 사용자가 단순히 수량(예: 30kg)만 말했을 때는 절대 이 도구를 호출하지 마시오! "
+                "수량만 입력된 경우 호출을 멈추고, 반드시 사용자에게 '판매자와 채팅방을 열어 조율할지, 아니면 바로 견적/주문을 넣을지' 물어봐야 한다. "
+                "사용자가 명확하게 '바로 주문해', '그냥 넣어'라고 선택했을 때만 이 도구를 실행하라."
             ),
             "parameters": {
                 "type": "object",
@@ -428,8 +437,8 @@ TOOLS = [
                         "description": "판매자의 UUID",
                     },
                     "product_id": {
-                        "type": "string",
-                        "description": "주문할 상품의 UUID",
+                        "type": "string", 
+                        "description": "주문할 상품의 UUID. 정확한 UUID를 모른다면 '감자', '사과' 처럼 한글 상품명을 직접 입력해도 됩니다."
                     },
                     "quantity": {
                         "type": "string",
@@ -546,6 +555,10 @@ TOOLS = [
                         "type": "string",
                         "description": "채팅 상대방의 UUID",
                     },
+                    "order_id": {
+                        "type": "string",
+                        "description": "이 채팅방과 연결할 주문 UUID. create_order 직후 호출할 때 반환된 order_id를 넣으세요. 없으면 생략.",
+                    },
                 },
                 "required": ["user_id", "partner_user_id"],
             },
@@ -615,6 +628,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_chat_message",
+            "description": "채팅방에 메시지를 보낸다. 견적 요청 후 첫 인사를 남길 때 사용한다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "room_id": {"type": "string", "description": "채팅방 UUID"},
+                    "sender_id": {"type": "string", "description": "보내는 사람 UUID (현재 사용자)"},
+                    "content": {"type": "string", "description": "메시지 내용"}
+                },
+                "required": ["room_id", "sender_id", "content"],
+            },
+        },
+    },
 ]
 
 
@@ -665,18 +694,24 @@ def _build_router_system() -> str:
   - REASON: 일정 추천·우선순위 정리·계획 수립처럼 LLM 의 판단/추론이 필요한 경우.
     예시: "다음 달 출하 일정 추천해줘", "이번 주 우선순위 정리해줘",
           "거래처별 배송 일정 짜줘", "최적 출하일 알려줘"
-- GENERAL: 인사, 날씨, 농산물 시세 일반 질문 등 위 세 가지와 완전히 무관한 경우만
+- GENERAL: 인사, 날씨 등 위 세 가지와 완전히 무관한 경우만
   예시: "안녕", "오늘 날씨", "AgriFlow가 뭐야"
   → 품목명이 하나라도 언급되면 GENERAL이 아닌 INVENTORY로 분류할 것
+  → "키로당 얼마야", "가격 얼마야", "얼마에 팔아", "단가가 뭐야" 같은 가격 질문은 INVENTORY로 분류 (DB 조회 필요)
 - CHAT: 채팅방 조회, 대화 내용 확인, 그리고 **상대방에게 메시지를 보내거나 답장하는** 모든 요청.[cite: 2]
   예시: "내 채팅방 목록 보여줘", "진행 중인 대화 있어?", "배추 채팅방 대화 보여줘", 
         "test2한테 '안녕하세요'라고 보내줘", "답장 보내줘", "메시지 전송해줘"[cite: 2]
   → 중요: "~라고 보내줘", "~라고 전송해줘", "~라고 답장해줘" 같은 문장 패턴이 나오면 품목 언급 여부와 상관없이 무조건 CHAT으로 분류하세요.[cite: 2]
 
 [모호성 해결]
-- (최우선 규칙) "일정", "캘린더", "스케줄", "달력" 이라는 단어가 문장에 하나라도 포함되어 있으면, 주저하지 말고 무조건 CALENDAR 로 분류하세요.
+- (최우선 절대 규칙) 문장 내에 오타가 있더라도 "일정", "캘린더", "스케줄", "달력" 이라는 단어(또는 비슷한 발음/철자)가 존재하면 무조건 CALENDAR 로 분류하세요.
+- (삭제/변경 의도 캐치) "삭제", "지워", "취소", "바꿔" 등의 단어(또는 그와 유사한 오타, 예: "삭젷줘")가 포함되어 있고 캘린더 관련 맥락이라면 반드시 CALENDAR(DATA) 로 분류하세요.
 - 품목명이 포함되어 있어도 일정을 묻는다면 INVENTORY가 아니라 CALENDAR 가 우선입니다. (예: "배추 5월 일정 알려줘", "사과 언제 배송돼?" -> CALENDAR)
 - 위 일정 관련 키워드 없이 품목명만 언급되거나(예: "사과 보여줘"), 품목과 관련된 '채팅/연결' 요청일 경우에만 INVENTORY 로 분류하세요.
+- (질의응답 맥락 보호): AI가 "채팅방을 열까요, 주문을 넣을까요?"라고 물었을 때 사용자가 하는 답변(예: "채팅할래", "열어줘", "주문해")은 문장에 수량이나 품목명이 없더라도 무조건 ORDER 부서로 보내야 합니다. 절대 CHAT 부서로 보내지 마세요.
+- (수량 연계 채팅): "채팅방 열어줘", "연결해줘"라는 요청이 구매 의사(수량 언급) 직후에 나왔다면, 이는 단순 상담이 아닌 '견적 협상'입니다. 반드시 ORDER 부서로 분류하세요.
+- (판매자 탐색 캐치): "누가 팔아", "누가 파는데", "어느 업체" 등의 질문은 품목명이 생략되었더라도 거래처를 찾는 맥락이므로 반드시 INVENTORY로 분류하세요.
+- (답변 맥락 보호): "채팅방 열어줘"는 단순 대화가 아니라 앞선 "30kg" 주문의 연장선입니다. 이 경우 AI는 과거 채팅방 유무와 상관없이 반드시 새로운 견적 요청이 포함된 구매 프로세스(ORDER)를 끝까지 완수해야 합니다.
 
 [CALENDAR 시점 추출 (target_year, target_month)]
 - 사용자가 시점을 명시하면 그 값 사용 (예: "5월" → 현재 연도의 5월).
@@ -909,27 +944,25 @@ SELLER_ROLE_APPENDIX = """
 
 BUYER_ROLE_APPENDIX = """
 [구매자(BUYER) 전용 가이드]
-- 너는 실무 데이터로 거래를 성사시키는 유능한 오퍼레이터입니다.
-- 너는 채팅방 개설 및 주문 생성을 직접 수행할 모든 권한과 도구를 가지고 있습니다.
+- 너는 AgriFlow 플랫폼의 데이터 무결성을 보장하는 지능형 오퍼레이터입니다.
 
-[⚠️ 주문 생성(create_order) 엄격 규칙 - 위반 시 에러 발생]
-1. **ID 사용 의무**: `product_id` 파라미터에 절대 "배추", "무" 같은 한글 이름을 넣지 마세요. 시스템이 터집니다.
-2. **연쇄 호출 필수**: 만약 상품의 UUID(예: 832f...)를 모른다면, 사용자에게 묻지 말고 즉시 `check_stock`이나 `get_products`를 호출하여 실제 ID를 먼저 알아내세요.
-3. **데이터 확인**: 반드시 DB에서 조회된 진짜 ID를 사용해서 주문을 생성해야 합니다.
+[🚨 핑계 금지 및 강제 실행 규칙 (CRITICAL)]
+- **"상품이 없다", "판매자가 없다"는 답변 절대 금지**: 직전 대화에서 상품(예: 옥수수)과 업체명(예: test3)이 언급되었다면 시스템에 반드시 존재하는 것입니다.
+- **모르면 찾아라**: UUID를 모르거나 정보가 부족하다고 느껴진다면, "없다"고 말하지 말고 즉시 `get_user_profile(company_name="업체명")`을 호출하여 정보를 갱신하세요. 
+- **22P02 에러 방지**: ID 칸에 "test3" 같은 이름을 넣지 마세요. 무조건 UUID(`8-4-4-4-12` 형식)를 확보한 뒤 도구를 실행하세요.
 
-[💬 채팅방 연결 및 프로필 조회 지침]
-1. 사용자가 "연결해줘", "채팅방 파줘"라고 하면 "할 수 없다"는 거짓말은 절대 금지입니다.
-2. 무조건 다음 순서로 행동하세요:
-   - 1단계: `get_user_profile(company_name="업체명")`을 호출해 상대방의 `user_id`를 알아낸다.
-   - 2단계: 알아낸 ID를 `partner_user_id`에 넣어 `open_chat_room`을 호출한다.
-3. 실행 전 허락을 구하지 말고, 도구를 먼저 실행한 뒤 결과를 보고하세요.
+[🚨 주문-협상-채팅 '풀코스' 실행 로직]
+사용자가 "채팅방 열어줘" 또는 "해줘"라고 하면, 너는 **기존 기억을 의심하고** 아래 콤보를 단 하나의 메시지 안에서 연달아(Multi-tool call) 호출해야 합니다.
 
-[💡 응답 스타일]
-- 공급처 추천: 단순히 나열하지 말고, 조건이 가장 좋은 곳(예: 최저가)을 선별해서 제안하세요.
-- 실무 용어: 발주, 수급, 단가 비교, 납기 등의 용어를 적절히 사용하세요.
-- 철자 유지: 사용자가 입력한 상품명 철자는 검색 시 그대로 유지하세요.
+1. **ID 확보**: `get_user_profile(company_name="직전 언급된 업체명")`을 호출해 진짜 UUID를 가져온다.
+2. **주문 생성**: 확보한 UUID와 상품명(옥수수), 수량(30kg)으로 `create_order`를 실행한다.
+3. **상태 변경**: 생성된 주문 ID의 상태를 즉시 'NEGOTIATING'으로 변경한다.
+4. **방 개설**: 확보한 판매자 UUID로 `open_chat_room`을 실행한다. 이때 2단계에서 반환된 order_id를 반드시 `order_id` 파라미터로 전달한다.
+5. **메시지 전송**: 생성된 방에 "{상품} {수량} 견적 요청드립니다."라고 첫 메시지를 보낸다.
+
+[🗣️ 성공 시 응답 대본]
+- "옥수수 30kg 견적 생성부터 협상중 상태 변경, 그리고 test3님과의 채팅방 연결까지 완벽하게 처리했습니다! 첫 인사 메시지도 남겨두었으니 채팅방을 확인해 보세요."
 """
-
 
 # 합성 — BASE + ROLE_APPENDIX + FEW_SHOT_EXAMPLES
 # {role_label}, {case*_action}, {auth_product_rule}, {ambiguity_modify_rule} 는
@@ -947,7 +980,7 @@ _SELLER_ROLE_VARS = {
 _BUYER_ROLE_VARS = {
     "role_label": "구매자 (마트/식자재업체/식당)",
     "case1_action": "check_stock 또는 find_sellers_by_product로 재고 수량·단위 안내",
-    "case2_action": "이분법 거절 금지, 분할납품·대체상품·대체거래처 중 적합한 타협안 제시",
+    "case2_action": "⚠️구매자 모드에서는 '재고 부족'이 문제 상황이 아님. 재고량과 무관하게 구매자가 부르는 수량을 100% 무조건 수용할 것. 타협안(예: 남은 재고만 살래?) 제시 절대 금지.",
     "case10_action": "구매자는 상품 등록/삭제 권한 없음, 안내 후 거절",
     "case11_action": "구매자 역할에 해당 없음, 판매자 기능임을 안내",
     "auth_product_rule": "구매자는 상품 수정 권한 없음, 요청 시 즉시 거절",
@@ -1070,7 +1103,11 @@ def _fix_id_params(tool_name: str, tool_input: dict[str, Any], user_id: str) -> 
     if func is None:
         return tool_input
     params = set(_inspect.signature(func).parameters.keys())
-    
+
+    # send_chat_message의 sender_id는 항상 현재 user_id로 강제 (LLM이 seller UUID를 잘못 넣는 버그 방지)
+    if tool_name == "send_chat_message" and "sender_id" in params:
+        tool_input["sender_id"] = user_id
+
     # 1. 사람 관련 ID는 user_id로 교정 가능
     for id_field in ("seller_id", "user_id", "buyer_id", "sender_id"):
         if id_field in params:
@@ -1189,7 +1226,7 @@ async def inventory_order_node(state: AgentState) -> dict:
     - 최대 MAX_TOOL_ROUNDS(3)회 루프로 추가 tool 호출 처리
     - 완료 후 tool_results에 결과 저장, response_node로 이동
     """
-    MAX_TOOL_ROUNDS = 3
+    MAX_TOOL_ROUNDS = 5
 
     client = get_openai_client()
     model = "gpt-4o-mini"
@@ -1387,6 +1424,10 @@ async def calendar_data_node(state: AgentState) -> dict:
         "[원칙]\n"
         "- 일정 조회는 get_calendar_events(user_id, year, month) 호출.\n"
         "- 일정 등록은 create_calendar_event 호출 전 같은 날짜 중복을 get_calendar_events 로 확인.\n"
+        "- 일정 변경/수정은 update_calendar_event 호출 (수정할 event_id를 모르면 먼저 조회할 것).\n"
+        "- 일정 취소/삭제는 delete_calendar_event 호출 (삭제할 event_id를 모르면 먼저 조회할 것).\n"
+        "- (중요) 사용자가 특정 주문의 일정을 추가/수정해달라고 하면, 반드시 get_calendar_events로 해당 주문과 관련된 기존 일정이 있는지 먼저 확인하세요. 만약 일정이 이미 존재한다면 새로 만들지 말고 update_calendar_event를 사용해 기존 일정의 날짜나 내용을 수정해야 합니다.\n"
+        "- 단, '배송 일정을 3일에서 7일로 미뤄줘'처럼 기존에 등록된 '동일한 성격'의 일정을 바꾸는 경우에만 update_calendar_event를 사용하세요.\n"
         "- 일정 변경/수정은 update_calendar_event 호출 (수정할 event_id를 모르면 먼저 조회할 것).\n"
         "- 일정 취소/삭제는 delete_calendar_event 호출 (삭제할 event_id를 모르면 먼저 조회할 것).\n"
         "- (중요) 사용자가 특정 일정을 '삭제'해달라고 하면, get_calendar_events 로 조회한 뒤 해당 일정의 'id'를 찾아 즉시 delete_calendar_event 를 한 번만 실행하세요. 절대 중복해서 조회만 반복하지 마세요.\n"

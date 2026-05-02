@@ -9,6 +9,7 @@ import MessageBubble from '@/components/chat/MessageBubble';
 import OrderContextBanner from '@/components/chat/OrderContextBanner';
 import PriceOfferPopover from '@/components/chat/PriceOfferPopover';
 import DeliveryDatePopover from '@/components/chat/DeliveryDatePopover';
+import ChatHeaderStatusControl from '@/components/chat/ChatHeaderStatusControl';
 import {
   useChatRooms,
   useMessagesWithWebSocket,
@@ -225,15 +226,23 @@ export default function SellerChatPage() {
                     )}
                   </div>
                 </div>
-                <button
-                  onClick={handleSummarize}
-                  disabled={summarize.isPending || messages.length === 0}
-                  className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
-                >
-                  <Sparkles className="h-3.5 w-3.5 text-purple-500" />
-                  <span className="hidden sm:inline">{summarize.isPending ? 'AI 요약 중...' : 'AI 요약'}</span>
-                  <span className="sm:hidden">요약</span>
-                </button>
+                <div className="flex items-center gap-2">
+                  {/* 주문 상태 배지 + 다음 상태 변경 드롭다운 — 연결된 주문이 있을 때만 표시 */}
+                  <ChatHeaderStatusControl
+                    orderId={linkedOrderId}
+                    currentStatus={linkedOrderStatus}
+                    role="seller"
+                  />
+                  <button
+                    onClick={handleSummarize}
+                    disabled={summarize.isPending || messages.length === 0}
+                    className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    <Sparkles className="h-3.5 w-3.5 text-purple-500" />
+                    <span className="hidden sm:inline">{summarize.isPending ? 'AI 요약 중...' : 'AI 요약'}</span>
+                    <span className="sm:hidden">요약</span>
+                  </button>
+                </div>
               </div>
 
               {/* 주문 컨텍스트 배너 — 채팅방에 연결된 주문이 있을 때만 표시 */}
@@ -326,10 +335,17 @@ export default function SellerChatPage() {
                       <MessageBubble
                         key={msg.id}
                         message={{ ...msg, message_type: 'SYSTEM' }}
+                        currentUserId={user?.id}
                       />
                     );
                   }
-                  return <MessageBubble key={msg.id} message={msg} />;
+                  return (
+                    <MessageBubble
+                      key={msg.id}
+                      message={msg}
+                      currentUserId={user?.id}
+                    />
+                  );
                 })}
                 <div ref={messagesEndRef} />
               </div>

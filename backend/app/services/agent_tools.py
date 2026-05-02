@@ -576,6 +576,74 @@ _UUID_PATTERN = __import__('re').compile(
 )
 
 
+def update_order(
+    order_id: str,
+    buyer_id: str,
+    new_quantity: Optional[int] = None,
+    new_unit_price: Optional[int] = None,
+    delivery_date: Optional[str] = None,
+    notes: Optional[str] = None,
+    order_number: Optional[str] = None,
+) -> dict:
+    """주문 수량/단가/납품일/메모를 수정한다.
+    order_id가 없으면 buyer_id + order_number로 검색.
+    order_items의 subtotal과 orders의 total_amount도 자동 재계산.
+    """
+    try:
+        supabase = get_supabase_client()
+
+        # order_id가 없으면 order_number로 검색
+        if not order_id or not _UUID_PATTERN.match(str(order_id)):
+            if not order_number:
+                return {"success": False, "error": "order_id 또는 order_number가 필요합니다."}
+            res = (
+                supabase.table("orders")
+                .select("id, buyer_id")
+                .eq("order_number", order_number)
+                .is_("deleted_at", None)
+                .limit(1)
+                .execute()
+            )
+            if not res.data:
+                return {"success": False, "error": f"주문 번호 '{order_number}'를 찾을 수 없습니다."}
+            order_id = res.data[0]["id"]
+            if buyer_id and res.data[0]["buyer_id"] != buyer_id:
+                return {"success": False, "error": "권한 없음: 본인 주문만 수정할 수 있습니다."}
+
+        # 주문 존재 확인
+        order_check = supabase.table("orders").select("id, buyer_id, status").eq("id", order_id).is_("deleted_at", None).execute()
+        if not order_check.data:
+            return {"success": False, "error": "주문을 찾을 수 없습니다."}
+        if buyer_id and order_check.data[0]["buyer_id"] != buyer_id:
+            return {"success": False, "error": "권한 없음: 본인 주문만 수정할 수 있습니다."}
+
+        # orders 테이블 업데이트 (납품일/메모)
+        order_update: dict = {}
+        if delivery_date is not None:
+            order_update["delivery_date"] = delivery_date
+        if notes is not None:
+            order_update["notes"] = notes
+
+        # order_items 수정 (수량/단가)
+        if new_quantity is not None or new_unit_price is not None:
+            items = supabase.table("order_items").select("id, quantity, unit_price").eq("order_id", order_id).execute()
+            if items.data:
+                item = items.data[0]
+                qty = new_quantity if new_quantity is not None else item["quantity"]
+                price = new_unit_price if new_unit_price is not None else item["unit_price"]
+                subtotal = qty * price
+                supabase.table("order_items").update({"quantity": qty, "unit_price": price, "subtotal": subtotal}).eq("id", item["id"]).execute()
+                order_update["total_amount"] = subtotal
+
+        if order_update:
+            supabase.table("orders").update(order_update).eq("id", order_id).execute()
+            _sync_calendar_events_for_order_id(order_id)
+
+        return {"success": True, "order_id": order_id, "message": "주문이 수정되었습니다."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def create_order(
     buyer_id: str,
     seller_id: str,
@@ -773,6 +841,22 @@ def find_sellers_by_product(category: str, product_name: Optional[str] = None) -
 
         products = result.data or []
 
+        # 결과가 없고 category가 ALL이 아니면 ALL로 재시도 (LLM이 잘못된 category를 추론한 경우 대비)
+        if not products and category and category.upper() != "ALL":
+            fallback_query = (
+                supabase.table("products")
+                .select("seller_id, name, price_per_unit, stock_quantity, unit, origin, spec, status, category")
+            )
+            if product_name:
+                fallback_query = fallback_query.ilike("name", f"%{product_name}%")
+            result = (
+                fallback_query
+                .gt("stock_quantity", 0)
+                .is_("deleted_at", None)
+                .execute()
+            )
+            products = result.data or []
+
         # seller_id 목록으로 users 테이블 조회
         seller_ids = list({p["seller_id"] for p in products if p.get("seller_id")})
         seller_map = {}
@@ -853,8 +937,10 @@ def find_buyers_by_product(category: str) -> dict:
 # 채팅방 도구
 # ─────────────────────────────────────────────
 
-def open_chat_room(user_id: str, partner_user_id: str) -> dict:
+def open_chat_room(user_id: str, partner_user_id: str, order_id: Optional[str] = None) -> dict:
     """두 사용자 간 채팅방을 조회하거나 생성한다.
+
+    partner_user_id가 UUID 형식이 아니면 name/company_name으로 자동 검색해 UUID로 변환한다.
 
     보안 검증:
     1) self-chat 거부 (user_id == partner_user_id)
@@ -866,6 +952,24 @@ def open_chat_room(user_id: str, partner_user_id: str) -> dict:
     rate-limit throttle 은 dead code 였으므로 제거.
     반환: {success, room_id, is_new, partner_name} 또는 {success: False, error, message?}
     """
+    # partner_user_id가 UUID가 아니면 이름/회사명으로 자동 검색
+    if not _UUID_PATTERN.match(str(partner_user_id)):
+        try:
+            _supabase = get_supabase_client()
+            _r = (
+                _supabase.table("users")
+                .select("id")
+                .or_(f"name.ilike.%{partner_user_id}%,company_name.ilike.%{partner_user_id}%")
+                .is_("deleted_at", None)
+                .limit(1)
+                .execute()
+            )
+            if not _r.data:
+                return {"success": False, "error": f"'{partner_user_id}' 사용자를 찾을 수 없습니다."}
+            partner_user_id = _r.data[0]["id"]
+        except Exception as _e:
+            return {"success": False, "error": str(_e)}
+
     # 1) self-chat 거부
     if user_id == partner_user_id:
         return {
@@ -921,9 +1025,13 @@ def open_chat_room(user_id: str, partner_user_id: str) -> dict:
             .execute()
         )
         if existing.data:
+            room_id = existing.data[0]["id"]
+            # order_id가 주어졌으면 기존 방에도 업데이트
+            if order_id:
+                supabase.table("chat_rooms").update({"order_id": order_id}).eq("id", room_id).execute()
             return {
                 "success": True,
-                "room_id": existing.data[0]["id"],
+                "room_id": room_id,
                 "is_new": False,
                 "partner_name": partner_name,
             }
@@ -932,9 +1040,12 @@ def open_chat_room(user_id: str, partner_user_id: str) -> dict:
         # 존재할 수밖에 없어 dead code 였음.
 
         # 새 채팅방 생성
+        insert_payload: dict = {"seller_id": seller_id, "buyer_id": buyer_id}
+        if order_id:
+            insert_payload["order_id"] = order_id
         created = (
             supabase.table("chat_rooms")
-            .insert({"seller_id": seller_id, "buyer_id": buyer_id})
+            .insert(insert_payload)
             .execute()
         )
         if not created.data:
@@ -1151,7 +1262,7 @@ def create_calendar_event(
     order_id가 빈 문자열이면 NULL로 저장한다.
     반환: {success, event_id, title}
     """
-    # DB CHECK 제약과 일치 (calendar_events.event_type)
+    # 1. 유효성 검사 (기존과 동일)
     VALID_EVENT_TYPES = {"SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER", "OTHER"}
     if event_type not in VALID_EVENT_TYPES:
         return {
@@ -1162,6 +1273,33 @@ def create_calendar_event(
     try:
         supabase = get_supabase_client()
 
+        # 🔥 [수정됨] order_id가 있다면 기존 일정이 있는지 확인하되, "event_type"도 같은지 확인!
+        if order_id:
+            existing = (
+                supabase.table("calendar_events")
+                .select("id")
+                .eq("order_id", order_id)
+                .eq("event_type", event_type)  
+                .eq("user_id", user_id)
+                .is_("deleted_at", None)  # 삭제되지 않은 것 중
+                .execute()
+            )
+
+            # 같은 주문의 "같은 유형"의 일정이 이미 존재한다면? 새로 만들지 말고 업데이트!
+            if existing.data:
+                existing_event_id = existing.data[0]["id"]
+                print(f"🕵️‍♂️ [System] 중복 일정 발견(ID: {existing_event_id}, 유형: {event_type}). 업데이트로 전환합니다.")
+                
+                return update_calendar_event(
+                    user_id=user_id,
+                    event_id=existing_event_id,
+                    title=title,
+                    event_date=event_date,
+                    event_type=event_type,
+                    description=description
+                )
+
+        # 2. 신규 등록 로직 (주문은 같아도 '배송', '출하' 등 유형이 다르면 이쪽으로 빠져서 새로 생성됨)
         payload: dict = {
             "user_id": user_id,
             "title": title,
@@ -1181,6 +1319,7 @@ def create_calendar_event(
             "success": True,
             "event_id": event["id"],
             "title": event.get("title", title),
+            "message": "새로운 일정이 등록되었습니다."
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1686,6 +1825,7 @@ TOOL_FUNCTION_MAP = {
     "get_orders": get_orders,
     "get_order_detail": get_order_detail,
     "update_order_status": update_order_status,
+    "update_order": update_order,
     "create_order": create_order,
     "delete_order": delete_order,
     "find_sellers_by_product": find_sellers_by_product,
