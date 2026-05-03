@@ -173,13 +173,41 @@ export function useMessagesWithWebSocket(roomId: string | null) {
       metadata: lastMessage.metadata ?? null,
     };
 
+    // 새 COUNTER_OFFER / DELIVERY_DATE_CHANGE 메시지가 도착하면 같은 order_id 의
+    // 이전 PENDING 카드를 미리 SUPERSEDED 로 낙관적 갱신 — 그래야 invalidate 의
+    // 네트워크 refetch 가 돌아오기 전에도 본인이 방금 새로 제시한 카드 위쪽의
+    // 이전 PENDING 카드에 수락/거절 버튼이 남지 않는다 (issue.md #1 새로고침 전
+    // stale 버튼 노출 버그).
+    const incomingType = incomingMessage.message_type;
+    const incomingMeta = incomingMessage.metadata;
+    const incomingOrderId = incomingMeta?.order_id;
+    const incomingStatus = incomingMeta?.status;
+    const supersedesPrevious =
+      !!incomingOrderId &&
+      incomingStatus === 'PENDING' &&
+      (incomingType === 'COUNTER_OFFER' || incomingType === 'DELIVERY_DATE_CHANGE');
+
     queryClient.setQueryData(
       ['messages', roomId],
       (old: SuccessResponse<Message[]> | undefined) => {
         if (!old) return { data: [incomingMessage] };
         const exists = old.data.some((m) => m.id === incomingMessage.id);
-        if (exists) return old;
-        return { ...old, data: [...old.data, incomingMessage] };
+        // 이전 메시지 SUPERSEDED 낙관적 마킹 — 같은 order_id + 같은 카드 종류 + PENDING 인 것만
+        const transformed = supersedesPrevious
+          ? old.data.map((m) => {
+              if (m.id === incomingMessage.id) return m;
+              if (m.message_type !== incomingType) return m;
+              const mMeta = m.metadata;
+              if (!mMeta || mMeta.order_id !== incomingOrderId) return m;
+              if (mMeta.status !== 'PENDING') return m;
+              return {
+                ...m,
+                metadata: { ...mMeta, status: 'SUPERSEDED' as const },
+              };
+            })
+          : old.data;
+        if (exists) return { ...old, data: transformed };
+        return { ...old, data: [...transformed, incomingMessage] };
       }
     );
 
@@ -201,6 +229,8 @@ export function useMessagesWithWebSocket(roomId: string | null) {
       // ACCEPTED/REJECTED/SUPERSEDED 로 동기화하므로 클라이언트가 stale 데이터를 가지고 있으면
       // 이전 카드의 수락/거절 버튼이 사라지지 않는다. WS 는 새 메시지 INSERT 만 푸시하고
       // 기존 메시지의 metadata UPDATE 는 알리지 않으므로 여기서 강제 invalidate.
+      // 위의 setQueryData 로 이미 낙관적으로 마킹됐지만, 백엔드의 정식 status 값으로
+      // 최종 동기화하기 위해 refetch 도 함께 트리거.
       queryClient.invalidateQueries({ queryKey: ['messages', roomId] });
 
       // 납품일 변경 이벤트 — delivery-date-changes 목록 + (수락 시) 캘린더 동기화

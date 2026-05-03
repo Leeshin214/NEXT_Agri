@@ -48,7 +48,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 
-app = FastAPI(title="AgriFlow API", version="1.0.0")
+app = FastAPI(title="fresh link API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1133,3 +1133,10 @@ pytest-cov==6.0.0
   - 새 service 메서드 작성 시 파라미터명에 builtin 사용 금지 (`type` → `notification_type`/`event_type`/`message_type`, `id` → `resource_id`/`user_id`, `list` → `items`, `dict` → `payload`, `format` → `output_format`).
   - 기존 코드 리뷰 시: `def fn(..., type: str, ...)` 같은 시그니처를 grep 으로 발견하면 우선 수정 대상.
   - 로그 포맷 문자열 안의 `type=%s` 는 builtin 호출이 아니므로 문제 없음 — 시그니처 파라미터만 주의.
+
+- **브랜드명 표기 정책 — `fresh link` (2026-05-03 리네이밍)**: 서비스 브랜드명은 기존 `AgriFlow` 에서 `fresh link` 로 전환됨. 백엔드에서 사용자에게 노출되는 텍스트(OpenAPI title, AI 시스템 프롬프트의 자기소개·예시·답변 템플릿)는 모두 `fresh link` 로 통일. 표기 규칙:
+  - 기본: `fresh link` (소문자 + 띄어쓰기 한 칸)
+  - 문장 시작 등 대문자가 자연스러운 곳에서만: `Fresh link`
+  - **절대 바꾸지 말 것**: 코드 식별자(변수/함수/클래스/모듈/파일명), DB 테이블·컬럼명, 마이그레이션 파일명, 환경변수 키, import 경로, 패키지명, DB 이름(`DATABASE_URL` 의 `/agriflow`), Docker 서비스명 같은 **사용자 노출되지 않는 모든 식별자**. `.env` 의 DB 이름 변경은 운영 마이그레이션 비용 큼 → 보존.
+  - **검증된 변경 위치 (5개 파일, 9개 라인)**: `app/core/config.py:34` PROJECT_NAME, `app/services/schedule_agent.py:114,135` 출하/발주 일정 추천 AI 자기소개, `app/services/orchestrator.py:657` 라우터 시스템 프롬프트, `:690` GENERAL 분류 예시 발화, `:891` AGENT_BASE_SYSTEM, `:1479,1686` 캘린더 도우미 시스템 프롬프트, `:1743` 채팅 비서 시스템 프롬프트.
+  - **검증 절차**: 변경 후 `grep -rni "agriflow" backend/` → `.env` DB 이름 1건만 남으면 정상. 그 외 잔여가 있으면 코드 식별자가 맞는지 명시적으로 판단해야 한다.

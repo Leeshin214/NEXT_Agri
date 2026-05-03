@@ -8,6 +8,7 @@ import {
   Repeat,
   Search,
   UserSearch,
+  Boxes,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -35,6 +36,7 @@ export const buyerMenus: MenuItem[] = [
   { label: '정기배송', href: '/buyer/subscriptions', icon: Repeat },
   { label: '회원 검색', href: '/buyer/members', icon: UserSearch },
   { label: '상품 탐색', href: '/buyer/browse', icon: Search },
+  { label: '내 재고', href: '/buyer/inventory', icon: Boxes },
   { label: '주문/견적 관리', href: '/buyer/orders', icon: ClipboardList },
   { label: '채팅', href: '/buyer/chat', icon: MessageCircle },
 ];

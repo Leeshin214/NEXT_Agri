@@ -507,6 +507,72 @@ const handleAlternativeClick = async (partner: AlternativePartner) => {
 
 기존에 있던 24h 5건 throttle (`rate_limited`) 은 dead code 였다 — 기존 방이 항상 `existing.data` 검색에서 잡히므로 동일 (seller, buyer) 페어가 24시간 내 5번씩 새 방을 만드는 시나리오 자체가 발생 불가. 제거함.
 
+### send_chat_message 거래처+주문 2단계 disambiguation (검증됨, 2026-05-03)
+
+AI 도우미가 "test4한테 옥수수 50kg 배송 완료라고 보내줘" 같은 발화를 받으면 어느 채팅방에 보내야 할지 모호했다 (test4 와 옥수수 40kg 주문방 + 옥수수 50kg 주문방이 동시에 있을 수 있음). `agent_tools.send_chat_message` 를 V1(legacy) / V2(신규) 두 시그니처를 모두 받는 구조로 확장:
+
+```python
+def send_chat_message(
+    room_id: str = "",          # V1: 직접 지정 시 그대로 발송
+    sender_id: str = "",        # 서버에서 _fix_id_params 가 user_id 로 강제 주입
+    content: str = "",          # legacy alias for message
+    partner_user_id: str = "",  # V2: 거래처 사용자 UUID
+    order_hint: Optional[dict] = None,  # {product_name?, quantity?, status?, recent?}
+    message: str = "",          # V2: 메시지 본문 (content 보다 우선)
+) -> dict
+```
+
+동작 흐름:
+1. `room_id` 가 유효 UUID → 즉시 발송 (V1 경로, 호환)
+2. `partner_user_id` + (선택) `order_hint` 로 후보 방 검색 (V2 경로)
+3. 후보 1개 → 즉시 발송 + `matched_room` 정보 반환
+4. 후보 ≥ 2개 → **발송 보류** + `{success: False, needs_confirmation: True, candidates: [...], message_preview}`
+5. 후보 0개 → `order_id IS NULL` 일반 채팅방 fallback. 그것도 없으면 `{success: False, error: "no_chat_room"}` (open_chat_room 으로 먼저 만들라는 안내)
+
+후보 검색 (`_resolve_chat_room_candidates`):
+- `chat_rooms` 에는 `deleted_at` 컬럼이 없다 — `deleted_at IS NULL` 필터 금지 (PostgREST `column does not exist` 에러)
+- 양방향 매칭: `or_("and(seller_id.eq.A,buyer_id.eq.B),and(seller_id.eq.B,buyer_id.eq.A)")` UUID 만 들어가므로 인용 불필요
+- orders 임베딩으로 status / order_items / products(name, unit) 조회
+- `orders.deleted_at IS NOT NULL` 또는 `status='CANCELLED'` 인 방은 주문 정보 무시 (일반방으로 격하)
+- order_hint 매칭: `product_name` ilike 부분일치, `quantity` 정확일치, `status` 정확일치(uppercase)
+- `recent=True` 시 `last_message_at DESC` 첫 1건만
+
+핵심 — `chat_node` 의 조기 종료 분기 (`if '"success": true' in result_content.lower(): return ...`) 와의 정합성:
+- 다중 매칭 시 **반드시 `success: False`** 로 반환해야 LLM 이 후보 리스트를 사용자에게 풀어 질문하도록 흐름이 이어진다. `success: True` 로 두면 chat_node 가 즉시 "메시지를 성공적으로 전송했습니다!" 로 잘못 답한다.
+
+`_fix_id_params` 정합성:
+- `partner_user_id` 는 user_id 강제 교정 루프(`("seller_id", "user_id", "buyer_id", "sender_id")`) 에 안 잡히므로 LLM 이 추론한 partner UUID 가 그대로 보존됨 (open_chat_room 과 동일 정책).
+- `room_id` 가 비유효 UUID 면 `tool_input.pop("room_id", None)` 로 제거되어 V2 경로로 자동 fallback — 새 default `room_id=""` 와 호환.
+
+도구 등록 (`orchestrator.py` `TOOLS_INVENTORY` + `TOOLS_CHAT` 두 군데):
+```json
+{
+  "name": "send_chat_message",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "partner_user_id": {"type": "string"},
+      "order_hint": {
+        "type": "object",
+        "properties": {
+          "product_name": {"type": "string"},
+          "quantity": {"type": "integer"},
+          "status": {"type": "string"},
+          "recent": {"type": "boolean"}
+        }
+      },
+      "message": {"type": "string"},
+      "room_id": {"type": "string", "description": "(legacy) ..."},
+      "sender_id": {"type": "string", "description": "(legacy) ..."},
+      "content": {"type": "string", "description": "(legacy) ..."}
+    },
+    "required": ["message"]
+  }
+}
+```
+
+`required` 가 `message` 단 1개로 줄어든 점이 핵심 — LLM 이 partner_user_id 만 알고 room_id 를 모를 때도 호출 가능. 단 partner_user_id 도 room_id 도 없으면 `error: "missing_room_or_partner"` 로 실패.
+
 ### 시스템 메시지 prefix 화이트리스트 패턴 (검증됨)
 
 `msg.content.startsWith('[') && msg.content.includes(']')` 같은 느슨한 매칭은 사용자가 보낸 "[중요]"
@@ -683,6 +749,61 @@ if (msgType && ORDER_RELATED_TYPES.includes(msgType)) {
 }
 ```
 
+#### 새 PENDING 카드 도착 시 낙관적 SUPERSEDED 마킹 (검증됨, 2026-05-03)
+
+`['messages', roomId]` 를 invalidate 만 해도 결국 refetch 가 정답을 가져오지만, **네트워크 RTT 동안**
+이전 PENDING 카드가 그대로 노출돼 본인이 방금 새로 제시한 카드 위쪽에 수락/거절 버튼이 잠깐 보이는
+문제가 있다 (issue.md #1: "새로고침하면 사라지는데 새로고침 전에도 안 뜨게 해달라"). 사용자 입장에서는
+"본인 제안인데 본인이 수락 버튼을 누를 수 있는 상태"가 되어 시스템적으로 모순되어 보인다.
+
+해결: `useMessagesWithWebSocket` 의 WS 수신 useEffect 에서 새 메시지를 캐시에 넣을 때, **같은 useEffect
+안의 `setQueryData` 안에서** 이전 동일 카드들 (`message_type` 일치 + `metadata.order_id` 일치 +
+`metadata.status === 'PENDING'`) 의 status 를 'SUPERSEDED' 로 미리 바꿔준다. invalidate refetch 는 그대로
+유지 — 백엔드 정식 status 값 (REPLACED/SUPERSEDED 등) 으로 최종 동기화 책임. 즉 **낙관적 갱신 + 서버
+권위 갱신** 이중 구조.
+
+대상 message_type:
+- `COUNTER_OFFER` — 새 협상가 제시 시 이전 PENDING 협상가 모두 SUPERSEDED
+- `DELIVERY_DATE_CHANGE` — 새 납품일 변경 요청 시 이전 PENDING 변경 요청 모두 SUPERSEDED
+
+```typescript
+const incomingType = incomingMessage.message_type;
+const incomingMeta = incomingMessage.metadata;
+const incomingOrderId = incomingMeta?.order_id;
+const incomingStatus = incomingMeta?.status;
+const supersedesPrevious =
+  !!incomingOrderId &&
+  incomingStatus === 'PENDING' &&
+  (incomingType === 'COUNTER_OFFER' || incomingType === 'DELIVERY_DATE_CHANGE');
+
+queryClient.setQueryData(['messages', roomId], (old) => {
+  if (!old) return { data: [incomingMessage] };
+  const exists = old.data.some((m) => m.id === incomingMessage.id);
+  const transformed = supersedesPrevious
+    ? old.data.map((m) => {
+        if (m.id === incomingMessage.id) return m;
+        if (m.message_type !== incomingType) return m;
+        const mMeta = m.metadata;
+        if (!mMeta || mMeta.order_id !== incomingOrderId) return m;
+        if (mMeta.status !== 'PENDING') return m;
+        return { ...m, metadata: { ...mMeta, status: 'SUPERSEDED' as const } };
+      })
+    : old.data;
+  if (exists) return { ...old, data: transformed };
+  return { ...old, data: [...transformed, incomingMessage] };
+});
+```
+
+주의: ACCEPTED/REJECTED 메시지(`OFFER_ACCEPTED`, `OFFER_REJECTED`, `DELIVERY_DATE_ACCEPTED`,
+`DELIVERY_DATE_REJECTED`)는 별도 status 마킹이 필요 없다 — 이쪽은 백엔드 mutation 의 onSuccess
+broad invalidate (`['messages']`) 가 충분히 빠르게 동작하고, 무엇보다 새 메시지 자체가 PENDING 이 아닌
+독립 카드(가운데 정렬)라 `supersedesPrevious` 조건에 안 걸린다. 즉 이 낙관적 갱신은 **새 PENDING
+제안이 도착해서 이전 PENDING 을 묻어버리는 케이스만** 다룬다.
+
+QueryClient 의 `staleTime: 60_000` (`components/providers/QueryProvider.tsx`) 도 invalidate 의 동작에는
+영향이 없다 (invalidateQueries 는 active query 의 staleTime 무관 refetch). 단지 refetch RTT 동안 잠깐의
+stale UI 가 노출될 뿐이고, 그 윈도우를 이 낙관적 마킹이 메운다.
+
 #### counter-offer mutation onSuccess 에서 broad messages invalidate (검증됨)
 
 `useSubmitCounterOffer` / `useAcceptCounterOffer` / `useRejectCounterOffer` (`useOrders.ts`) 의
@@ -779,25 +900,88 @@ const handleOpenChat = async () => {
 
 `useChatRooms()`에서 `isLoading`, `error`, `refetch`를 함께 destructure해 로딩 스피너와 에러+재시도 버튼을 표시한다.
 
-```typescript
-const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: refetchRooms } = useChatRooms();
+현재(2026-05-03) 두 채팅 페이지(`seller/chat`, `buyer/chat`)는 인라인 리스트 대신 공통 컴포넌트
+`<ChatRoomList />` 를 사용한다 (아래 "채팅 리스트 거래처별 그룹핑" 섹션 참조). 위 destructure 한
+`isLoading` / `error` / `refetch` 는 그대로 props 로 흘려준다:
 
-// JSX
-{roomsLoading ? (
-  <div className="flex items-center justify-center p-8">
-    <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary-600 border-t-transparent" />
-  </div>
-) : roomsError ? (
-  <div className="p-4 text-sm text-red-500">
-    채팅방을 불러오지 못했습니다.
-    <button onClick={() => refetchRooms()} className="ml-2 text-primary-600 underline">다시 시도</button>
-  </div>
-) : rooms.length === 0 ? (
-  <p className="p-4 text-sm text-gray-400">채팅방이 없습니다.</p>
-) : (
-  rooms.map(...)
-)}
+```tsx
+const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: refetchRooms } = useChatRooms();
+const rooms = roomsData?.data ?? [];
+
+<ChatRoomList
+  rooms={rooms}
+  myRole="SELLER"   // 또는 "BUYER"
+  selectedRoomId={selectedRoomId}
+  onSelectRoom={handleRoomSelect}
+  isLoading={roomsLoading}
+  error={roomsError}
+  onRetry={refetchRooms}
+/>
 ```
+
+`<ChatRoomList />` 내부가 isLoading/error/empty/groups 분기를 모두 담당한다 — 페이지 쪽엔 분기 X.
+
+### 채팅 리스트 거래처별 그룹핑 (검증됨, 2026-05-03)
+
+같은 거래처와 N개의 주문방이 있을 때 채팅 리스트가 평면 N행으로 흩어지면 한 거래처의 전체 거래
+상황을 파악하기 어렵다. 거래처(파트너) 단위로 그룹 헤더 + 하위 주문방 카드 N개로 묶어 렌더한다.
+
+#### 컴포넌트 구조 (frontend/components/chat/)
+- `ChatRoomList.tsx` — 검색 인풋 + 미읽 필터 토글 + 그룹 목록. 양쪽 페이지에서 공통 사용
+- `ChatRoomGroup.tsx` — 거래처 단위 그룹 헤더 (펼침/접힘 토글, 펼침 기본값 true) + 하위 방
+- `ChatRoomItem.tsx` — 단일 방 카드. order_id 유무로 Package(주문 채팅) / MessageSquare(일반 대화) 아이콘 분기. nested=true 면 좌측 보더 + 들여쓰기
+
+#### 그룹핑 로직 (frontend/lib/chatGrouping.ts)
+순수 함수 `groupChatRoomsByPartner(rooms, myRole)` 가 백엔드 호출 없이 클라이언트에서 묶는다.
+**`useChatRooms()` 응답 (`ChatRoom[]`) 의 기존 필드만으로 충분** — 추가 fetch 불필요.
+
+```typescript
+export interface ChatRoomGroup {
+  partnerUserId: string;          // = myRole==='SELLER' ? buyer_id : seller_id
+  partnerName: string | null;     // 가장 최근 활동 방의 partner_name
+  partnerCompany: string | null;  // 가장 최근 활동 방의 partner_company
+  unreadTotal: number;            // 그룹 내 unread_count 합
+  lastActivityAt: string | null;  // MAX(last_message_at)
+  activeOrderCount: number;       // order_id 가 NULL 이 아닌 방 개수
+  rooms: ChatRoom[];              // 그룹 내 방 목록 (lastActivityAt DESC)
+}
+```
+
+정렬:
+- 그룹 자체: `lastActivityAt DESC` (null 인 그룹은 가장 뒤)
+- 그룹 내 방: `last_message_at` (없으면 `created_at`) DESC
+
+partner_user_id 결정 규칙 — 페이지에서 `myRole` prop 으로 전달:
+- seller 페이지: `myRole='SELLER'` → `room.buyer_id`
+- buyer 페이지: `myRole='BUYER'` → `room.seller_id`
+
+#### 검색 / 필터
+- 검색: 거래처 이름 / 회사명 부분일치 (`includes`, 소문자 정규화) → 매칭 그룹 전체 표시
+- 미읽 필터 토글: `unreadTotal > 0` 인 그룹만
+- 두 조건은 AND. `useMemo` 로 rooms / search / unreadOnly / myRole 의존성에 캐시
+
+#### 그룹 헤더 자동 펼침 (UX)
+사용자가 어떤 그룹을 접어둔 상태에서 다른 화면(주문 상세 → 채팅 이동)이 그 그룹의 방으로
+라우팅하면, 헤더 안에서 선택된 방이 안 보이는 함정이 생긴다. `ChatRoomGroup` 내부에서
+`group.rooms.some(r => r.id === selectedRoomId)` 면 강제 펼침으로 처리한다 (`isExpanded = expanded || containsSelected`). 사용자가 명시적으로 접어둔 상태값(`expanded`) 자체는 유지하되,
+선택된 방이 있을 동안만 임시로 펼쳐 보이는 패턴.
+
+#### "일반 대화 vs 주문 채팅" 시각 구분
+백엔드 데이터 모델은 그대로 두고 `room.order_id` 의 truthy 여부로 분기:
+- order_id 있음 → Package 아이콘 + "주문 채팅" 라벨 (text-primary-500)
+- order_id 없음 → MessageSquare 아이콘 + "일반 대화" 라벨 (text-gray-400)
+
+상품명/주문번호 같은 풀 데이터는 OrderContextBanner 가 메시지 영역에서 별도로 보여주므로
+리스트 카드는 가벼운 라벨만.
+
+#### 상대 시각 표시 헬퍼
+ChatRoomGroup 내부 `formatRelativeTime(iso)` — "방금 전 / N분 전 / N시간 전 / N일 전" / 7일 이상은 `M.D` 짧은 날짜.
+NegotiationHistory 의 동일 패턴과 시그니처 통일.
+
+#### 페이지 변경분
+seller/chat, buyer/chat 페이지의 인라인 리스트 ~50줄을 `<ChatRoomList />` 한 줄 호출로 치환.
+`useChatRooms` / `useMessagesWithWebSocket` / `useMarkAsRead` / `useSummarizeChat` 등 기존
+훅·로직은 모두 그대로 유지 — 메시지 영역 / 헤더 / OrderContextBanner / 빠른 액션 popover 변경 없음.
 
 ### 납품일 변경 요청·승인 채팅 카드 (검증됨, 2026-04-29)
 

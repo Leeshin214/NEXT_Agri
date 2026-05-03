@@ -268,6 +268,41 @@ CREATE TABLE ai_conversations (
 );
 ```
 
+### buyer_inventories 테이블 — 구매자 재고 (2026-05-03 신설, 마이그레이션 20260503000001)
+```sql
+CREATE TABLE buyer_inventories (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  buyer_id        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  product_id      UUID NOT NULL REFERENCES products(id),
+  quantity        INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  unit            TEXT,
+  last_added_at   TIMESTAMPTZ,
+  notes           TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at      TIMESTAMPTZ
+);
+
+-- 활성 행 한정 unique — 한 buyer 의 한 product 당 active row 1개
+CREATE UNIQUE INDEX uniq_buyer_inventories_active_buyer_product
+  ON buyer_inventories (buyer_id, product_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_buyer_inventories_buyer
+  ON buyer_inventories (buyer_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_buyer_inventories_product
+  ON buyer_inventories (product_id) WHERE deleted_at IS NULL;
+CREATE INDEX idx_buyer_inventories_recent_added
+  ON buyer_inventories (buyer_id, last_added_at DESC NULLS LAST)
+  WHERE deleted_at IS NULL;
+
+-- orders 테이블 — buyer 재고 누적 멱등성 컬럼
+ALTER TABLE orders ADD COLUMN inventory_added_at TIMESTAMPTZ;
+```
+- **자동 누적**: `order_service.update_status` 의 COMPLETED 분기에서 `_add_buyer_inventory_for_order(order_id)` 호출. order_items 를 product_id 별 quantity 합산 → (buyer_id, product_id) active row 가 있으면 quantity += 합산값 + last_added_at 갱신, 없으면 INSERT. `orders.inventory_added_at` 으로 멱등성 보장 (이미 누적됐으면 skip).
+- **실패 정책**: 누적 실패는 logger.error 만 — COMPLETED 전이 자체를 막지 않는다 (`_deduct_seller_stock_for_order` 와 다름; 사용자 입장에선 주문 완료가 더 중요).
+- **23505 race fallback**: INSERT 시 partial unique index 충돌이 나면 → fallback 으로 다시 SELECT 후 UPDATE 실행 (다른 동시 호출이 이미 INSERT 한 케이스).
+- RLS: `buyer_inventories_select_own` / `buyer_inventories_update_own` (auth.uid() ↔ users.supabase_uid 패턴). INSERT/DELETE 정책 미정의 → 클라이언트 직접 INSERT 불가 (자동 누적 + service_role 만), DELETE 도 클라이언트 차단 (PATCH soft delete 만 가능).
+- `deleted_at` 보유 — 사용자가 hide 후 다음 주문 COMPLETED 시 새 active row 생성 가능 (partial unique index 가 deleted_at IS NULL 만 적용).
+
 ### subscriptions / subscription_items 테이블 — 정기배송 V1.5 Phase 1 (2026-04-28)
 ```sql
 -- 정기배송 마스터
@@ -689,3 +724,23 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
   - 적용 위치: `notification_service.mark_read` / `mark_all_read`. 동일 함정이 있는 다른 서비스(예: 향후 partners/orders 의 단순 UPDATE 응답을 신뢰하는 코드)도 같은 패턴으로 보강 가능.
   - 비용: round-trip 1~2회 추가. 알림 읽음 같은 저빈도/단건 mutation 이라 무시 가능. 고빈도 경로(메시지 일괄 읽음 등)에서는 RPC SECURITY DEFINER 함수로 1 round-trip 처리 권장.
   - 증상 진단: 프론트에서 mutation 후 invalidate 해도 UI 가 갱신되지 않고, DB 직접 확인 시 데이터는 갱신되어 있으면 거의 이 함정이다.
+
+- **RLS 무한재귀(42P17) 회피 — `current_app_user_id()` SECURITY DEFINER 헬퍼 (2026-05-03 운영 장애 수정, 마이그레이션 20260504000001)**: `xxx_id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())` 패턴이 다수 테이블에 누적되면, 어느 시점에 새 마이그레이션이 카탈로그를 변경하면서 PostgreSQL RLS plan invalidation 이 발생하고, users 테이블의 OR 정책 / 잠재 자기참조가 더 이상 운 좋게 풀리지 않아 `42P17 infinite recursion detected in policy for relation "users"` 가 모든 anon/authenticated REST 호출에 폭발한다 (service_role 은 RLS 우회라 정상). 운영 백엔드는 service_role 키라 안 터지지만 프론트 직접 Supabase JS / Realtime / Edge Function 호출은 전부 죽는다.
+  ```sql
+  -- 1) 헬퍼 함수 — SECURITY DEFINER 로 RLS 우회, STABLE 로 트랜잭션 캐시
+  CREATE OR REPLACE FUNCTION public.current_app_user_id()
+  RETURNS UUID LANGUAGE sql STABLE SECURITY DEFINER
+  SET search_path = public, pg_temp AS $$
+    SELECT id FROM public.users WHERE supabase_uid = auth.uid() LIMIT 1
+  $$;
+  GRANT EXECUTE ON FUNCTION public.current_app_user_id()
+    TO anon, authenticated, service_role;
+
+  -- 2) 정책 본문에서 SELECT FROM users 제거
+  CREATE POLICY "xxx_select_own" ON xxx
+    FOR SELECT USING (buyer_id = public.current_app_user_id());
+  ```
+  - **재현 결정**: anon 키로 `/rest/v1/{any_table}?select=id&limit=1` 호출했을 때 42P17 이 나오면 이 함정이다. service_role 호출은 멀쩡하므로 백엔드 로그에 안 잡혀 진단이 늦어질 수 있다.
+  - **신규 RLS 정책 작성 가이드라인 (2026-05-03 이후)**: 본문에서 `SELECT FROM users` 직접 호출 금지. `xxx_id = public.current_app_user_id()` 또는 `xxx_id IN (SELECT id FROM ... WHERE buyer_id = public.current_app_user_id())` 형태로 작성. 기존 검증된 패턴(`subscriptions`, `notifications`, `negotiation_history`, `delivery_date_change_history`) 도 향후 같은 함정 노출 가능 — 신규 마이그레이션이 추가될 때마다 plan invalidation 위험이 있어 점진적으로 헬퍼 함수 패턴으로 마이그레이션 권장.
+  - **다른 테이블 RLS 는 일괄 수정 금지**: 영향 범위가 너무 커 별도 운영 점검 + 트래픽 적은 시간대에 단계적 적용. 헬퍼 함수 자체는 idempotent (CREATE OR REPLACE) 하므로 한 번 등록한 뒤 재사용.
+  - **STABLE vs IMMUTABLE 선택**: `auth.uid()` 가 같은 트랜잭션 안에서 변하지 않으므로 STABLE 이 정확. IMMUTABLE 로 하면 PostgreSQL 이 다른 사용자 컨텍스트에서도 캐시를 재사용하려 해서 보안 사고 위험.

@@ -43,3 +43,9 @@ export type {
   UnreadCountData,
   MarkAllReadData,
 } from './notification';
+export type {
+  BuyerInventory,
+  BuyerInventoryUpdatePayload,
+  BuyerInventoryListParams,
+  BuyerInventorySortBy,
+} from './inventory';

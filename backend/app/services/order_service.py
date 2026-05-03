@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import math
 import random
 from datetime import datetime, timezone
@@ -15,6 +16,9 @@ from app.services.chat_service import chat_service
 # notification_service 도 단방향 의존 — 알림 INSERT 만 수행 (역참조 없음)
 from app.services.notification_service import notification_service
 from app.websocket.connection_manager import manager as ws_manager
+
+
+logger = logging.getLogger(__name__)
 
 
 # ===========================================
@@ -900,6 +904,272 @@ class OrderService:
                 "error": f"재고 차감 중 오류가 발생했습니다: {str(e)}",
             }
 
+    async def _add_buyer_inventory_for_order(self, order_id: UUID | str) -> None:
+        """주문이 COMPLETED 로 진입할 때 buyer 재고를 누적한다.
+
+        설계 (옵션 A — buyer_inventories 테이블 신설):
+          - 멱등성: orders.inventory_added_at 이 이미 채워져 있으면 skip.
+          - order_items 를 product_id 별 quantity 합산 (같은 상품 여러 라인 케이스).
+          - 각 (buyer_id, product_id) active row UPSERT:
+              * 있으면 quantity += 합산값, last_added_at = NOW(), unit 업데이트
+              * 없으면 INSERT (quantity = 합산값)
+          - orders.inventory_added_at = NOW() 기록.
+
+        실패 정책:
+          본 함수는 절대 raise 하지 않는다 (logger.error 만). 호출처(update_status 의
+          COMPLETED 분기) 가 best-effort 로 호출하므로, 누적 실패가 COMPLETED 전이를
+          막지 않는다 — 사용자 입장에선 주문 완료가 더 중요하고, 재고는 추후 수동 보정 가능.
+        """
+        order_id_str = str(order_id)
+
+        try:
+            # 1) 주문 + 멱등성 체크 — inventory_added_at 이미 있으면 skip
+            order_result = await asyncio.to_thread(
+                lambda: self.orders.select("id, buyer_id, inventory_added_at")
+                .eq("id", order_id_str)
+                .is_("deleted_at", None)
+                .limit(1)
+                .execute()
+            )
+            order_rows = order_result.data or []
+            if not order_rows:
+                logger.error(
+                    "[order_service._add_buyer_inventory_for_order] order not found "
+                    "order_id=%s",
+                    order_id_str,
+                )
+                return
+
+            order = order_rows[0]
+            if order.get("inventory_added_at"):
+                # 이미 누적됨 — 멱등 skip
+                return
+
+            buyer_id = order.get("buyer_id")
+            if not buyer_id:
+                logger.error(
+                    "[order_service._add_buyer_inventory_for_order] buyer_id 없음 "
+                    "order_id=%s",
+                    order_id_str,
+                )
+                return
+            buyer_id_str = str(buyer_id)
+
+            # 2) order_items 조회 + product_id 별 quantity 합산
+            items_result = await asyncio.to_thread(
+                lambda: self.items.select("product_id, quantity")
+                .eq("order_id", order_id_str)
+                .execute()
+            )
+            items_data = items_result.data or []
+            if not items_data:
+                # 아이템 없는 주문 — 누적 대상 없음. 멱등성만 기록하고 종료.
+                now_utc = datetime.now(timezone.utc).isoformat()
+                await asyncio.to_thread(
+                    lambda: self.orders.update({"inventory_added_at": now_utc})
+                    .eq("id", order_id_str)
+                    .execute()
+                )
+                return
+
+            # product_id 별 합산
+            qty_by_product: dict[str, int] = {}
+            for item in items_data:
+                pid = item.get("product_id")
+                qty = item.get("quantity")
+                if not pid or qty is None:
+                    continue
+                pid_str = str(pid)
+                qty_by_product[pid_str] = qty_by_product.get(pid_str, 0) + int(qty)
+
+            if not qty_by_product:
+                now_utc = datetime.now(timezone.utc).isoformat()
+                await asyncio.to_thread(
+                    lambda: self.orders.update({"inventory_added_at": now_utc})
+                    .eq("id", order_id_str)
+                    .execute()
+                )
+                return
+
+            # 3) 합산 결과로 buyer_inventories UPSERT
+            buyer_inventories_table = self.client.table("buyer_inventories")
+            now_utc_iso = datetime.now(timezone.utc).isoformat()
+
+            # 상품 unit 조회용 (한 번에 batch 조회)
+            product_ids = list(qty_by_product.keys())
+            products_lookup: dict[str, dict] = {}
+            if product_ids:
+                products_result = await asyncio.to_thread(
+                    lambda: self.client.table("products")
+                    .select("id, unit")
+                    .in_("id", product_ids)
+                    .execute()
+                )
+                for p in products_result.data or []:
+                    products_lookup[str(p["id"])] = p
+
+            for pid_str, add_qty in qty_by_product.items():
+                product_unit = products_lookup.get(pid_str, {}).get("unit")
+
+                # 기존 active row 조회
+                existing_result = await asyncio.to_thread(
+                    lambda p=pid_str: buyer_inventories_table.select(
+                        "id, quantity"
+                    )
+                    .eq("buyer_id", buyer_id_str)
+                    .eq("product_id", p)
+                    .is_("deleted_at", None)
+                    .limit(1)
+                    .execute()
+                )
+                existing_rows = existing_result.data or []
+
+                if existing_rows:
+                    # UPDATE — 기존 quantity 에 add_qty 합산
+                    existing = existing_rows[0]
+                    new_qty = int(existing.get("quantity") or 0) + add_qty
+                    update_payload = {
+                        "quantity": new_qty,
+                        "last_added_at": now_utc_iso,
+                    }
+                    if product_unit:
+                        update_payload["unit"] = product_unit
+                    try:
+                        await asyncio.to_thread(
+                            lambda eid=str(existing["id"]),
+                            up=update_payload: buyer_inventories_table.update(up)
+                            .eq("id", eid)
+                            .is_("deleted_at", None)
+                            .execute()
+                        )
+                    except Exception as upd_err:
+                        logger.error(
+                            "[order_service._add_buyer_inventory_for_order] update 실패 "
+                            "order_id=%s buyer_id=%s product_id=%s err=%s: %s",
+                            order_id_str,
+                            buyer_id_str,
+                            pid_str,
+                            type(upd_err).__name__,
+                            upd_err,
+                        )
+                        # 한 상품 실패해도 다른 상품은 계속 처리
+                        continue
+                else:
+                    # INSERT — 새 row
+                    insert_payload = {
+                        "buyer_id": buyer_id_str,
+                        "product_id": pid_str,
+                        "quantity": add_qty,
+                        "unit": product_unit,
+                        "last_added_at": now_utc_iso,
+                    }
+                    try:
+                        await asyncio.to_thread(
+                            lambda p=insert_payload: buyer_inventories_table.insert(p).execute()
+                        )
+                    except PostgrestAPIError as ins_err:
+                        # 23505 — partial unique index 충돌 (race: 다른 동시 호출이 INSERT 후)
+                        # → fallback: 다시 SELECT 한 뒤 UPDATE
+                        err_code = getattr(ins_err, "code", "") or ""
+                        err_msg = str(ins_err)
+                        if (
+                            err_code == "23505"
+                            or "23505" in err_msg
+                            or "duplicate" in err_msg.lower()
+                        ):
+                            try:
+                                race_result = await asyncio.to_thread(
+                                    lambda p=pid_str: buyer_inventories_table.select(
+                                        "id, quantity"
+                                    )
+                                    .eq("buyer_id", buyer_id_str)
+                                    .eq("product_id", p)
+                                    .is_("deleted_at", None)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                race_rows = race_result.data or []
+                                if race_rows:
+                                    race_row = race_rows[0]
+                                    race_qty = (
+                                        int(race_row.get("quantity") or 0) + add_qty
+                                    )
+                                    upd_payload = {
+                                        "quantity": race_qty,
+                                        "last_added_at": now_utc_iso,
+                                    }
+                                    if product_unit:
+                                        upd_payload["unit"] = product_unit
+                                    await asyncio.to_thread(
+                                        lambda rid=str(race_row["id"]),
+                                        up=upd_payload: buyer_inventories_table.update(
+                                            up
+                                        )
+                                        .eq("id", rid)
+                                        .is_("deleted_at", None)
+                                        .execute()
+                                    )
+                            except Exception as race_err:
+                                logger.error(
+                                    "[order_service._add_buyer_inventory_for_order] "
+                                    "race fallback 실패 order_id=%s product_id=%s "
+                                    "err=%s: %s",
+                                    order_id_str,
+                                    pid_str,
+                                    type(race_err).__name__,
+                                    race_err,
+                                )
+                                continue
+                        else:
+                            logger.error(
+                                "[order_service._add_buyer_inventory_for_order] "
+                                "insert 실패 order_id=%s buyer_id=%s product_id=%s "
+                                "err=%s: %s",
+                                order_id_str,
+                                buyer_id_str,
+                                pid_str,
+                                type(ins_err).__name__,
+                                ins_err,
+                            )
+                            continue
+                    except Exception as ins_err2:
+                        logger.error(
+                            "[order_service._add_buyer_inventory_for_order] "
+                            "insert 일반 실패 order_id=%s product_id=%s err=%s: %s",
+                            order_id_str,
+                            pid_str,
+                            type(ins_err2).__name__,
+                            ins_err2,
+                        )
+                        continue
+
+            # 4) 멱등성 — orders.inventory_added_at 기록
+            now_utc = datetime.now(timezone.utc).isoformat()
+            try:
+                await asyncio.to_thread(
+                    lambda: self.orders.update({"inventory_added_at": now_utc})
+                    .eq("id", order_id_str)
+                    .execute()
+                )
+            except Exception as flag_err:
+                logger.error(
+                    "[order_service._add_buyer_inventory_for_order] "
+                    "inventory_added_at 기록 실패 order_id=%s err=%s: %s",
+                    order_id_str,
+                    type(flag_err).__name__,
+                    flag_err,
+                )
+
+        except Exception as e:
+            # 최상위 try — buyer 재고 누적은 절대 호출처(COMPLETED 전이)를 막지 않는다.
+            logger.error(
+                "[order_service._add_buyer_inventory_for_order] 누적 전체 실패 (무시) "
+                "order_id=%s err=%s: %s",
+                order_id_str,
+                type(e).__name__,
+                e,
+            )
+
     async def update_status(
         self, order_id: UUID, user_id: UUID, new_status: str
     ) -> Optional[dict]:
@@ -948,6 +1218,21 @@ class OrderService:
         updated_order = await self.get_order(order_id)
         if updated_order:
             await self._sync_calendar_events_for_order(updated_order)
+
+        # COMPLETED 진입 시 buyer 재고 자동 누적 (옵션 A — buyer_inventories)
+        # _deduct_seller_stock_for_order 와 달리 실패해도 raise 하지 않음 — 사용자 입장에선
+        # 주문 완료가 더 중요. 누적 실패는 logger.error 로만 남기고 흐름 계속.
+        if new_status == "COMPLETED":
+            try:
+                await self._add_buyer_inventory_for_order(order_id)
+            except Exception as e:
+                logger.error(
+                    "[order_service.update_status] buyer 재고 누적 실패 (무시) "
+                    "order_id=%s err=%s: %s",
+                    str(order_id),
+                    type(e).__name__,
+                    e,
+                )
 
         # 주요 상태 전환만 채팅에 반영 (너무 시끄럽지 않게)
         # CONFIRMED, PREPARING, SHIPPING, COMPLETED 만 알림 — 그 외는 skip

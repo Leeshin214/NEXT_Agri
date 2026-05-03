@@ -10,6 +10,7 @@ import OrderContextBanner from '@/components/chat/OrderContextBanner';
 import PriceOfferPopover from '@/components/chat/PriceOfferPopover';
 import DeliveryDatePopover from '@/components/chat/DeliveryDatePopover';
 import ChatHeaderStatusControl from '@/components/chat/ChatHeaderStatusControl';
+import ChatRoomList from '@/components/chat/ChatRoomList';
 import {
   useChatRooms,
   useMessagesWithWebSocket,
@@ -130,56 +131,23 @@ export default function BuyerChatPage() {
       <PageHeader title="채팅" description="공급처와 실시간으로 대화하세요" />
 
       <div className="flex h-[calc(100vh-200px)] rounded-xl bg-white shadow-sm overflow-hidden">
-        {/* 채팅방 목록 — 모바일: mobileView==='list'일 때만 표시, md 이상: 항상 표시 */}
+        {/* 채팅방 목록 — 거래처별 그룹핑 (모바일: mobileView==='list'일 때만 표시, md 이상: 항상 표시) */}
         <div
           className={cn(
-            'border-r border-gray-200 overflow-y-auto',
+            'border-r border-gray-200',
             'w-full md:w-72 md:flex-shrink-0',
             mobileView === 'list' ? 'flex flex-col' : 'hidden md:flex md:flex-col'
           )}
         >
-          {roomsLoading ? (
-            <div className="flex items-center justify-center p-8">
-              <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary-600 border-t-transparent" />
-            </div>
-          ) : roomsError ? (
-            <div className="p-4 text-sm text-red-500">
-              채팅방을 불러오지 못했습니다.
-              <button onClick={() => refetchRooms()} className="ml-2 text-primary-600 underline">
-                다시 시도
-              </button>
-            </div>
-          ) : rooms.length === 0 ? (
-            <p className="p-4 text-sm text-gray-400">채팅방이 없습니다.</p>
-          ) : (
-            rooms.map((room) => (
-              <button
-                key={room.id}
-                onClick={() => handleRoomSelect(room.id)}
-                className={cn(
-                  'w-full border-b border-gray-100 p-4 text-left hover:bg-gray-50',
-                  selectedRoomId === room.id && 'bg-primary-50'
-                )}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-medium text-gray-900">
-                    {room.partner_name || '상대방'}
-                  </p>
-                  {room.unread_count > 0 && (
-                    <span className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-primary-600 px-1.5 text-[10px] font-bold text-white">
-                      {room.unread_count}
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-gray-500">{room.partner_company}</p>
-                {room.last_message && (
-                  <p className="mt-1 truncate text-xs text-gray-400">
-                    {room.last_message}
-                  </p>
-                )}
-              </button>
-            ))
-          )}
+          <ChatRoomList
+            rooms={rooms}
+            myRole="BUYER"
+            selectedRoomId={selectedRoomId}
+            onSelectRoom={handleRoomSelect}
+            isLoading={roomsLoading}
+            error={roomsError}
+            onRetry={refetchRooms}
+          />
         </div>
 
         {/* 메시지 영역 — 모바일: mobileView==='messages'일 때만 표시, md 이상: 항상 표시 */}

@@ -385,6 +385,7 @@ content: [
 - [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat) + 거래처 추가 버튼
 - [x] browse — 상품 카드 그리드, 카테고리/가격 필터, 견적 요청 버튼, ?seller_id= 쿼리로 판매자 필터
 - [x] orders — 견적 생성/수정/취소 모달 + 협상가 제시/수락/거절 + 상세 슬라이드
+- [x] inventory — 자동 누적 재고 목록(테이블), 수량/메모 수정 모달, soft-delete 모달, 검색 디바운스 + 정렬(recent/quantity/name) + 페이지네이션
 - [ ] chat — 판매자와 동일 패턴
 
 ### 공통
@@ -2435,3 +2436,89 @@ const PAGE_ROLE = 'SELLER' as const;
 ```
 
 이 패턴은 다른 byte-identical 페이지에도 동일하게 적용 — myRole 류 상수는 항상 union 타입으로 선언.
+
+#### 구매자 재고 페이지 (`/buyer/inventory`) (검증됨, 2026-05-03)
+
+자동 누적형(`order COMPLETED → buyer_inventories upsert`) 재고 관리 페이지. 사용자는 INSERT 권한이 없고 PATCH/DELETE 만 가능 — `useCreate*` 훅을 만들지 않는 게 핵심.
+
+##### 타입/훅/엔드포인트 매핑
+
+| 위치 | 정체 |
+|------|-----|
+| `frontend/types/inventory.ts` | `BuyerInventory`, `BuyerInventoryUpdatePayload`, `BuyerInventoryListParams`, `BuyerInventorySortBy` |
+| `frontend/types/index.ts` | barrel export 등록 (함정: 잊으면 페이지에서 import 실패) |
+| `frontend/hooks/useBuyerInventory.ts` | `useBuyerInventoryList`, `useBuyerInventoryDetail`, `useUpdateBuyerInventory`, `useDeleteBuyerInventory` (Create 없음) |
+| `frontend/app/(dashboard)/buyer/inventory/page.tsx` | 페이지 |
+| `frontend/constants/menus.ts` | buyerMenus 에 `{ label: '내 재고', href: '/buyer/inventory', icon: Boxes }` (Boxes = lucide-react) |
+
+##### sort_by 값 — 백엔드와 정확히 일치 (함정)
+
+백엔드 `buyer_inventory_service.list_buyer_inventory` 가 받는 정렬 키는 `recent | quantity | name` 이다. 다른 도메인의 `last_added_at | created_at` 같은 컬럼명을 그대로 쓰면 backend 가 fallback("recent") 으로 무시한다. 타입에 명시:
+```ts
+export type BuyerInventorySortBy = 'recent' | 'quantity' | 'name';
+```
+
+##### 검색 디바운스 + 페이지 리셋 패턴
+
+`SearchFilterBar` 자체에는 디바운스가 없으므로 페이지 컴포넌트에서 직접:
+```tsx
+const [searchInput, setSearchInput] = useState('');
+const [search, setSearch] = useState('');
+useEffect(() => {
+  const t = setTimeout(() => {
+    setSearch(searchInput.trim());
+    setPage(1);   // 검색어 변하면 1페이지로
+  }, 300);
+  return () => clearTimeout(t);
+}, [searchInput]);
+```
+정렬 변경 시에도 `useEffect(() => setPage(1), [sortBy])` 로 1페이지 리셋.
+
+##### 페이지네이션 — meta 기반 단순 prev/next
+
+`SuccessResponse<BuyerInventory[]>` 의 `meta.total_pages` 를 그대로 사용. 빌더 컴포넌트가 없어 인라인으로:
+```tsx
+{totalPages > 1 && (
+  <div className="flex items-center justify-between gap-3 pt-2">
+    <p className="text-xs text-gray-500">{page} / {totalPages} 페이지</p>
+    <button disabled={page <= 1 || isFetching} onClick={() => setPage(p => Math.max(1, p - 1))}>이전</button>
+    <button disabled={page >= totalPages || isFetching} onClick={() => setPage(p => Math.min(totalPages, p + 1))}>다음</button>
+  </div>
+)}
+```
+`isFetching` 으로 disable → 페이지 전환 중복 클릭 방지.
+
+##### 빈 상태 분기 — 절대 빈 vs 검색 결과 빈
+
+자동 누적이라 "아직 입고된 적 없음" 과 "검색 결과 없음" 을 시각적으로 구분하는 게 UX 상 중요:
+```tsx
+const isEmpty         = !isLoading && items.length === 0 && !search;
+const isFilteredEmpty = !isLoading && items.length === 0 && !!search;
+// 각각 다른 EmptyState (제목/설명 다르게)
+```
+
+##### 수정 모달 — 변경 없는 필드는 payload 에서 제외
+
+`BuyerInventoryUpdate` Pydantic 이 `Optional`(미전달=변경 안 함) 이므로 같은 값이면 키 자체를 빼야 백엔드가 불필요한 update 안 한다:
+```ts
+const payload: BuyerInventoryUpdatePayload = {};
+if (qty !== editTarget.quantity) payload.quantity = qty;
+const trimmedNotes = editNotes.trim();
+const currentNotes = editTarget.notes ?? '';
+if (trimmedNotes !== currentNotes) payload.notes = trimmedNotes;
+if (Object.keys(payload).length === 0) { closeEdit(); return; }
+```
+
+##### 삭제 = soft delete — UI 라벨로 명시 (UX)
+
+DELETE 가 hard delete 가 아닌 soft delete(`deleted_at` 채움) 임을 사용자에게 명시. 모달 제목 "재고 항목 숨기기", 본문에 "데이터는 보존됩니다. 같은 상품을 다시 배송완료하면 새로운 재고 항목으로 자동 추가됩니다." 안내.
+
+##### 임베딩 join 평탄화 필드 — null 폴백 패턴
+
+상품/판매자 soft-delete 시 백엔드가 `product_*`, `seller_*` 를 null 로 보내준다. 표시할 때 항상 폴백:
+```tsx
+{item.product_name ?? '상품 정보 없음'}
+{item.seller_company ?? item.seller_name ?? '-'}
+{categoryLabel(item.product_category)}   // CATEGORY_OPTIONS 매핑 함수, null 이면 '' 반환
+```
+
