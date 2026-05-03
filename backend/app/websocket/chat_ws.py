@@ -630,6 +630,28 @@ async def websocket_chat(websocket: WebSocket, room_id: str):
             }
             await manager.broadcast(room_id, broadcast_payload)
 
+            # 7-1. 판매자가 첫 답변 시 QUOTE_REQUESTED → NEGOTIATING 자동 전환
+            if user_id == str(room.get("seller_id")):
+                try:
+                    supabase = get_supabase_client()
+                    linked = await asyncio.to_thread(
+                        lambda: supabase.table("orders")
+                        .select("id")
+                        .eq("seller_id", str(room["seller_id"]))
+                        .eq("buyer_id", str(room["buyer_id"]))
+                        .eq("status", "QUOTE_REQUESTED")
+                        .is_("deleted_at", None)
+                        .execute()
+                    )
+                    for order in (linked.data or []):
+                        await asyncio.to_thread(
+                            lambda oid=order["id"]: supabase.table("orders").update({"status": "NEGOTIATING"}).eq("id", oid).execute()
+                        )
+                        from app.services.agent_tools import _sync_calendar_events_for_order_id
+                        await asyncio.to_thread(_sync_calendar_events_for_order_id, order["id"])
+                except Exception as _e:
+                    print(f"[WS] 자동 NEGOTIATING 실패: {_e}")
+
             # 8. 합의 감지 백그라운드 실행 (쿨다운 적용)
             if should_analyze(room_id):
                 try:

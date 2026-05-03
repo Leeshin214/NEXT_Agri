@@ -13,6 +13,7 @@ from app.schemas.chat import (
 )
 from app.schemas.common import SuccessResponse
 from app.schemas.order import CounterOfferCreate, CounterOfferResponse
+from app.core.supabase import get_supabase_client
 from app.services.chat_service import chat_service
 from app.services.order_service import order_service
 
@@ -132,13 +133,45 @@ async def submit_counter_offer_via_chat(
             detail="이 채팅방에 접근할 권한이 없습니다",
         )
 
-    # 3) 연결된 주문 확인
+    # 3) 연결된 주문 확인 — room.order_id가 취소/완료 상태면 같은 buyer-seller 간 활성 주문 자동 탐색
     order_id = room.get("order_id")
     if not order_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="이 채팅방에 연결된 주문이 없습니다",
         )
+
+    # room.order_id 상태 확인 — 협상 불가 상태면 활성 주문으로 교체
+    NEGOTIABLE_STATUSES = ("QUOTE_REQUESTED", "NEGOTIATING")
+    supabase = get_supabase_client()
+    order_check = await asyncio.to_thread(
+        lambda: supabase.table("orders")
+        .select("id, status")
+        .eq("id", str(order_id))
+        .is_("deleted_at", None)
+        .single()
+        .execute()
+    )
+    current_order = order_check.data
+    if not current_order or current_order.get("status") not in NEGOTIABLE_STATUSES:
+        # 같은 buyer-seller 간 활성 주문 탐색
+        fallback = await asyncio.to_thread(
+            lambda: supabase.table("orders")
+            .select("id, status")
+            .eq("buyer_id", str(room["buyer_id"]))
+            .eq("seller_id", str(room["seller_id"]))
+            .in_("status", list(NEGOTIABLE_STATUSES))
+            .is_("deleted_at", None)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not fallback.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="협상 가능한 주문이 없습니다. 먼저 주문을 생성해주세요.",
+            )
+        order_id = fallback.data[0]["id"]
 
     # 4) 협상가 제시 — order_service 가 메시지/브로드캐스트 자동 처리
     offer = await order_service.submit_counter_offer(

@@ -459,13 +459,18 @@ response_node
 - UUID 파라미터 자동 교정: `_fix_id_params()` 헬퍼로 seller_id/user_id/buyer_id 검증
 - MAX_TOOL_ROUNDS 마지막 라운드 강제 break 제거 — validator_node가 tool_round < 2 기준으로 RETRY 관리하므로 두 로직 동시 존재 시 validator 발동 전에 루프 종료됨
 
-#### AgentState 필드 (pending_tool_calls 제거됨)
+#### AgentState 필드 (history 분리 — 히스토리 오염 해결)
 ```python
 class AgentState(TypedDict):
-    user_id, user_role, user_info, message, intent,
-    messages, tool_results, tools_used, final_response, tool_round,
+    user_id, user_role, user_info, message, intent, subtype, target_year, target_month,
+    history,           # 깨끗한 user/assistant 대화 히스토리 (DB 원본)
+    messages,          # 라우터(orchestrator_node) 전용: system + history + 현재 user
+    tool_results, tools_used, final_response, tool_round,
     validation_status, manual_review
 ```
+- `messages` 는 라우터 시스템 프롬프트와 라우터 JSON 응답이 누적되어 오염됨
+- 다른 노드(inventory_order/calendar_data/calendar_reason)는 모두 `state["history"]` 를 직접 사용 → 오염된 messages 를 다시 필터링할 필요 없음
+- `AgentOrchestrator.run()` 에서 `clean_history` 를 한 번만 만들어 `history` / `messages` 양쪽에 주입
 
 #### TOOL_FUNCTION_MAP 전체 목록 (18개)
 ```
@@ -491,9 +496,9 @@ find_alternative_partners, get_user_profile
 
 ### 주의사항 & 함정
 
-- orchestrator_node가 라우터 JSON을 messages에 assistant로 추가하는데, inventory_order_node에서 이를 필터링하지 않으면 LLM이 혼란 → `_is_router_json()` 헬퍼로 필터링 필수
+- (구) orchestrator_node 가 라우터 JSON 을 messages 에 누적시켜 inventory_order_node 에서 이를 필터링해야 했음 → 현재는 `state["history"]` 필드를 별도로 두고 노드들이 그것을 직접 사용하므로 필터링 불필요. `_is_router_json()` 헬퍼는 잔존하지만 사용처 없음
 - `response_format=json_object` 사용 시 시스템 프롬프트에 반드시 "JSON으로만 응답" 명시해야 함 (미명시 시 API 오류)
-- inventory_order_node의 agent_messages 구성: `state["messages"]`를 그대로 쓰면 orchestrator system prompt가 섞임 → 별도 agent_messages 리스트 새로 구성해야 함
+- 새 노드를 추가할 때는 `state["messages"]` 를 그대로 쓰지 말고 항상 `state["history"]` 를 사용한다. messages 는 라우터 전용
 - response_node 단락회로: success=False 또는 재고 부족 결과는 반드시 LLM 통과시켜야 타협안 생성 가능. `last.get("message")` 유무만으로 단락회로 결정하면 이분법 거절 응답이 그대로 반환됨
 - find_alternative_partners에 단순 정렬 공식 추가 금지 — DB 결과 그대로 반환, 추천 순위는 LLM(response_node)이 자연어로 생성
 

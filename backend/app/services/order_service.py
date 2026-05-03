@@ -350,64 +350,44 @@ class OrderService:
     async def _ensure_chat_room_for_order(self, order: dict) -> Optional[dict]:
         """주문에 연결된 채팅방을 조회하거나 생성한다.
 
-        1) order_id 로 직접 매칭되는 chat_room 검색
-        2) 없으면 (seller_id, buyer_id) 페어로 chat_room 검색
-        3) 그래도 없으면 새로 생성
-        4) 검색/생성된 chat_room 의 order_id 를 현재 주문 ID 로 UPDATE
-           (가장 최근 주문 컨텍스트로 동기화)
-
-        반환: chat_room dict 또는 None (실패 시)
+        주문별 채팅방 정책:
+        - 같은 buyer/seller라도 order_id가 다르면 다른 채팅방을 만든다.
+        - 기존 일반 채팅방(order_id 없음)이나 다른 주문 채팅방의 order_id를 덮어쓰지 않는다.
         """
         try:
             seller_id = str(order["seller_id"])
             buyer_id = str(order["buyer_id"])
             order_id = str(order["id"])
 
-            # 1) order_id 매칭 chat_room 우선 검색
+            # 1) 이 주문에 이미 연결된 채팅방만 검색
             existing = await asyncio.to_thread(
-                lambda: chat_service.rooms.select("*")
-                .eq("order_id", order_id)
-                .execute()
-            )
-            if existing.data:
-                return existing.data[0]
-
-            # 2) (seller_id, buyer_id) 페어로 검색
-            pair_result = await asyncio.to_thread(
                 lambda: chat_service.rooms.select("*")
                 .eq("seller_id", seller_id)
                 .eq("buyer_id", buyer_id)
+                .eq("order_id", order_id)
+                .limit(1)
                 .execute()
             )
-            room: Optional[dict]
-            if pair_result.data:
-                room = pair_result.data[0]
-            else:
-                # 3) 새 채팅방 생성
-                create_result = await asyncio.to_thread(
-                    lambda: chat_service.rooms.insert(
-                        {
-                            "seller_id": seller_id,
-                            "buyer_id": buyer_id,
-                            "order_id": order_id,
-                        }
-                    ).execute()
-                )
-                if not create_result.data:
-                    return None
-                room = create_result.data[0]
-                # 새로 생성한 방은 이미 order_id 가 매핑됨
-                return room
 
-            # 4) 기존 방의 order_id 를 현재 주문 ID 로 갱신 (가장 최근 컨텍스트)
-            update_result = await asyncio.to_thread(
-                lambda: chat_service.rooms.update({"order_id": order_id})
-                .eq("id", room["id"])
-                .execute()
+            if existing.data:
+                return existing.data[0]
+
+            # 2) 없으면 이 주문 전용 새 채팅방 생성
+            create_result = await asyncio.to_thread(
+                lambda: chat_service.rooms.insert(
+                    {
+                        "seller_id": seller_id,
+                        "buyer_id": buyer_id,
+                        "order_id": order_id,
+                    }
+                ).execute()
             )
-            if update_result.data:
-                return update_result.data[0]
-            return room
+
+            if not create_result.data:
+                return None
+
+            return create_result.data[0]
+
         except Exception as e:
             print(f"[order_service] _ensure_chat_room_for_order 실패: {type(e).__name__}: {e}")
             return None
@@ -766,6 +746,159 @@ class OrderService:
                 detail="Created order could not be loaded",
             )
         return created_order
+    
+    async def _deduct_seller_stock_for_order(self, order_id: UUID | str) -> dict:
+        """
+        주문이 CONFIRMED 상태로 확정될 때 판매자 재고를 차감한다.
+        orders.inventory_deducted_at 값으로 중복 차감을 방지한다.
+        """
+        order_id_str = str(order_id)
+
+        try:
+            # 1. 주문 조회: 이미 재고 차감된 주문인지 확인
+            order_result = await asyncio.to_thread(
+                lambda: self.orders.select("id, inventory_deducted_at")
+                .eq("id", order_id_str)
+                .is_("deleted_at", None)
+                .limit(1)
+                .execute()
+            )
+
+            if not order_result.data:
+                return {
+                    "success": False,
+                    "error": "재고 차감 대상 주문을 찾을 수 없습니다.",
+                }
+
+            order = order_result.data[0]
+
+            # 이미 차감된 주문이면 다시 차감하지 않음
+            if order.get("inventory_deducted_at"):
+                return {
+                    "success": True,
+                    "message": "이미 재고가 차감된 주문입니다.",
+                    "already_deducted": True,
+                }
+
+            # 2. 주문 항목 조회
+            items_result = await asyncio.to_thread(
+                lambda: self.items.select("id, product_id, quantity")
+                .eq("order_id", order_id_str)
+                .execute()
+            )
+
+            order_items = items_result.data or []
+
+            if not order_items:
+                return {
+                    "success": False,
+                    "error": "주문 항목이 없어 재고를 차감할 수 없습니다.",
+                }
+
+            # 3. 먼저 전체 재고 충분 여부 검사
+            stock_checks = []
+
+            for item in order_items:
+                product_id = item.get("product_id")
+                quantity = item.get("quantity")
+
+                if not product_id or quantity is None:
+                    return {
+                        "success": False,
+                        "error": "주문 항목에 product_id 또는 quantity가 없습니다.",
+                    }
+
+                product_result = await asyncio.to_thread(
+                    lambda pid=product_id: self.client.table("products")
+                    .select("id, name, stock_quantity, status")
+                    .eq("id", str(pid))
+                    .is_("deleted_at", None)
+                    .limit(1)
+                    .execute()
+                )
+
+                if not product_result.data:
+                    return {
+                        "success": False,
+                        "error": f"상품을 찾을 수 없습니다. product_id={product_id}",
+                    }
+
+                product = product_result.data[0]
+                current_stock = int(product.get("stock_quantity") or 0)
+                order_quantity = int(quantity)
+
+                if current_stock < order_quantity:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"'{product.get('name')}' 재고가 부족합니다. "
+                            f"현재 재고: {current_stock}, 확정 수량: {order_quantity}"
+                        ),
+                    }
+
+                stock_checks.append({
+                    "product_id": str(product_id),
+                    "product_name": product.get("name"),
+                    "current_stock": current_stock,
+                    "order_quantity": order_quantity,
+                    "new_stock": current_stock - order_quantity,
+                })
+
+            # 4. 재고 차감 실행
+            deducted_items = []
+
+            for stock in stock_checks:
+                new_stock = stock["new_stock"]
+
+                if new_stock == 0:
+                    new_status = "OUT_OF_STOCK"
+                elif new_stock < 10:
+                    new_status = "LOW_STOCK"
+                else:
+                    new_status = "NORMAL"
+
+                await asyncio.to_thread(
+                    lambda s=stock, ns=new_stock, st=new_status: self.client.table("products")
+                    .update({
+                        "stock_quantity": ns,
+                        "status": st,
+                    })
+                    .eq("id", s["product_id"])
+                    .execute()
+                )
+
+                deducted_items.append({
+                    "product_id": stock["product_id"],
+                    "product_name": stock["product_name"],
+                    "before_quantity": stock["current_stock"],
+                    "deducted_quantity": stock["order_quantity"],
+                    "after_quantity": new_stock,
+                    "new_status": new_status,
+                })
+
+            # 5. 주문에 재고 차감 완료 시각 기록
+            now_utc = datetime.now(timezone.utc).isoformat()
+
+            await asyncio.to_thread(
+                lambda: self.orders.update({
+                    "inventory_deducted_at": now_utc,
+                })
+                .eq("id", order_id_str)
+                .execute()
+            )
+
+            return {
+                "success": True,
+                "message": "판매자 재고가 차감되었습니다.",
+                "deducted_items": deducted_items,
+                "inventory_deducted_at": now_utc,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"재고 차감 중 오류가 발생했습니다: {str(e)}",
+            }
 
     async def update_status(
         self, order_id: UUID, user_id: UUID, new_status: str
@@ -793,6 +926,18 @@ class OrderService:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="권한이 없습니다",
             )
+        
+        # CONFIRMED로 확정되는 순간 판매자 재고 차감
+        inventory_deduction_result = None
+
+        if new_status == "CONFIRMED":
+            inventory_deduction_result = await self._deduct_seller_stock_for_order(order_id)
+
+            if not inventory_deduction_result.get("success"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=inventory_deduction_result.get("error", "재고 차감에 실패했습니다."),
+                )
 
         await asyncio.to_thread(
             lambda: self.orders.update({"status": new_status})

@@ -13,6 +13,17 @@ import type { Message, MessageMetadata } from '@/types';
 
 interface MessageBubbleProps {
   message: Message;
+  /**
+   * 부모(채팅 페이지)에서 직접 주입하는 현재 사용자 id.
+   * 지정하면 useAuthStore 의 user 보다 우선해 본인/상대 판별에 사용한다.
+   *
+   * 배경: useAuthStore 는 Zustand persist 를 사용하므로 첫 렌더 시점에는
+   * 하이드레이션 전이라 user 가 null 일 수 있다. 그 결과 isMine 이 false 로
+   * 고정돼 모든 메시지가 왼쪽에 표시되는 버그가 발생한다 (새로고침 후엔 정상).
+   * 부모 페이지에서 user.id 를 prop 으로 내려주면 하이드레이션 타이밍과
+   * 무관하게 일관된 판별이 가능하다.
+   */
+  currentUserId?: string;
 }
 
 const ROLE_LABEL: Record<'SELLER' | 'BUYER', string> = {
@@ -28,12 +39,13 @@ function formatAmount(amount: number | undefined | null): string {
 /**
  * message_type 에 따라 분기 렌더하는 통합 메시지 컴포넌트.
  *
- * 본인/상대 판별: sender_id 와 현재 user.id 비교 우선.
+ * 본인/상대 판별: currentUserId(prop) → useAuthStore.user.id 순으로 우선.
  * (metadata.from_role 만으로는 같은 역할 두 사용자를 구분하지 못함)
  */
-export default function MessageBubble({ message }: MessageBubbleProps) {
+export default function MessageBubble({ message, currentUserId }: MessageBubbleProps) {
   const { user } = useAuthStore();
-  const isMine = !!user && message.sender_id === user.id;
+  const effectiveUserId = currentUserId ?? user?.id;
+  const isMine = !!effectiveUserId && message.sender_id === effectiveUserId;
   const type = message.message_type ?? 'TEXT';
   const metadata = (message.metadata ?? {}) as MessageMetadata;
 

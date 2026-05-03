@@ -639,6 +639,23 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 
 - **soft delete 컬럼 보유 테이블 갱신 (2026-04-29)**: `deleted_at` 보유 = `users, products, partners, orders, calendar_events, messages, subscriptions` (7개). `deleted_at` 미보유 = `order_items, chat_rooms, ai_conversations, subscription_items, negotiation_history, delivery_date_change_history, notifications`. 알림은 일시성 데이터라 soft delete 미적용 — 향후 TTL/archive 정책 추가 시 재검토.
 
+- **LLM 추론 category ↔ DB 저장 category 불일치 fallback 패턴 (2026-05-02, agent_tools.find_sellers_by_product 버그 수정)**: AI 도우미 도구가 `category` 인자를 받아 PostgREST 쿼리에 `eq("category", ...)` 로 박을 때, LLM 이 사용자 발화("옥수수 판매자 찾아줘")에서 추론한 카테고리(예: `GRAIN`)와 실제 DB 에 저장된 카테고리(예: `VEGETABLE`)가 어긋나면 결과가 0건이 되어 LLM 이 "판매자 없음"으로 잘못 응답한다. CHECK 제약이 13종으로 넓고(`fruit/vegetable/grain/...` 외 한국어 카테고리 포함), 동일 품목도 판매자별로 다른 카테고리로 등록될 수 있어 발생. 검증된 fallback 패턴 — 1차 조회 결과가 비어있고 category 가 `ALL` 이 아니면 category 필터만 제거하고 `product_name ilike` + `stock>0` + `deleted_at IS NULL` 로 2차 조회.
+  ```python
+  result = (query.gt("stock_quantity", 0).is_("deleted_at", None).execute())
+  products = result.data or []
+
+  # category 추론 실패 대비 fallback (product_name 은 유지하여 무관 품목 차단)
+  if not products and category and category.upper() != "ALL":
+      fallback_query = supabase.table("products").select("...")
+      if product_name:
+          fallback_query = fallback_query.ilike("name", f"%{product_name}%")
+      result = fallback_query.gt("stock_quantity", 0).is_("deleted_at", None).execute()
+      products = result.data or []
+  ```
+  - `category="ALL"` 호출은 1차에서 카테고리 필터를 안 걸므로 fallback 조건(`!= "ALL"`)에 막혀 중복 실행되지 않는다.
+  - `product_name` 필터는 fallback 에서도 유지 → "옥수수" 키워드 매칭이 살아있어 무관 상품 혼입 없음.
+  - 동일 함정이 잠재된 도구: `find_buyers_by_product`, `check_stock` 등 category 인자를 받는 모든 agent_tools 함수. 신규 도구 추가 시 동일 fallback 적용 권장.
+
 - **supabase-py 2.x `update().execute()` representation 응답 비신뢰 패턴 (2026-04-29 notification 읽음 처리 버그 수정)**: supabase-py 2.11.0 의 `client.table(...).update(...).execute()` 는 UPDATE 가 실제로 성공해도 `result.data == []` 로 빈 배열을 반환하는 케이스가 있다 (representation 헤더 누락 / RLS 의 SELECT-after-UPDATE 단계 차단 / 일부 응답 경로). service_role 키 호출이라 RLS 자체는 우회되지만, 클라이언트 라이브러리 내부에서 representation 이 빠질 수 있어 `len(result.data)` 또는 `result.data[0]` 으로 성공 판단을 하면 안 된다. 검증된 회피 패턴:
   ```python
   # 단건 UPDATE — pre-select 로 존재/권한 확인 → UPDATE → 재조회 (3 step)
