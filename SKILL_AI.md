@@ -725,3 +725,49 @@ create_subscription_from_order,
 - 검증 결과: AST OK, placeholder 23/23 보존(이번 작업 23종 — 이전 11에서 변경 없음), BASE/chat_node 양쪽 1회씩 추가 확인, 이전 가이드 27종 모두 보존(`grep -c` 27 카운트), git diff --stat = 80 insertions(+) (단순 추가, 기존 줄 수정 0).
 - **핵심 교훈 — 단일 enum 매핑도 schema 만 믿지 말고 본문에 한 번 더 박아야 일관성 확보**: `get_partners` schema description 에 이미 "거래처 목록", "내 거래처", "거래 중인 곳" 등 자연어 트리거가 명시돼 있어도, 사용자가 "보낸 신청" 같이 변형된 표현을 쓰면 LLM 이 status 인자를 누락하거나 status_in 으로 잘못 보내는 사례가 발생할 가능성이 있음. 본문 프롬프트의 5종 매핑이 backup 역할 — schema 가 1차, 본문이 2차 방어선. 단일 enum 도구도 다중 enum 도구와 동일하게 schema + 본문 2중 명시 패턴을 따라가는 것이 안전.
 - **핵심 교훈 — 두 도구가 같은 의도(예: 받은 거래처 요청 조회)를 처리할 수 있을 때는 우선순위를 본문에 명시**: `get_partners(status="PENDING_INCOMING")` 와 `get_incoming_partner_requests` 가 둘 다 같은 데이터를 돌려주는 상황에서 LLM 이 둘 중 어느 쪽을 부를지 헷갈리면 같은 라운드에 두 도구를 동시 호출하거나 매번 다른 도구를 부르는 일관성 문제가 생긴다. "단독 조회 시엔 get_incoming_partner_requests 우선, 다른 상태와 함께 묻는 맥락에서만 get_partners(status='PENDING_INCOMING')" 처럼 우선순위 단서를 본문 + 도구 description 양쪽에 똑같이 박아야 LLM 이 일관되게 따라간다.
+
+#### 도구 모듈화 리팩터링 — PR 0 인프라 신설 (2026-05-04 추가)
+- 배경: `backend/app/services/agent_tools.py` 가 41개 도구를 한 파일(약 16만 자)에 담고 있어 LLM·휴먼 모두 한 도구를 수정할 때 다른 도구의 컨텍스트를 끌고 가야 하는 구조. 도구 추가/수정 시 회귀 위험과 머지 충돌이 누적되는 패턴을 격리하기 위해 도메인별 분리 진행. 사용자 승인된 설계 = "단계별 PR 으로 점진 이동, PR 0 은 인프라만 — 회귀 위험 0".
+- PR 0 신설 파일 (5개, 절대 경로):
+  - `backend/app/services/agent/__init__.py` (30 lines) — 외부 공개 API. `TOOL_FUNCTION_MAP` / `TOOLS` / `TOOLS_CALENDAR` / `TOOLS_CHAT` / `INT_FIELDS` 5심볼만 export. 등록 트리거를 위해 `from . import tools` 가 첫 줄.
+  - `backend/app/services/agent/_registry.py` (104 lines) — `ToolEntry` (frozen dataclass: name/func/schema/groups/int_fields), `ToolRegistry` (글로벌 dict 기반, register/function_map/schemas_for/int_fields_union/all_entries 5메서드), `tool(...)` 데코레이터.
+  - `backend/app/services/agent/_shared.py` (10 lines) — cross-domain helper placeholder. PR 0 에서는 비어있고, 다음 PR 들에서 `_run_async_in_thread` 등 이동 예정.
+  - `backend/app/services/agent/tools/__init__.py` (20 lines) — 도메인 모듈 import 트리거. PR 0 에서는 모든 import 가 주석 처리 (도메인 모듈 0개).
+  - `backend/tests/test_agent_registry.py` (106 lines) — pytest 7개 케이스: register/lookup, 중복 RuntimeError, 미존재 그룹 빈 list, int_fields union, 빈 groups ValueError, list 타입 groups ValueError, multi-group 등록.
+- PR 0 의 핵심 가치 — **회귀 위험 0**: `agent_tools.py` / `orchestrator.py` / `chat_ws.py` 일절 수정 X. 기존 `from app.services.agent_tools import TOOL_FUNCTION_MAP` (orchestrator.py 라인 39) 그대로 동작. 새 `app.services.agent` 패키지는 import 만 가능하고 0개 도구만 노출 — 다음 PR 들에서 도메인 모듈을 점진적으로 옮긴 뒤 마지막 PR 에서 orchestrator import 경로를 한 줄 바꿈.
+- 검증 결과 — 5종 모두 통과:
+  1. AST 파싱: 5개 파일 모두 OK.
+  2. import 동작: `python -c "from app.services.agent import TOOL_FUNCTION_MAP, ..."` → `OK 0 tools registered` (PR 0 에서는 도구 0개로 정상).
+  3. 단위 테스트: `pytest tests/test_agent_registry.py --noconftest -v` → 7 passed in 0.01s. (`--noconftest` 는 기존 `tests/conftest.py` 가 httpx 등 외부 의존성 import 하는 문제 회피용 — 신규 인프라 테스트는 외부 의존성 없음.)
+  4. 기존 import 경로 보존: orchestrator.py 의 `from app.services.agent_tools import TOOL_FUNCTION_MAP` regex 로 존재 확인.
+  5. git diff --stat HEAD = 비어있음 (modifications 0개, 신규 untracked 만 5개).
+- 데코레이터 사용 패턴 (다음 PR 에서 적용):
+  ```python
+  # tools/product.py 예시
+  from .._registry import tool
+
+  @tool(
+      name="get_products",
+      description="...",
+      parameters={"type": "object", "properties": {...}, "required": [...]},
+      groups=("inventory_order",),
+      int_fields=frozenset({"min_stock", "max_stock"}),
+  )
+  def get_products(seller_id: str, ...) -> dict:
+      ...
+  ```
+  - 도구 본문 + schema 가 한 hunk 에 묶여 격리 — 한 도구 수정 시 다른 도구 컨텍스트 불필요.
+  - groups 는 비어있지 않은 tuple 강제. `groups=("inventory_order",)` 처럼 trailing comma 필수 (단일 그룹도 tuple 보장).
+  - `int_fields` 는 LLM 이 string 으로 보내는 인자를 자동 int 변환할 필드 — `@tool` 등록 시 도구별 int 변환 정책이 함수 정의와 같은 위치에 박혀 가독성 향상.
+- 다음 PR 계획 (도메인별 분리 — 8개 PR, 각 PR 회귀 영향 격리):
+  - PR 1: product (6개) — get_products / find_sellers_by_product / find_buyers_by_product / 등.
+  - PR 2: order (6개) — get_orders / create_order / update_order / update_order_status / delete_order / cancel_order.
+  - PR 3: chat (4개) — chat_send_message / chat_create_room / 등.
+  - PR 4: calendar (4개).
+  - PR 5: partner (7개).
+  - PR 6: subscription (4개).
+  - PR 7: negotiation (6개) — submit_counter_offer / accept_counter_offer / reject_counter_offer / submit_delivery_date_change / 등.
+  - PR 8: user (3개) — orchestrator import 경로를 `from app.services.agent import ...` 으로 한 줄 변경 + `agent_tools.py` 빈 shim 또는 삭제.
+- **핵심 교훈 — 인프라 PR 은 "회귀 0 보장" 자체가 핵심 가치**: 큰 리팩터링은 1단계 인프라 PR + N단계 점진 이동 PR 로 분리하면 각 단계마다 회귀 영향이 독립적으로 검증 가능. PR 0 의 인프라가 0개 도구만 노출하더라도 unit test 7종으로 인프라 자체의 정합성을 검증해두면 다음 PR 들에서 도메인 모듈을 추가할 때마다 test_agent_registry 가 회귀 sentinel 역할을 한다.
+- **핵심 교훈 — 새 패키지의 `__init__.py` 첫 줄에 `from . import tools  # noqa: F401`**: 데코레이터 기반 등록 시스템은 모듈 import 가 곧 등록 트리거이므로, 외부에서 `from app.services.agent import TOOL_FUNCTION_MAP` 만 호출해도 자동으로 모든 도메인 모듈이 import 되어야 한다. 패키지 `__init__.py` 첫 줄에 명시적으로 `from . import tools` 를 박고, `tools/__init__.py` 에서 모든 도메인 모듈을 명시 import. 이렇게 하면 외부 호출자는 import 순서를 신경 쓸 필요 없이 자동으로 등록이 완료된 상태의 registry 를 받는다.
+- **핵심 교훈 — `--noconftest` 로 인프라 단위 테스트를 외부 의존성 없이 실행**: 기존 `backend/tests/conftest.py` 는 httpx/Supabase 등 외부 패키지 import 가 있어 venv 미설치 환경에서 collect 단계에서 실패한다. 인프라 단위 테스트(`test_agent_registry.py`) 는 자체 import 가 stdlib + pytest 만 사용하므로 `pytest --noconftest` 로 conftest 우회 실행하면 venv 없이도 7케이스 모두 통과. 다음 PR 들의 도메인 모듈 단위 테스트도 동일 패턴(외부 의존성 mock 또는 회피)으로 작성하면 venv 없이 검증 가능.
