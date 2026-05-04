@@ -2,13 +2,14 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Star, Plus, MessageCircle, FileText, Trash2, Inbox } from 'lucide-react';
+import { Star, Plus, MessageCircle, FileText, Trash2, Inbox, Repeat } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import DataTable, { type Column } from '@/components/common/DataTable';
 import SearchFilterBar from '@/components/common/SearchFilterBar';
 import StatusBadge from '@/components/common/StatusBadge';
 import AddPartnerModal from '@/components/partners/AddPartnerModal';
 import PartnerDetailModal from '@/components/partners/PartnerDetailModal';
+import SubscriptionFormModal from '@/components/subscriptions/SubscriptionFormModal';
 import {
   useAcceptPartner,
   useDeletePartner,
@@ -41,6 +42,11 @@ export default function BuyerPartnersPage() {
   const [chatPendingId, setChatPendingId] = useState<string | null>(null);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [deletePendingId, setDeletePendingId] = useState<string | null>(null);
+  // 테스터 피드백 #6 — 거래처 목록에서 정기배송 신청 진입점
+  // 행의 "정기배송" 버튼 클릭 시 해당 거래처를 prefill 한 채로 모달 오픈.
+  // SubscriptionFormModal 은 partner prop 으로 seller_id/buyer_id/partner_id 를 자동 매핑.
+  const [subscriptionPartner, setSubscriptionPartner] =
+    useState<Partner | null>(null);
 
   // 서버 사이드 필터로 통일 (seller 페이지와 동일 패턴)
   // V1.5 Phase 3: is_favorite 필터는 백엔드 list_partners 가 미지원 → 클라이언트 필터링
@@ -334,8 +340,9 @@ export default function BuyerPartnersPage() {
       className: 'text-right',
       render: (item) => {
         const isPendingOutgoing = item.status === 'PENDING_OUTGOING';
+        const isActive = item.status === 'ACTIVE';
         return (
-          <div className="flex items-center justify-end gap-1">
+          <div className="flex flex-wrap items-center justify-end gap-1">
             <button
               onClick={(e) => {
                 e.stopPropagation();
@@ -354,8 +361,22 @@ export default function BuyerPartnersPage() {
               }`}
             >
               <MessageCircle className="h-3.5 w-3.5" />
-              채팅
+              <span className="hidden sm:inline">채팅</span>
             </button>
+            {/* 테스터 피드백 #6: ACTIVE 거래처에만 정기배송 빠른 신청 버튼 노출 */}
+            {isActive && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSubscriptionPartner(item);
+                }}
+                title="정기배송 신청"
+                className="inline-flex items-center gap-1 rounded-lg border border-primary-600 bg-white px-2.5 py-1 text-xs font-medium text-primary-700 hover:bg-primary-50"
+              >
+                <Repeat className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">정기배송</span>
+              </button>
+            )}
             {showCreateOrderAction && (
               <button
                 onClick={(e) => {
@@ -375,7 +396,7 @@ export default function BuyerPartnersPage() {
                 }`}
               >
                 <FileText className="h-3.5 w-3.5" />
-                주문 작성
+                <span className="hidden sm:inline">주문 작성</span>
               </button>
             )}
             <button
@@ -529,6 +550,16 @@ export default function BuyerPartnersPage() {
         onDelete={handleDeletePartner}
         deletePending={!!deletePendingId}
       />
+
+      {/* 테스터 피드백 #6 — 거래처 목록 행에서 직접 정기배송 신청 (PartnerDetailModal 통과 안 함) */}
+      {subscriptionPartner && (
+        <SubscriptionFormModal
+          isOpen={!!subscriptionPartner}
+          onClose={() => setSubscriptionPartner(null)}
+          partner={subscriptionPartner}
+          myRole="BUYER"
+        />
+      )}
     </div>
   );
 }

@@ -158,6 +158,16 @@ export default function CreateOrderModal({
     return sum + Math.max(0, q) * Math.max(0, p);
   }, 0);
 
+  // 납품 가능 최소 날짜: 오늘 + 1일 (KST 기준 YYYY-MM-DD)
+  const minDeliveryDate = useMemo(() => {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const y = tomorrow.getFullYear();
+    const m = String(tomorrow.getMonth() + 1).padStart(2, '0');
+    const d = String(tomorrow.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }, []);
+
   const handleSelectSeller = (member: UserPublicProfile) => {
     setSellerId(member.id);
     const label = member.company_name
@@ -215,6 +225,11 @@ export default function CreateOrderModal({
       return;
     }
 
+    if (!deliveryDate) {
+      setError('납품 희망일을 선택해 주세요.');
+      return;
+    }
+
     const validItems: OrderItemInput[] = [];
     for (const [idx, it] of items.entries()) {
       if (!it.product_id) {
@@ -242,7 +257,7 @@ export default function CreateOrderModal({
     try {
       await createOrder.mutateAsync({
         seller_id: sellerId,
-        delivery_date: deliveryDate || undefined,
+        delivery_date: deliveryDate,
         delivery_address: deliveryAddress || undefined,
         notes: notes || undefined,
         items: validItems,
@@ -351,18 +366,24 @@ export default function CreateOrderModal({
           )}
         </div>
 
-        {/* 납품일 */}
+        {/* 납품일 — 백엔드 V2 부터 필수 (2026-05-04) */}
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
             <label className="mb-1 block text-sm font-medium text-gray-700">
-              납품 희망일
+              납품 희망일 <span className="text-red-500">*</span>
             </label>
             <input
               type="date"
               value={deliveryDate}
               onChange={(e) => setDeliveryDate(e.target.value)}
+              min={minDeliveryDate}
+              required
+              aria-required="true"
               className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
             />
+            <p className="mt-1 text-xs text-gray-400">
+              판매자가 일정을 확인할 수 있도록 납품일을 반드시 선택해 주세요.
+            </p>
           </div>
         </div>
 

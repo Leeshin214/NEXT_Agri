@@ -7,6 +7,7 @@ import PageHeader from '@/components/common/PageHeader';
 import Modal from '@/components/common/Modal';
 import MessageBubble from '@/components/chat/MessageBubble';
 import OrderContextBanner from '@/components/chat/OrderContextBanner';
+import ChatRoomInquiryProduct from '@/components/chat/ChatRoomInquiryProduct';
 import PriceOfferPopover from '@/components/chat/PriceOfferPopover';
 import DeliveryDatePopover from '@/components/chat/DeliveryDatePopover';
 import ChatHeaderStatusControl from '@/components/chat/ChatHeaderStatusControl';
@@ -30,7 +31,9 @@ import type { PriceOfferPrefill } from '@/components/chat/PriceOfferPopover';
 export default function SellerChatPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user } = useAuthStore();
+  // isHydrated 까지 함께 구독해야 첫 렌더에서 user.id 가 undefined 인 채로
+  // MessageBubble 이 그려지는 race 를 막을 수 있다 (첫 메시지 좌측 정렬 버그).
+  const { user, isHydrated } = useAuthStore();
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
   const [showSummary, setShowSummary] = useState(false);
   const [summary, setSummary] = useState('');
@@ -159,6 +162,21 @@ export default function SellerChatPage() {
     !suggestionDismissed && alternativePartnersSuggestion ? alternativePartnersSuggestion : null;
   const previewAlternatives = (visibleSuggestion?.alternatives ?? []).slice(0, 3);
 
+  // hydration 미완료 또는 user 없는 상태에서는 메시지 본인/상대 판별이 불가능 →
+  // 잘못된 정렬로 첫 진입 직후 첫 메시지가 좌측 정렬되는 버그를 막기 위해 가드.
+  // AuthGuard 가 이미 user 를 채워주지만 store 구독 타이밍 차로 1프레임 비어 보일 수
+  // 있으므로 페이지 레벨에서도 한 번 더 확인한다.
+  if (!isHydrated || !user?.id) {
+    return (
+      <div>
+        <PageHeader title="채팅" description="바이어와 실시간으로 대화하세요" />
+        <div className="flex h-[calc(100vh-200px)] items-center justify-center rounded-xl bg-white text-sm text-gray-500 shadow-sm">
+          채팅을 불러오는 중...
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div>
       <PageHeader title="채팅" description="바이어와 실시간으로 대화하세요" />
@@ -255,6 +273,13 @@ export default function SellerChatPage() {
                     router.push(`/seller/orders?id=${id}`)
                   }
                 />
+              )}
+
+              {/* 문의 상품 미니카드 — 일반 대화방(linkedOrderId 없음)에서만 노출.
+                  주문방은 OrderContextBanner 가 컨텍스트를 제공하므로 중복 표시 안 함.
+                  SELLER 가 본 채팅방은 본인 상품에 대한 buyer 의 문의이므로 본인 상품 페이지로 라우팅. */}
+              {!linkedOrderId && (
+                <ChatRoomInquiryProduct messages={messages} role="seller" />
               )}
 
               {/* 대체 거래처 제안 배너 */}

@@ -194,11 +194,33 @@ _ALLOWED_SEARCH_ROLES = {"SELLER", "BUYER"}               # ADMIN 등 거부용
 ```python
 router = APIRouter(prefix="/products", tags=["products"])
 
-# GET /products - 상품 목록 (구매자: 전체 탐색, 판매자: 내 상품)
-# GET /products/{id} - 상품 상세
-# POST /products - 상품 등록 (판매자만)
-# PATCH /products/{id} - 상품 수정 (판매자만)
-# DELETE /products/{id} - 상품 삭제 (판매자만)
+# GET /products              - 상품 목록 (구매자: 전체 탐색, 판매자: 내 상품)
+# GET /products/{id}         - 상품 상세 (단순, ProductResponse — 호환성 유지)
+# GET /products/{id}/detail  - 상품 상세 페이지 전용 — 판매자 join + 거래 관계 + 같은 판매자 다른 상품 (B.1, 2026-05-04)
+# POST /products             - 상품 등록 (판매자만)
+# PATCH /products/{id}       - 상품 수정 (판매자만)
+# DELETE /products/{id}      - 상품 삭제 (판매자만)
+
+# GET /products/{id}/detail (B.1, 2026-05-04) — 상세 페이지 한 번 호출로 종합 컨텍스트
+# 응답: SuccessResponse[ProductDetailResponse]
+#   - ProductResponse 모든 필드
+#   - seller_name / seller_company    : users 임베딩 join (판매자 담당자명/회사명)
+#   - partner_relationship_status     : 현재 BUYER ↔ 판매자 partners.status
+#                                        값: 'ACTIVE' | 'PENDING_OUTGOING' | 'PENDING_INCOMING'
+#                                            | 'INACTIVE' | None (관계 없음)
+#                                        SELLER 본인이 자기 상품 조회 시 None.
+#   - previous_order_count            : BUYER ↔ 판매자 주문 총 건수 (CANCELLED/soft-deleted 제외)
+#   - completed_order_count           : 그 중 status='COMPLETED' 만
+#   - other_seller_products           : 같은 판매자의 다른 상품 (최대 4개, OUT_OF_STOCK 후순위)
+#                                        ProductMinimal: {id, name, category, unit, price_per_unit,
+#                                                          stock_quantity, status, image_url}
+# 가드:
+#   - 상품 없음 또는 soft-deleted → 404
+#   - 판매자 자체가 soft-deleted 면 SELLER 본인 외엔 404 (구매자 노출 차단)
+# 성능:
+#   - SELLER 본인 조회: products+seller 1쿼리 + other_products 1쿼리 = 2쿼리
+#   - BUYER 조회:       products+seller + partners + orders + other_products = 4쿼리
+# 서비스: product_service.get_product_detail(product_id, *, current_user_id, current_user_role)
 
 @router.get("", response_model=SuccessResponse[list[ProductResponse]])
 async def list_products(
@@ -679,6 +701,22 @@ pytest-cov==6.0.0
   )
   ```
 
+- **agent_tools 도구는 항상 sync — async service 호출 시 sync 재구현 (2026-05-04 partner 거래처 등록 도구 추가)**: `orchestrator._execute_tool` 은 `func(**tool_input)` 패턴으로 도구 함수를 호출한다 (await 없음). 따라서 `agent_tools.py` 의 모든 도구는 동기 함수여야 한다. 만약 호출하고 싶은 비즈니스 로직이 `partner_service.create_partner` 처럼 `async def` 라면, 그 안의 핵심 로직(자기 자신 차단, 양방향 PENDING 두 row INSERT, 23505 처리, partner_user 임베딩)을 supabase 클라이언트 동기 호출 패턴으로 재구현한다. 검증된 패턴:
+  ```python
+  def request_partner_registration(user_id: str, target_user_id: str, note: Optional[str] = None) -> dict:
+      # 1) 입력 검증 — UUID 형식 + 자기 자신 차단
+      if user_id == target_user_id: return {"success": False, "error": "self_registration_not_allowed"}
+      # 2) 상대방 존재 확인 — users.is_active=true AND deleted_at IS NULL
+      # 3) 사전 active row 체크 — partial unique index (user_id, partner_user_id) WHERE deleted_at IS NULL
+      #    → 23505 발생 전에 already_partner 응답
+      # 4) 본인 row INSERT (PENDING_OUTGOING) — 23505 catch 시 already_partner
+      # 5) 상대 row INSERT (PENDING_INCOMING) — 실패 시 본인 row hard-delete 보상
+      # 6) partner_user 임베딩 응답 — _build_partner_response 헬퍼 재사용
+  ```
+  - 다중 매칭 시 confirmation 응답: `{"success": False, "needs_confirmation": True, "candidates": [{user_id, name, company_name, role}, ...]}` — `send_chat_message` 의 needs_confirmation 패턴과 일관. LLM 이 후보 리스트를 사용자에게 안내하고 사용자 응답 후 UUID 기반 도구로 다시 호출하도록 유도.
+  - `_fix_id_params` 는 `user_id` 를 자동 강제 주입하므로 LLM 이 user_id 를 빠뜨려도 안전. `target_user_id` 는 LLM 이 보낸 값 보존 → 도구 내부 검증으로 invalid UUID/self/missing 을 각각 다른 error code 로 반환.
+  - 신규 도구 등록 4단계: (1) `agent_tools.py` 함수 추가, (2) `TOOL_FUNCTION_MAP` 등록, (3) `orchestrator.py` `TOOLS` 리스트에 OpenAI tool schema 추가, (4) 검증 — `python -c "from app.services.orchestrator import TOOLS; tool_names=[t['function']['name'] for t in TOOLS]; assert all(n in TOOL_FUNCTION_MAP for n in tool_names)"`.
+
 - **LangGraph 노드별 TOOLS 분리 시 시스템 프롬프트 동기화 필수 (2026-04-29 검증)**: 한 노드가 보유하던 도구를 별도 노드로 옮길 때(예: `inventory_order_node` 의 캘린더 도구 2개를 `calendar_data_node` 의 `TOOLS_CALENDAR` 로 이동), 도구 정의만 옮기고 원래 노드의 시스템 프롬프트를 그대로 두면 LLM 이 존재하지 않는 도구를 호출 시도해서 OpenAI API 가 tool 이름을 모른다고 거부하거나, 가이드와 실제 도구 노출이 어긋나 답변이 어색해진다. 반드시 다음 4 영역을 동시에 정리한다.
   - 시스템 프롬프트 안의 `[사용 가능한 도구]` 목록에서 옮긴 도구 이름 삭제
   - CASE 매트릭스에서 해당 도구 호출 케이스 통째 삭제 (CASE 번호 재정렬 권장)
@@ -935,7 +973,7 @@ pytest-cov==6.0.0
   - 동일 패턴이지만 "재시도" 가 의미있는 경우(예: order_number 자동생성)는 except 블록에서 재시도 후 최종 실패 시 변환.
 
 - **order_number UNIQUE 충돌 방어 패턴 — 랜덤 + 재시도**: `_generate_order_number` 가 `ORD-{YYYYMMDD}-{HHMMSS}` (시분초) 기반이면 동시 합의 자동 주문 (chat_ws._handle_consensus) 에서 같은 초 두 요청이 충돌해 23505 → 500. 두 단계로 방어:
-  1. 패턴을 `ORD-{YYYYMMDD}-{random.randint(1000,9999)}` 로 통일 (agent_tools.create_order 와 동일)
+  1. 패턴을 `ORD-{YYYYMMDD}-{random.randint(1000,9999)}` 로 통일
   2. INSERT 23505 catch → order_number 재생성 + 재시도 (max 3회). 그래도 실패 시 409 변환.
   ```python
   for attempt in range(3):
@@ -950,7 +988,31 @@ pytest-cov==6.0.0
   else:
       raise HTTPException(409, "주문 번호 생성 반복 실패")
   ```
-  적용 위치: `order_service.create_order` 와 `agent_tools.create_order` 양쪽 모두.
+  적용 위치: `order_service.create_order` 단일 진입점. 이전에는 `agent_tools.create_order` 가 직접 INSERT 하며 같은 패턴을 중복 구현했으나, 2026-05-04 부터 `order_service.create_order` 로 통합됨 (아래 auto_confirm 항목 참조).
+
+- **`order_service.create_order` V2 정책 — 모든 신규 주문은 QUOTE_REQUESTED 로 시작 (2026-05-04 갱신)**: 가격이 일치해도 즉시 CONFIRMED 자동 진입을 제거. 판매자 검토 후 `update_status(CONFIRMED)` 시점에 재고 차감. `auto_confirm=True` 의 의미는 "단가 일치 시 즉시 확정" 이 아니라 "단가 차이가 있을 때 자동 협상(카운터오퍼) 발사" 로 좁혀짐. 라우터(POST /orders) 는 그대로 `auto_confirm=False` (기본) 로 호출해 UI 모달 흐름 유지.
+  ```python
+  async def create_order(self, buyer_id: UUID, data: dict, auto_confirm: bool = False) -> dict:
+      # V2 (2026-05-04): initial_status = "QUOTE_REQUESTED" — 항상 동일.
+      # auto_confirm=True 면 products.price_per_unit 일괄 조회 → 라인별 비교
+      #   "MATCH"     — 모든 라인 unit_price >= price_per_unit
+      #                  → QUOTE_REQUESTED INSERT + "주문 견적 도착" SYSTEM 메시지
+      #                    (상품/단가/납품일 정리, 판매자 수락 대기)
+      #   "NEGOTIATE" — 한 라인이라도 unit_price < price_per_unit
+      #                  → QUOTE_REQUESTED INSERT + 자동 카운터오퍼 → NEGOTIATING 전환
+      # auto_confirm=False (UI 모달 / API 직접 흐름)
+      #   → QUOTE_REQUESTED INSERT + "새 견적 요청" SYSTEM 메시지
+      #
+      # 재고 차감은 update_status(CONFIRMED) 시점에 일어남 (create_order 본문에서 호출 X)
+  ```
+  - 호출처별 정책: 라우터 = `auto_confirm` 미전달(기본 False); `agent_tools.create_order` = `auto_confirm=True` 명시; chat_ws consensus = agent_tools 경유로 자동 적용.
+  - `agent_tools.create_order` 는 자체 INSERT 하지 않고 `order_service.create_order(buyer_id, data, auto_confirm=True)` 로 위임. product_id UUID/이름 해석 + seller 소속 검증 로직만 유지.
+  - 반환 dict 의 `auto_confirmed` 키는 V2 부터 항상 False (호환성용 키 유지). LLM 시스템 프롬프트는 status 값으로 분기.
+  - NEGOTIATE 분기 자동 카운터오퍼 실패는 logger.error 만 + 주문은 QUOTE_REQUESTED 로 살아남음 (best-effort).
+  - 마이그레이션 영향: SHA `76c7736` 의 즉시-확정/재고-차감 코드는 이번 변경으로 제거됨. 기존 INSERT 직후 재고 차감 검증 테스트는 update_status(CONFIRMED) 분기 검증으로 이전 필요.
+  - 검증: AST 파싱 + venv import + Pydantic Required 검증 (`OrderCreate.delivery_date.is_required() == True`) + TOOLS schema required list 에 `delivery_date` 포함 확인.
+
+- **`OrderCreate.delivery_date` Required (2026-05-04)**: V2 부터 모든 주문 생성 흐름에서 납품일 필수. POST /orders 라우터는 422 자동 반환, agent_tools.create_order 는 빈 값 가드 (`{"success": False, "error": "..."}`) 로 명시 차단, orchestrator TOOLS create_order required list 에 `delivery_date` 추가. chat_ws consensus 흐름은 이전부터 `_validate_consensus_extracted` 에서 필수 검증 중이라 변경 없음.
 
 - **PostgREST 임베딩으로 N+1 제거 (2026-04-27 검증)**: orders 같은 부모 테이블 응답에 buyer/seller(users), items+product 정보를 함께 내려야 할 때, 서비스 안에서 N개의 자식 select 를 따로 부르는 대신 PostgREST 의 select 임베딩 한 번으로 처리한다. count="exact" 와 임베딩이 동시에 잘 동작한다 (HTTP 206 + content-range 헤더 정상).
   ```python

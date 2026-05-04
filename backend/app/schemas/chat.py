@@ -8,6 +8,10 @@ from pydantic import BaseModel, Field
 class ChatRoomCreate(BaseModel):
     partner_user_id: UUID
     order_id: Optional[UUID] = None
+    # 상품 문의로 진입한 경우 — 새로 생성되는 채팅방의 첫 시스템 메시지 metadata 에
+    # {kind: 'product_inquiry', inquiry_product_id} 로 저장됨 (B.2, 2026-05-04).
+    # 기존 채팅방을 반환하는 경우엔 이 필드는 무시 (메시지 자동 발송 X).
+    inquiry_product_id: Optional[UUID] = None
 
 
 class ChatRoomResponse(BaseModel):

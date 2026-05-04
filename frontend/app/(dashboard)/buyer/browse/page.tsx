@@ -60,12 +60,17 @@ export default function BuyerBrowsePage() {
 
     try {
       // 1. 채팅방 생성 (seller_id = product.seller_id)
+      //    inquiry_product_id 를 함께 보내면, 백엔드가 새 채팅방인 경우 첫 시스템 메시지의
+      //    metadata 에 {kind: 'product_inquiry', inquiry_product_id} 를 자동 저장한다.
+      //    채팅 페이지 진입 시 헤더 미니카드 렌더에 사용됨.
       const roomRes = await createChatRoom.mutateAsync({
         partner_user_id: product.seller_id,
+        inquiry_product_id: product.id,
       });
       const roomId = roomRes.data.id;
 
-      // 2. 시스템 메시지 자동 발송
+      // 2. 사용자 평문 첫 메시지 — 백엔드 시스템 메시지와 별개로 사용자 인사 1건 보냄
+      //    (기존 UX 유지). last_message 도 이 텍스트로 갱신됨.
       const categoryLabel =
         CATEGORY_OPTIONS.find((c) => c.value === product.category)?.label ||
         product.category;
@@ -81,6 +86,11 @@ export default function BuyerBrowsePage() {
     } finally {
       setChatRequestingId(null);
     }
+  };
+
+  // 카드 자체 클릭 → 상세 페이지로
+  const handleCardClick = (product: Product) => {
+    router.push(`/buyer/browse/${product.id}`);
   };
 
   const handleQuoteRequest = (product: Product) => {
@@ -165,7 +175,16 @@ export default function BuyerBrowsePage() {
             return (
               <div
                 key={product.id}
-                className="group overflow-hidden rounded-xl border border-gray-100 bg-white shadow-sm transition-shadow hover:shadow-md"
+                onClick={() => handleCardClick(product)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    handleCardClick(product);
+                  }
+                }}
+                className="group cursor-pointer overflow-hidden rounded-xl border border-gray-100 bg-white shadow-sm transition-shadow hover:shadow-md focus:outline-none focus:ring-2 focus:ring-primary-500"
               >
                 {/* 이미지 영역 */}
                 <div className="flex h-40 items-center justify-center bg-gray-50">
@@ -211,10 +230,15 @@ export default function BuyerBrowsePage() {
                     </span>
                   </div>
 
-                  {/* 액션 버튼 — 문의(채팅) + 견적 요청(모달) */}
+                  {/* 액션 버튼 — 문의(채팅) + 견적 요청(모달).
+                      카드 자체 클릭이 상세 라우팅이므로 버튼 클릭은 stopPropagation 으로
+                      카드 클릭과 충돌 방지. */}
                   <div className="flex gap-2">
                     <button
-                      onClick={() => handleChatInquiry(product)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleChatInquiry(product);
+                      }}
                       disabled={isOutOfStock || !!chatRequestingId}
                       className={cn(
                         'flex flex-1 items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-xs font-medium transition-colors',
@@ -229,7 +253,10 @@ export default function BuyerBrowsePage() {
                       {isChatRequesting ? '연결 중...' : '문의'}
                     </button>
                     <button
-                      onClick={() => handleQuoteRequest(product)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleQuoteRequest(product);
+                      }}
                       disabled={isOutOfStock}
                       className={cn(
                         'flex flex-1 items-center justify-center gap-1 rounded-lg px-2 py-1.5 text-xs font-medium transition-colors',
