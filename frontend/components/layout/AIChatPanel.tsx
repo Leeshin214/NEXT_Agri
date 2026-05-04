@@ -1,13 +1,17 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import { Bot, Send, Sparkles, ChevronLeft, ChevronRight, AlertTriangle } from 'lucide-react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Bot, Send, Sparkles, ChevronLeft, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
 import { useAIStream } from '@/hooks/useAIStream';
 import { useAuthStore } from '@/store/authStore';
 import { useUIStore } from '@/store/uiStore';
 import { useAIChatStore } from '@/store/aiChatStore';
 import { useAIHistory } from '@/hooks/useAIHistory';
 import { sellerQuickPrompts, buyerQuickPrompts } from '@/constants/aiPrompts';
+
+// 사용자가 의도적으로 위로 스크롤한 것으로 간주할 임계값(px).
+// 이 값보다 멀면 자동 스크롤을 멈추고 "맨 밑으로" 버튼을 노출한다.
+const BOTTOM_THRESHOLD_PX = 80;
 
 export default function AIChatPanel() {
   const [input, setInput] = useState('');
@@ -21,7 +25,8 @@ export default function AIChatPanel() {
   // AI 히스토리 hydrate 트리거 + store 의 turns 구독
   useAIHistory(100);
   const turns = useAIChatStore((s) => s.turns);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const [isAtBottom, setIsAtBottom] = useState(true);
   const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
   const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
 
@@ -41,10 +46,46 @@ export default function AIChatPanel() {
     return () => window.removeEventListener('resize', handleResize);
   }, [setAIPanelOpen]);
 
-  // turns 변화 또는 마지막 응답 변화 시 자동 스크롤
+  // 메시지 컨테이너 스크롤 위치 추적 — 사용자가 위로 스크롤했는지 판별
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [turns.length, lastTurn?.response]);
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+      setIsAtBottom(distance < BOTTOM_THRESHOLD_PX);
+    };
+    // 초기 한 번 — 사이즈 계산 직후 정확한 상태로 진입
+    onScroll();
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [aiPanelOpen]);
+
+  const scrollToBottom = useCallback((smooth = true) => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto',
+    });
+  }, []);
+
+  // 패널이 처음 열리거나 첫 turns 가 hydrate 되었을 때 즉시 맨 아래로
+  // (페이지 전환 후 패널이 다시 보일 때 최신 메시지가 보이도록 보장)
+  useEffect(() => {
+    if (!aiPanelOpen) return;
+    if (turns.length === 0) return;
+    // 마운트 직후 레이아웃 확정 후 1프레임 뒤 즉시 점프
+    const raf = requestAnimationFrame(() => scrollToBottom(false));
+    return () => cancelAnimationFrame(raf);
+    // turns.length 0→N 전환 시에도 동일하게 동작
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiPanelOpen, turns.length === 0]);
+
+  // 새 메시지 / 응답 갱신 시: 사용자가 바닥 근처에 있을 때만 자동 따라가기
+  useEffect(() => {
+    if (!isAtBottom) return;
+    scrollToBottom(true);
+  }, [turns.length, lastTurn?.response, isAtBottom, scrollToBottom]);
 
   const handleSubmit = (text: string) => {
     if (!text.trim()) return;
@@ -95,7 +136,7 @@ export default function AIChatPanel() {
       </div>
 
       {/* 응답 영역 */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
+      <div ref={messagesContainerRef} className="flex-1 overflow-y-auto p-3 space-y-1.5">
         {turns.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <Bot className="h-10 w-10 text-gray-200" />
@@ -153,13 +194,25 @@ export default function AIChatPanel() {
                 </div>
               );
             })}
-            <div ref={messagesEndRef} />
           </>
         )}
       </div>
 
-      {/* 입력창 */}
-      <div className="border-t border-gray-200 p-3 flex-shrink-0">
+      {/* 입력창 — 위에 "맨 밑으로 내리기" 버튼이 absolute 로 떠 있음 */}
+      <div className="relative border-t border-gray-200 p-3 flex-shrink-0">
+        {/* 맨 밑으로 내리기 버튼 — 바닥에서 멀어졌을 때만 노출 */}
+        <button
+          type="button"
+          onClick={() => scrollToBottom(true)}
+          aria-label="맨 아래로 이동"
+          className={`absolute -top-10 left-1/2 -translate-x-1/2 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-600 shadow-md hover:bg-gray-50 hover:text-primary-600 transition-opacity duration-200 ${
+            isAtBottom || turns.length === 0
+              ? 'pointer-events-none opacity-0'
+              : 'opacity-100'
+          }`}
+        >
+          <ChevronDown className="h-4 w-4" />
+        </button>
         <div className="flex gap-2">
           <input
             value={input}

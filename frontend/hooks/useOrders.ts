@@ -3,6 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import type {
+  CancelRequest,
   CounterOffer,
   CounterOfferCreate,
   Order,
@@ -101,6 +102,33 @@ export function useCancelOrder(orderId: string) {
   return useMutation({
     mutationFn: ({ reason }: { reason: string }) =>
       api.patch<SuccessResponse<Order>>(`/orders/${orderId}/cancel`, { reason }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+      queryClient.invalidateQueries({ queryKey: ['order', orderId] });
+    },
+  });
+}
+
+export function useCreateCancelRequest(orderId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ reason }: { reason: string }) =>
+      api.post<SuccessResponse<CancelRequest>>(`/orders/${orderId}/cancel-request`, { reason }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['orders'] });
+      queryClient.invalidateQueries({ queryKey: ['order', orderId] });
+    },
+  });
+}
+
+export function useRespondCancelRequest(orderId: string, requestId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ action }: { action: 'approve' | 'reject' }) =>
+      api.patch<SuccessResponse<CancelRequest>>(
+        `/orders/${orderId}/cancel-request/${requestId}/respond`,
+        { action }
+      ),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['orders'] });
       queryClient.invalidateQueries({ queryKey: ['order', orderId] });

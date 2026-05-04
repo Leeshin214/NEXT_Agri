@@ -1,6 +1,6 @@
 'use client';
 
-import { Check, X, DollarSign, Package, Ban } from 'lucide-react';
+import { Check, X, DollarSign, Package, Ban, AlertTriangle, XCircle } from 'lucide-react';
 import {
   useAcceptCounterOffer,
   useRejectCounterOffer,
@@ -92,6 +92,12 @@ export default function MessageBubble({
       return (
         <OrderCancelledCard metadata={metadata} content={message.content} />
       );
+
+    case 'CANCEL_REQUESTED':
+      return <CancelRequestedCard metadata={metadata} />;
+
+    case 'CANCEL_REQUEST_REJECTED':
+      return <CancelRequestRejectedCard metadata={metadata} />;
 
     case 'DELIVERY_DATE_CHANGE':
       return (
@@ -521,6 +527,49 @@ function OrderCancelledCard({
           content && (
             <p className="whitespace-pre-wrap text-xs text-red-800">{content}</p>
           )
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── CANCEL_REQUESTED ──────────────────────────────────────────────
+
+function CancelRequestedCard({ metadata }: { metadata: MessageMetadata }) {
+  const reason = (metadata as Record<string, unknown>).reason as string | undefined;
+  return (
+    <div className="flex justify-center">
+      <div className="w-full max-w-[85%] rounded-xl border border-orange-300 bg-orange-50 p-3">
+        <div className="mb-1 flex items-center gap-2">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-orange-200 text-orange-800">
+            <AlertTriangle className="h-3.5 w-3.5" />
+          </span>
+          <p className="text-sm font-medium text-orange-900">취소 요청이 접수됐습니다</p>
+        </div>
+        {reason && (
+          <p className="whitespace-pre-wrap text-xs text-orange-800">사유: {reason}</p>
+        )}
+        <p className="mt-1 text-[11px] text-orange-600">판매자 승인 후 취소 처리됩니다.</p>
+      </div>
+    </div>
+  );
+}
+
+// ─── CANCEL_REQUEST_REJECTED ────────────────────────────────────────
+
+function CancelRequestRejectedCard({ metadata }: { metadata: MessageMetadata }) {
+  const reason = (metadata as Record<string, unknown>).reason as string | undefined;
+  return (
+    <div className="flex justify-center">
+      <div className="w-full max-w-[85%] rounded-xl border border-gray-300 bg-gray-50 p-3">
+        <div className="mb-1 flex items-center gap-2">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gray-200 text-gray-700">
+            <XCircle className="h-3.5 w-3.5" />
+          </span>
+          <p className="text-sm font-medium text-gray-900">취소 요청이 거절됐습니다</p>
+        </div>
+        {reason && (
+          <p className="whitespace-pre-wrap text-xs text-gray-600">요청 사유: {reason}</p>
         )}
       </div>
     </div>

@@ -487,7 +487,7 @@ class AgentState(TypedDict):
 - 다른 노드(inventory_order/calendar_data/calendar_reason)는 모두 `state["history"]` 를 직접 사용 → 오염된 messages 를 다시 필터링할 필요 없음
 - `AgentOrchestrator.run()` 에서 `clean_history` 를 한 번만 만들어 `history` / `messages` 양쪽에 주입
 
-#### TOOL_FUNCTION_MAP 전체 목록 (36개, 2026-05-04 갱신)
+#### TOOL_FUNCTION_MAP 전체 목록 (41개, 2026-05-04 갱신)
 ```
 # 상품/재고
 get_products, check_stock, update_stock, create_product, delete_product, update_product,
@@ -499,8 +499,12 @@ find_sellers_by_product, find_buyers_by_product, find_alternative_partners, get_
 open_chat_room, get_chat_rooms, get_chat_messages, send_chat_message,
 # 캘린더
 get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event,
-# 거래처 등록 (양방향 PENDING)
+# 거래처 (조회 / 등록 / 응답)
+get_partners,                                  # 2026-05-04 신규 — ACTIVE/PENDING_OUTGOING/PENDING_INCOMING/INACTIVE 조회
 request_partner_registration, request_partner_registration_by_name,
+get_incoming_partner_requests, accept_partner_request, reject_partner_request,
+# 정기배송 받은 요청
+get_incoming_subscription_requests,
 # 카운터오퍼 / 납품일 변경 (2026-05-04 신규)
 submit_counter_offer, accept_counter_offer, reject_counter_offer,
 submit_delivery_date_change, accept_delivery_date_change, reject_delivery_date_change,
@@ -618,3 +622,152 @@ create_subscription_from_order,
 - 응답 표현 예시를 가이드에 박을 때 "○○ N단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일." 처럼 수치 (수량·가격·날짜) 를 먼저 풀어서 제시하는 형식이, "주문 견적이 발송됐고 가격은 ₩○○이고 납품일은 ○월 ○일입니다" 처럼 산문체로 풀어쓰는 형식보다 LLM 모방률이 높음.
 - 이유: GPT-4o-mini 는 가이드의 마지막 예시 문장을 그대로 따라가는 경향이 있어, **명사 + 수치 + 핵심 정보를 마침표로 끊어 나열**하는 패턴이 채팅창에서 가독성도 좋고 LLM 도 잘 재현함.
 - 반대로 부정형 ("절대 X 라고 말하지 마라") 은 한 번 더 강조 — `[응답 표현]` 섹션 본문 + 헤더 옆 강조 + 가이드 맨 마지막 문장 3중으로 박아야 LLM 이 무의식적으로 옛 표현으로 돌아가는 걸 막을 수 있음 (이번 작업에서 "주문이 확정됐습니다 절대 금지"를 3곳에 분산 명시).
+
+#### 주문 대상 판매자 식별 절차 + 도구 실패 시 환각 방지 (2026-05-04 갱신 — 우선순위 재정의)
+- 실제 사용자 시나리오 실패: "test3한테 감자 10kg 주문해줘" → AI 가 `create_order(seller_id="test3")` 처럼 이름을 UUID 자리에 직접 넣어 호출 실패 + 그 후 환각으로 컨텍스트 메모리에 있던 다른 주문(동해 참치·참나물 등)을 줄줄이 노출. 두 가지 결함을 동시에 강제로 차단해야 한다.
+- (1) **schema description 강화** (orchestrator.py 라인 ~423-434): `create_order` 의 `seller_id` 와 `buyer_id` description 에 "이름/회사명 평문 금지", "get_user_profile / find_sellers_by_product 로 UUID 조회 후 사용", "UUID 아닌 값은 백엔드가 즉시 실패시킨다"를 명시. JSON schema description 은 OpenAI 가 tool_call 인자 생성 시점에 직접 참조하므로, 이 위치에서 막는 것이 BUYER_ROLE_APPENDIX 본문 가이드보다 LLM 준수율이 더 높다.
+- (1.5) **find_sellers_by_product schema description 보강** (라인 ~520): description 끝에 "응답의 seller_id 는 UUID 형식이라 create_order 의 seller_id 에 그대로 사용 가능. 사용자가 직후 발화에서 회사명/담당자만 언급해도 이 응답을 컨텍스트로 활용해 다시 get_user_profile 을 호출할 필요 없이 매칭되는 항목의 seller_id 를 그대로 쓸 것" 추가. find_*_by_product 응답을 다음 발화의 컨텍스트로 활용하는 패턴을 schema 차원에서 LLM 에게 알려줌.
+- (2) **BUYER_ROLE_APPENDIX `[🚨 주문 대상 판매자 식별 절차 — 매우 중요]` 섹션 (라인 ~1770)** — 우선순위 명시 버전. 1단계 get_user_profile 부터 부르라고 박았던 옛 가이드는 LLM 을 ILIKE 매칭 실패로 유도해 "거래처 찾을 수 없다" 잘못된 응답 양산. **컨텍스트에 이미 seller_id 가 있으면 그것부터 쓰는 게 정답**. 새 우선순위 4단계로 재구성:
+  - **[1순위 — 직전 대화 컨텍스트 활용]** 직전 find_sellers_by_product / find_buyers_by_product 응답의 seller_id 를 그대로 사용. seller_name / seller_company / username 매칭만 해서 create_order 호출. **이미 컨텍스트에 UUID 가 있는데 굳이 get_user_profile 다시 부르지 마라**.
+  - **[2순위 — 새로 검색]** 직전 컨텍스트에 판매자 목록이 없거나 사용자가 새 품목 언급 → find_sellers_by_product(category, product_name) 호출 → seller_id 사용.
+  - **[3순위 — get_user_profile 폴백]** 사용자가 품목 정보 없이 거래처 이름만 언급해서 find_sellers_by_product 를 못 부르고 직전 컨텍스트에도 매칭이 없을 때**만** get_user_profile(username/company_name) 호출. ILIKE 부분 일치라 정확 매칭 안 될 수 있음을 명시. 0건이면 사용자에게 정확한 이름 되묻기.
+  - **[금지 사항]** 명시적 단정문 4종: 이름을 seller_id 에 그대로 넣지 마라 / UUID 추측 금지 / 응답에 이미 seller_id 가 있는데 get_user_profile 다시 부르지 마라 / 안 물은 다른 정보(이전 주문, 다른 거래처) 끌어오지 마라.
+  - **[다중 매칭]** 1순위/2순위 결과에서 후보 2명 이상이면 도구 호출 X, 사용자에게 자연체로 되묻기.
+- (3) **chat_node 시스템 프롬프트 동일 섹션 (라인 ~2677)** 에도 동일한 4단계(우선순위 + 금지 + 다중매칭) 매핑을 직접 명시. chat intent 라우팅 시 가장 자주 호출되는 노드라 BUYER_ROLE_APPENDIX 와 별도로 박음 — 5중 명시 패턴 일부.
+- (4) **AGENT_BASE_SYSTEM 신규 섹션** `[도구 실패 시 응답 가이드 — 매우 중요 (환각 방지)]` (라인 ~1591 근방, [재고 검색 vs 대체 거래처 추천 분리 원칙] 직후, [주의사항] 직전): SELLER/BUYER 합성본 양쪽에 자동 반영. 핵심 원칙 6개 — (a) 실패 사실+원인을 한 줄, (b) 안 물은 다른 정보 끌어와 늘어놓지 마라, (c) 다음 액션 1개만 짧게, (d) 실패를 성공으로 포장 금지, (e) 컨텍스트 메모리의 다른 주문/거래처 자기멋대로 노출 금지, (f) error 코드 영문 그대로 노출 금지.
+- (5) **chat_node** 에도 동일한 [도구 실패 시 응답 가이드] 섹션을 직접 명시. BASE 안에서도 들어가지만, chat 라우팅이 가장 자주 도구 실패를 마주치는 노드라 중복 명시 — 5번 정도가 LLM 망각을 가장 잘 방어하는 표준 패턴 (가독성/마크다운 금지 가이드도 같은 5중 패턴).
+- 검증 결과: AST OK, placeholder 11개 모두 보존 (`role_label`, `role_label_short`, `case1/2/10/11_action`, `auth_product_rule`, `ambiguity_modify_rule`, `user_id`, `company_name`, `user_name`), BUYER 합성본 잔여 placeholder 0, SELLER 합성본 잔여 placeholder 0, BUYER 전용 가이드(`주문 대상 판매자 식별 절차`)가 SELLER 합성본에 누출 0건, 도구 실패 가이드는 BASE 에 박힌 결과 SELLER/BUYER 양쪽 자동 반영 확인. 이전 가이드 14종(가독성, 핵심 대화 원칙, 대체 거래처, send_chat_message needs_confirmation, 자연어→카드 도구, 안전장치, 재고 vs 대체, 구매자 주문/견적, 단가/납품일 필수, 주문 결과 응답 표현, 납품일 변경, 채팅방 연결, 신규 구매자 발굴, 카드 도구 매핑) 모두 보존.
+- 회귀 검증 통과: "자동 확정 / 협상 분기", "auto_confirmed=true", "재고를 자동 차감한다", "[🚨 단가 자동 조회 강제]" 등 옛 표현 모두 미존재.
+- 핵심 교훈: **이름→UUID 매핑 가이드는 LLM 본문 프롬프트보다 schema description 에 박아야 효과 있음.** OpenAI tool_call 은 schema 의 description 을 인자 생성 직전에 다시 읽어 들이므로, "이 필드는 UUID 만 받음"을 schema 차원에서 못 박으면 LLM 이 평문(이름)을 넣을 확률이 거의 사라진다. 본문 프롬프트는 보조 — schema 가 1차 방어선.
+- 핵심 교훈 2: **도구 실패 시 환각 방지는 "안 물은 정보 끌어오지 마라"를 명시적으로 박아야 함.** 단순히 "에러를 정확히 안내하라"만 박으면 LLM 이 친절을 가장해 컨텍스트 메모리의 다른 주문/거래처를 줄줄이 추가로 노출한다. "사용자가 직접 물은 대상의 에러만 답한다"를 본문에 단정문으로 박아야 멈춘다.
+- 핵심 교훈 3 (2026-05-04 신규 — 우선순위 가이드 회귀 사고에서 학습): **"가장 정확한 도구를 부르라"는 본능적 직관이 오히려 함정**. 옛 가이드가 "1단계: get_user_profile 호출"을 우선순위 맨 위에 둔 이유는 "사용자 이름 → user 테이블 정확 조회"가 가장 직관적이기 때문이지만, 실제로는 (a) ILIKE 부분 일치라 정확히 매칭 안 될 수 있고 (b) 직전 대화 컨텍스트의 seller_id 를 무시하게 만들어 이미 확보된 UUID 를 버리고 다시 검색하는 비효율 + 매칭 실패 흐름을 유발했다. **"컨텍스트에 이미 답이 있으면 그것부터 쓰라"가 1순위여야 한다.** LLM 가이드를 쓸 때 "어느 도구를 부르라" 가 아니라 "현재 상태 → 가장 적은 도구 호출로 정답 도달"의 결정 트리를 먼저 박아야 한다. find_*_by_product 같이 응답에 UUID 가 포함된 도구는 그 응답이 곧 다음 라운드의 컨텍스트가 됨을 schema description 에서도 함께 알려주면 LLM 이 자연스럽게 컨텍스트 활용 흐름을 따라간다.
+- 핵심 교훈 4 (2026-05-04 — 명령형 어조의 효과): "다시 부르지 마라" 같은 부정 명령형 + 구체 예시("seller_id='test3' 같이 넣지 마라")를 같이 박는 것이 "권장합니다" 같은 산문체보다 LLM 준수율이 훨씬 높음. **금지 사항은 본문에 단정문 + 헤더 옆 강조 + 구체 anti-example** 3중 패턴이 표준 — 이번 작업에서 [금지 사항] 섹션에 4종 단정문을 박아 옛 우선순위로 회귀하지 않도록 봉쇄.
+
+#### get_orders 도구 — service 위임 + status_in 다중 상태 (2026-05-04 추가)
+- 기존 `agent_tools.get_orders` 가 (1) `.is_("deleted_at", None)` 누락으로 삭제된 주문도 응답에 포함되고 (2) 단일 `status` 만 받아 사용자의 "진행 중인 주문" (UI 의 5상태 다중 정의: `QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING`) 같은 발화를 표현 못하던 두 가지 결함이 있었다 → `order_service.list_orders` 위임 패턴으로 동시 해결.
+- **위임 패턴**: 도구 본문에서 직접 `supabase.table("orders").select(...)` 를 호출하지 않고 `_run_async_in_thread(lambda: order_service.list_orders(user_id=..., role=..., status=status, status_in=status_in, page=1, limit=20))` 으로 service 의 비동기 메서드 호출. service 가 이미 `deleted_at IS NULL` + `status_in` 다중 + 페이지네이션 + buyer/seller/items 임베딩을 일관 처리하므로 도구는 응답을 LLM-친화 형식으로 재가공만 한다.
+- **시그니처**: `def get_orders(user_id, role, status: Optional[str]=None, status_in: Optional[list[str]]=None) -> dict`. 기존 호출 (`status=...`) 은 그대로 동작 (하위호환). status_in 우선 적용은 service 레이어에서 결정.
+- **schema description 강화** (orchestrator.py `TOOLS` 의 `get_orders` 엔트리): "사용자가 '진행 중', '활성', '내 주문' 등 표현 시 `status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING']` 로 호출. 완료/취소 제외" 를 명시. enum 도 7종 모두 박음 (단일 `status` 와 동일). LLM 이 schema description 을 tool_call 인자 생성 직전에 직접 읽으므로, 다중 상태 매핑은 본문 프롬프트보다 schema 에 박는 것이 준수율이 높다.
+- **LLM 응답 contract 보존**: `_flatten_order_row` 가 채워주는 `items: [...]` 에서 `product_name`/`product_unit`/`quantity`/`unit_price` 를 다시 모아 `product_summary` / `primary_product_name` / `primary_quantity` / `primary_unit_price` / `primary_subtotal` / `item_summary` / `items_count` 7종 derived 필드를 도구 응답에 추가한다 — 시스템 프롬프트 (`AGENT_BASE_SYSTEM` 라인 1643-1644 "product_summary 또는 primary_product_name 이 상품명과 일치", chat_node 라인 2542 "get_chat_rooms 결과의 product_summary, primary_quantity, item_summary") 가 이 필드명으로 주문 매칭/선택을 지시하므로 service 응답을 그대로 노출하면 안 됨. 임베딩 객체(`buyer`/`seller`/`items`) 는 응답에서 제거 → LLM 토큰 절약.
+- **검증 패턴 (venv 없는 환경에서도 통과)**: AST 로 `get_orders` body 를 unparse 한 뒤 `"order_service.list_orders" in body` / `"_run_async_in_thread" in body` / `"product_summary" in body` 등 substring assertion. 동시에 `ast.literal_eval(TOOLS_node)` 로 orchestrator 의 `TOOLS` list 를 파싱해 `status_in` properties 가 `type:"array"`, `items.enum` 7종 보유하는지 검증 + `json.dumps(tool_entry)` round-trip 으로 OpenAI tool calling 포맷 준수 확인. 동일 패턴이 다른 schema 변경 검증에도 재사용 가능.
+- **`_execute_tool` 의 kwargs 호출 (`func(**tool_input)`) 덕분에 새 파라미터 추가가 안전**: 기존 `INT_FIELDS` 변환 로직과 충돌 없음. list 파라미터는 OpenAI 가 array 로 직접 보내주므로 별도 변환 불필요. dispatch 코드 변경 없이 도구 함수 + schema 두 곳만 갱신하면 된다.
+- **service 위임의 부수 효과 — 정렬/페이지네이션도 통일**: 기존 도구는 `.order("created_at", desc=True).limit(20)` 직접 박고 있었는데 service.list_orders 도 동일 (`order("created_at", desc=True).range(...)`) 이라 응답 순서/개수는 그대로 유지. 향후 service 가 정렬·페이지 정책을 바꾸면 도구도 자동 따라간다.
+- **확장 가이드**: `agent_tools.get_chat_rooms` 도 같은 패턴 (직접 supabase 호출 + 자체 flatten) 인데 `chat_room_service` 가 있다면 위임으로 통일 가능. 다른 도구 (`get_calendar_events`, `find_alternative_partners`) 는 deleted_at 필터를 직접 챙기고 있으니 이번 함정 대상은 아님 — 신규 도구 추가 시 "service 가 있으면 무조건 위임" 을 1순위 패턴으로 적용할 것.
+
+#### get_orders 자연어 → status_in 매핑 + 응답 환각 방지 가이드 (2026-05-04 추가)
+- schema description 만으로는 LLM 이 사용자의 다양한 한국어 표현을 정확히 status_in 으로 옮긴다는 보장이 부족. tool_call 인자 생성 직전 schema 를 읽기는 하지만, 자연어 → enum 다중 매핑은 본문 프롬프트와 schema description 양쪽에 동시에 박아야 LLM 이 일관되게 호출한다. 또한 `get_orders` 결과 응답 표현 규칙(환각 방지)도 함께 박아야 "협상 요청 중" / "상태 없음" / "검토 중" 같이 enum 에 없는 LLM 임의 표현을 막을 수 있다.
+- 적용 위치 (orchestrator.py):
+  - `AGENT_BASE_SYSTEM` 의 `[주문 목록 조회 가이드 — 자연어 → status_in 매핑 (매우 중요)]` (라인 1623 근방, [재고 검색 vs 대체 거래처 추천 분리 원칙] 직후, [도구 실패 시 응답 가이드] 직전) + `[주문 응답 표시 규칙 — 환각 방지]` (라인 1637 근방). SELLER/BUYER 합성본 양쪽에 자동 반영. response_node 의 요약 단계에서도 BASE 가 적용되므로 한 곳에 박는 것으로 전체 흐름 커버.
+  - `chat_node` 시스템 프롬프트의 동일 두 섹션 (라인 2625 / 2633 근방, [도구 실패 시 응답 가이드] 직후, [자연어 협상/납품일 → 카드 도구 매핑] 직전). chat intent 라우팅 시 사용자가 "주문 보여줘" / "진행 중인 주문 확인" 같이 자연어로 가장 자주 묻는 노드라 BASE 와 별도로 직접 명시 — 5중 패턴(BASE + chat_node + schema description) 의 일부.
+- 자연어 매핑 핵심 (8종):
+  1. "진행 중인 주문" / "활성 주문" / "내 주문" / "오픈된 주문" / "처리 중 주문" → `status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"]` (5상태)
+  2. "완료된 주문" / "끝난 주문" → `status_in=["COMPLETED"]`
+  3. "취소된 주문" / "취소건" → `status_in=["CANCELLED"]`
+  4. "협상 중 주문" → `status_in=["NEGOTIATING"]`
+  5. "확정된 주문" → `status_in=["CONFIRMED"]`
+  6. "배송 중 주문" → `status_in=["SHIPPING"]`
+  7. "준비 중 주문" / "출고 준비 중" → `status_in=["PREPARING"]`
+  8. "견적 요청" / "들어온 견적" → `status_in=["QUOTE_REQUESTED"]`
+  9. **상태 미명시** ("주문 보여줘" / "주문 목록") → 진행 중 기본값 (5상태). 완료/취소는 사용자가 명시 요청해야 포함.
+- 응답 표시 규칙 핵심 (환각 방지 5종):
+  - status enum 한글 매핑 고정: `QUOTE_REQUESTED→"견적 요청"`, `NEGOTIATING→"협상 중"`, `CONFIRMED→"주문 확정"`, `PREPARING→"준비 중"`, `SHIPPING→"배송 중"`, `COMPLETED→"완료"`, `CANCELLED→"취소"`. 임의 표현("협상 요청 중", "상태 없음", "검토 중", "보류") 금지.
+  - 도구가 반환하지 않은 주문은 절대 응답에 포함 금지 — 컨텍스트 메모리/이전 대화에 옛 주문이 기억나도 출력 X. 사용자가 직접 묻지 않은 다른 주문(어제 본 견적, 옛 참치 주문)을 끌어와 답하지 말 것.
+  - 0건이면 "현재 진행 중인 주문이 없습니다" 또는 "조회된 주문이 없습니다" 만 안내. 거래처 추천·다른 카테고리 주문·상품 정보 늘어놓지 말 것.
+  - 마크다운 강조·표·헤더 금지(가독성 일관). 자연체 한국어 + 필요 시 `1.` 번호.
+  - 응답 예시는 수치(품목·수량·날짜·금액) 우선 형식: `"옥수수 50kg — 협상 중, 납품일 5월 20일, ₩600,000"` — 검증된 패턴 ("수치를 먼저 제시하는 응답 형식이 더 효과적") 그대로 적용.
+- 검증 결과: AST OK, placeholder 11/11 보존, 잔여 placeholder 0(SELLER/BUYER 양쪽), 신규 가이드 BASE + chat_node 모두 포함, BUYER 전용 가이드 SELLER 누출 0건, 옛 표현 회귀 0건, 이전 가이드 26종 모두 보존.
+- **핵심 교훈 — 다중 enum 매핑은 schema + 본문 5중 명시**: 단일 status 만 있을 때는 schema description 한 줄로 충분했지만 status_in 처럼 LLM 이 다중 enum 배열을 추론해야 하는 파라미터는 (1) schema description 의 enum + 매핑 안내, (2) BASE 본문의 [주문 목록 조회 가이드] 8종 매핑, (3) chat_node 의 동일 매핑 — 3중으로 박아야 LLM 이 "진행 중인 주문" 같은 자연어 발화를 정확히 5상태 배열로 변환한다. schema 만 있으면 LLM 이 자주 단일 status 만 보내고 다른 4상태를 누락시키는 사례가 있어 본문 프롬프트가 백업 역할을 한다.
+- **핵심 교훈 — 응답 표시 규칙은 enum 매핑까지 명시 박아야 환각 차단**: 도구 결과의 status 값을 그대로 LLM 에 던져주면, GPT-4o-mini 가 "협상 요청 중" / "상태 없음" 같이 enum 에 없는 한국어 표현을 자기 멋대로 만들어내 사용자 혼란을 유발한다. "이 매핑만 사용" + 한글 표 7종을 본문에 박으면 LLM 이 곧이곧대로 따라가 일관된 표현이 나온다. 부정형("X 라고 말하지 마라")은 한 번 더 강조해서 본문 + 헤더 옆 강조 + 마지막 문장 3중으로 박는 패턴을 그대로 유지.
+
+#### 카드 도구(submit_counter_offer / submit_delivery_date_change) order_id 결정 절차 가이드 (2026-05-04 추가)
+- 실제 사용자 시나리오 실패: "테스트 관리 협상가를 30000원으로 제시해줘" (사용자가 어느 상품인지 명시 안 함, "테스트 관리"는 단순 지시어) → AI 가 진행 중인 주문 두 건(대파 10kg / 새우 10kg) 중 임의로 새우를 선택해 "새우 주문에 ₩30,000으로 가격 협상 요청을 하겠습니다" 응답. 사용자 의도와 무관한 주문에 협상가를 보내는 위험한 동작.
+- 원인: 카드 도구(submit_counter_offer / submit_delivery_date_change / accept_* / reject_* 6종)는 `order_id` 가 필수인데, LLM 이 모호한 발화에서 후보 여러 개를 마주쳤을 때 "친절을 가장해" 한 후보를 선택하는 환각 패턴이 있음. "어느 주문인지 물어봐라" 가이드는 [자연어 → 카드 도구 매핑] 섹션 안에 있었지만 매핑 규칙 가이드와 섞여 있어 LLM 이 무시함.
+- 해결책 — 독립 섹션으로 분리해서 결정 트리 명시:
+  - **AGENT_BASE_SYSTEM** 의 `[협상가 제시 / 납품일 변경 도구 호출 절차 — 매우 중요]` 섹션 (라인 1636 근방, [정기배송 수정 요청] 직후, [자연어 → 카드 도구 안전장치] 직전). SELLER/BUYER 합성본 양쪽에 자동 반영. 6종 카드 도구 모두에 적용 (submit_counter_offer, submit_delivery_date_change, accept_counter_offer, reject_counter_offer, accept_delivery_date_change, reject_delivery_date_change).
+  - **chat_node** 시스템 프롬프트의 동일 섹션 (라인 2849 근방, [자연어 협상/납품일 → 카드 도구 매핑] 직후). chat intent 라우팅 시 가장 자주 호출되는 노드라 BASE 와 별도로 박음.
+  - **TOOLS schema** 의 `submit_counter_offer.order_id.description` + `submit_delivery_date_change.order_id.description` 보강. tool_call 인자 생성 직전 LLM 이 직접 읽는 위치에 "어떤 주문인지 모호하면 후보 추출 후 1개면 사용 / 2개+면 되묻기 / 0개면 안내" 절차 명시.
+- 결정 트리 (3단계):
+  - **[1단계 — 협상 가능 주문 목록 조회]** 협상가 제시는 `get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING'])`, 납품일 변경은 `status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED']` 로 사전 필터링. CONFIRMED 이후(협상) / PREPARING 이후(납품일 변경) 차단되므로 사전 필터링 필수.
+  - **[2단계 — 후보 필터링]** 사용자 발화 상품명 / 거래처 / 수량 매칭. 정확한 상품명, 동시에 수량 명시 시 수량도 매칭, 거래처 명시 시 거래처도 매칭.
+  - **[3단계 — 후보 수에 따른 처리]**
+    - 후보 0개: "○○ 상품에 대한 협상 가능한 주문이 없습니다 (이미 확정 이후 상태이거나 진행 중 주문 없음)" 안내만 하고 끝. 다른 주문 정보 늘어놓지 마라.
+    - 후보 1개: 즉시 도구 호출 → 결과 안내.
+    - 후보 2개 이상: "옥수수 50kg 주문(ORD-...) 과 옥수수 80kg 주문(ORD-...) 중 어느 주문에 협상가를 제시할까요?" 형식으로 되묻기. 답변 받기 전에는 절대 도구 호출 X.
+- **발화 모호성 처리** (별도 강조): 사용자 발화가 어느 상품인지 너무 모호한 경우(예: "테스트 관리" 같은 비-상품 지시어) 임의로 한 주문을 추측 선택해 진행하지 말고 사용자에게 "어떤 상품의 주문에 대한 협상인가요?" 되묻기. 진행 중 주문 목록을 짧게 보여주는 것은 OK 지만 임의 선택 금지.
+- **금지 사항 5종** (단정문 + 구체 anti-example):
+  - 사용자가 안 물은 다른 주문 정보 줄줄이 나열.
+  - 후보 여러 개일 때 임의 선택해서 진행.
+  - 후보 0개일 때 다른 상품 주문 정보 끼워서 응답.
+  - "주문 ID를 알려주세요"로 UUID 직접 요구.
+  - accept/reject 도 동일 절차 적용 안 함 (수락/거절 PENDING 카드의 order_id 결정 시에도 동일한 결정 트리 따라야 함).
+- 검증 결과: AST OK, placeholder 11/11 보존, BUYER/SELLER 합성본 모두 새 가이드 1회씩 포함 (`composition count = 1` 확인), chat_node 도 동일 가이드 포함, TOOLS schema 의 submit_counter_offer / submit_delivery_date_change order_id description 모두 갱신, BUYER 전용 가이드 (`주문 대상 판매자 식별 절차`, `구매자 주문/견적 생성 규칙`) SELLER 누출 0건, 이전 가이드 23종 모두 보존.
+- **핵심 교훈 — 결정 트리는 매핑 가이드와 분리해서 독립 섹션으로 박아야 LLM 이 따라간다**: 자연어 → 도구 매핑 섹션 안에 "후보 여러 개면 되묻기" 가이드를 같이 박아두면 LLM 이 매핑 규칙만 보고 결정 트리는 무시한다. 결정 트리(0/1/N 분기)는 별도 섹션 + 각 단계에 헤더([1단계], [2단계], [3단계])를 박고 각 분기마다 구체 발화 예시까지 같이 넣어야 LLM 이 단계별로 검토한다. 매핑 가이드는 "어느 도구를 부르라"이고, 결정 트리는 "그 도구의 인자를 어떻게 정하라"이므로 관심사가 다름 → 분리가 자연스럽다.
+- **핵심 교훈 — order_id 같은 UUID 인자는 schema description 에 결정 절차까지 박아야 LLM 준수율 최대화**: 본문 프롬프트만으로는 LLM 이 모호한 발화에서 임의로 한 후보를 선택하는 환각이 자주 발생. tool_call 인자 생성 직전에 LLM 이 다시 읽는 schema description 에 "0개/1개/2개+ 분기 + 임의 추측 금지" 절차를 박으면 schema 가 1차 방어선이 되고 본문 프롬프트가 보조한다. (이전 작업에서 검증된 패턴: seller_id 환각 차단 시에도 schema description 강화가 본문보다 효과 컸음. 이번 order_id 도 동일 패턴 적용.)
+- **핵심 교훈 — 후보 0개 응답에서 "다른 주문 끼워 넣기" 환각이 가장 위험**: 후보 1개/2개+ 분기는 LLM 이 비교적 잘 따라가지만, 후보 0개일 때 GPT-4o-mini 가 "친절을 가장해" 컨텍스트 메모리의 다른 주문 정보를 줄줄이 노출하는 환각이 빈번. "○○ 상품에 대한 협상 가능한 주문이 없습니다" 만 짧게 답하고 끝내라는 단정문을 명시적으로 박아야 함. 이전 [도구 실패 시 응답 가이드] 의 "안 물은 정보 끌어오지 마라" 패턴과 동일 구조 — 환각 방지 가이드는 매번 명시적 단정문이 필요.
+
+#### get_partners 자연어 → status 매핑 가이드 (2026-05-04 추가)
+- 신규 `get_partners(user_id, status?, status_in?, role?)` 도구는 schema description 에 자연어 트리거("거래처 목록", "내 거래처", "거래 중인 곳" 등)와 ACTIVE/PENDING_OUTGOING/PENDING_INCOMING/INACTIVE 4종 enum 을 명시했지만, 본문 프롬프트에도 동일한 매핑을 박아야 LLM 이 일관되게 status 인자를 채운다. 이전 `get_orders` status_in 작업과 동일한 "schema + 본문 2중 명시" 패턴을 그대로 적용.
+- 적용 위치 (orchestrator.py):
+  - `AGENT_BASE_SYSTEM` 의 `[거래처 목록 조회 가이드 — 자연어 → status 매핑 (매우 중요)]` (라인 1753 근방, [주문 목록 조회 가이드] 직후, [주문 응답 표시 규칙] 직전). SELLER/BUYER 합성본 양쪽에 자동 반영.
+  - `chat_node` 시스템 프롬프트의 동일 섹션 (라인 2940 근방, [주문 목록 조회 가이드] 직후, [주문 응답 표시 규칙 — 환각 방지 (매우 중요)] 직전). 사용자가 채팅 노드에서 "거래처 보여줘" 같이 자연어로 자주 묻는 위치라 BASE 와 별도로 박음.
+- 자연어 매핑 핵심 (5종):
+  1. "거래처 목록" / "내 거래처" / "거래 중인 곳" / "거래처 보여줘" / "거래하고 있는 거래처" / "내가 거래하는 사람들" → `status="ACTIVE"` (기본값)
+  2. "보낸 거래처 신청" / "신청 보낸 곳" / "내가 신청한 거래처" / "보낸 요청" → `status="PENDING_OUTGOING"`
+  3. "받은 거래처 신청" / "들어온 거래처 요청" / "거래처 신청 왔어?" → 단독 조회는 `get_incoming_partner_requests` 우선, 다른 상태와 함께 묻는 맥락에서만 `status="PENDING_INCOMING"`.
+  4. "거절된 거래처" / "비활성 거래처" / "거래 종료된 곳" → `status="INACTIVE"`
+  5. **상태 미명시** ("거래처 보여줘" / "거래처 목록") → 기본값 `status="ACTIVE"`.
+- 응답 표시 규칙 핵심 (환각 방지 4종):
+  - 0건이면 "현재 활성 거래처가 없습니다" (또는 status 에 맞춰 "보낸 거래처 신청이 없습니다" / "거절된 거래처가 없습니다") 만 안내. 다른 정보(주문 내역, 상품 추천, 다른 카테고리 거래처) 늘어놓지 말 것.
+  - 도구가 반환하지 않은 거래처는 절대 응답에 포함 금지 — 컨텍스트 메모리/이전 대화의 옛 거래처 정보 출력 X.
+  - 도구 결과 외 임의 정보 추가 금지. 사용자가 안 물은 다른 거래처 정보 카탈로그처럼 늘어놓지 말 것.
+  - 마크다운 강조·표·헤더 금지. 자연체 한국어 + 필요 시 `1.` 번호.
+- `get_orders` 와 차이점: `get_orders` 는 status_in 다중 enum 매핑이 핵심이라 8종 매핑을 본문에 박았지만, `get_partners` 는 사용자가 보통 한 번에 한 상태만 묻는 패턴이라 단일 status 매핑 5종이면 충분. status_in 은 "활성 거래처와 보낸 신청 둘 다" 같은 명시적 다중 요청에서만 사용한다는 단서를 본문에 박았다. PENDING_INCOMING 은 단독 조회 시 `get_incoming_partner_requests` 가 우선 — 도구 description 과 본문 가이드 모두에 동일하게 명시해 LLM 이 두 도구 중 어느 쪽을 부를지 헷갈리지 않게 함.
+- 검증 결과: AST OK, placeholder 23/23 보존(이번 작업 23종 — 이전 11에서 변경 없음), BASE/chat_node 양쪽 1회씩 추가 확인, 이전 가이드 27종 모두 보존(`grep -c` 27 카운트), git diff --stat = 80 insertions(+) (단순 추가, 기존 줄 수정 0).
+- **핵심 교훈 — 단일 enum 매핑도 schema 만 믿지 말고 본문에 한 번 더 박아야 일관성 확보**: `get_partners` schema description 에 이미 "거래처 목록", "내 거래처", "거래 중인 곳" 등 자연어 트리거가 명시돼 있어도, 사용자가 "보낸 신청" 같이 변형된 표현을 쓰면 LLM 이 status 인자를 누락하거나 status_in 으로 잘못 보내는 사례가 발생할 가능성이 있음. 본문 프롬프트의 5종 매핑이 backup 역할 — schema 가 1차, 본문이 2차 방어선. 단일 enum 도구도 다중 enum 도구와 동일하게 schema + 본문 2중 명시 패턴을 따라가는 것이 안전.
+- **핵심 교훈 — 두 도구가 같은 의도(예: 받은 거래처 요청 조회)를 처리할 수 있을 때는 우선순위를 본문에 명시**: `get_partners(status="PENDING_INCOMING")` 와 `get_incoming_partner_requests` 가 둘 다 같은 데이터를 돌려주는 상황에서 LLM 이 둘 중 어느 쪽을 부를지 헷갈리면 같은 라운드에 두 도구를 동시 호출하거나 매번 다른 도구를 부르는 일관성 문제가 생긴다. "단독 조회 시엔 get_incoming_partner_requests 우선, 다른 상태와 함께 묻는 맥락에서만 get_partners(status='PENDING_INCOMING')" 처럼 우선순위 단서를 본문 + 도구 description 양쪽에 똑같이 박아야 LLM 이 일관되게 따라간다.
+
+#### 도구 모듈화 리팩터링 — PR 0 인프라 신설 (2026-05-04 추가)
+- 배경: `backend/app/services/agent_tools.py` 가 41개 도구를 한 파일(약 16만 자)에 담고 있어 LLM·휴먼 모두 한 도구를 수정할 때 다른 도구의 컨텍스트를 끌고 가야 하는 구조. 도구 추가/수정 시 회귀 위험과 머지 충돌이 누적되는 패턴을 격리하기 위해 도메인별 분리 진행. 사용자 승인된 설계 = "단계별 PR 으로 점진 이동, PR 0 은 인프라만 — 회귀 위험 0".
+- PR 0 신설 파일 (5개, 절대 경로):
+  - `backend/app/services/agent/__init__.py` (30 lines) — 외부 공개 API. `TOOL_FUNCTION_MAP` / `TOOLS` / `TOOLS_CALENDAR` / `TOOLS_CHAT` / `INT_FIELDS` 5심볼만 export. 등록 트리거를 위해 `from . import tools` 가 첫 줄.
+  - `backend/app/services/agent/_registry.py` (104 lines) — `ToolEntry` (frozen dataclass: name/func/schema/groups/int_fields), `ToolRegistry` (글로벌 dict 기반, register/function_map/schemas_for/int_fields_union/all_entries 5메서드), `tool(...)` 데코레이터.
+  - `backend/app/services/agent/_shared.py` (10 lines) — cross-domain helper placeholder. PR 0 에서는 비어있고, 다음 PR 들에서 `_run_async_in_thread` 등 이동 예정.
+  - `backend/app/services/agent/tools/__init__.py` (20 lines) — 도메인 모듈 import 트리거. PR 0 에서는 모든 import 가 주석 처리 (도메인 모듈 0개).
+  - `backend/tests/test_agent_registry.py` (106 lines) — pytest 7개 케이스: register/lookup, 중복 RuntimeError, 미존재 그룹 빈 list, int_fields union, 빈 groups ValueError, list 타입 groups ValueError, multi-group 등록.
+- PR 0 의 핵심 가치 — **회귀 위험 0**: `agent_tools.py` / `orchestrator.py` / `chat_ws.py` 일절 수정 X. 기존 `from app.services.agent_tools import TOOL_FUNCTION_MAP` (orchestrator.py 라인 39) 그대로 동작. 새 `app.services.agent` 패키지는 import 만 가능하고 0개 도구만 노출 — 다음 PR 들에서 도메인 모듈을 점진적으로 옮긴 뒤 마지막 PR 에서 orchestrator import 경로를 한 줄 바꿈.
+- 검증 결과 — 5종 모두 통과:
+  1. AST 파싱: 5개 파일 모두 OK.
+  2. import 동작: `python -c "from app.services.agent import TOOL_FUNCTION_MAP, ..."` → `OK 0 tools registered` (PR 0 에서는 도구 0개로 정상).
+  3. 단위 테스트: `pytest tests/test_agent_registry.py --noconftest -v` → 7 passed in 0.01s. (`--noconftest` 는 기존 `tests/conftest.py` 가 httpx 등 외부 의존성 import 하는 문제 회피용 — 신규 인프라 테스트는 외부 의존성 없음.)
+  4. 기존 import 경로 보존: orchestrator.py 의 `from app.services.agent_tools import TOOL_FUNCTION_MAP` regex 로 존재 확인.
+  5. git diff --stat HEAD = 비어있음 (modifications 0개, 신규 untracked 만 5개).
+- 데코레이터 사용 패턴 (다음 PR 에서 적용):
+  ```python
+  # tools/product.py 예시
+  from .._registry import tool
+
+  @tool(
+      name="get_products",
+      description="...",
+      parameters={"type": "object", "properties": {...}, "required": [...]},
+      groups=("inventory_order",),
+      int_fields=frozenset({"min_stock", "max_stock"}),
+  )
+  def get_products(seller_id: str, ...) -> dict:
+      ...
+  ```
+  - 도구 본문 + schema 가 한 hunk 에 묶여 격리 — 한 도구 수정 시 다른 도구 컨텍스트 불필요.
+  - groups 는 비어있지 않은 tuple 강제. `groups=("inventory_order",)` 처럼 trailing comma 필수 (단일 그룹도 tuple 보장).
+  - `int_fields` 는 LLM 이 string 으로 보내는 인자를 자동 int 변환할 필드 — `@tool` 등록 시 도구별 int 변환 정책이 함수 정의와 같은 위치에 박혀 가독성 향상.
+- 다음 PR 계획 (도메인별 분리 — 8개 PR, 각 PR 회귀 영향 격리):
+  - PR 1: product (6개) — get_products / find_sellers_by_product / find_buyers_by_product / 등.
+  - PR 2: order (6개) — get_orders / create_order / update_order / update_order_status / delete_order / cancel_order.
+  - PR 3: chat (4개) — chat_send_message / chat_create_room / 등.
+  - PR 4: calendar (4개).
+  - PR 5: partner (7개).
+  - PR 6: subscription (4개).
+  - PR 7: negotiation (6개) — submit_counter_offer / accept_counter_offer / reject_counter_offer / submit_delivery_date_change / 등.
+  - PR 8: user (3개) — orchestrator import 경로를 `from app.services.agent import ...` 으로 한 줄 변경 + `agent_tools.py` 빈 shim 또는 삭제.
+- **핵심 교훈 — 인프라 PR 은 "회귀 0 보장" 자체가 핵심 가치**: 큰 리팩터링은 1단계 인프라 PR + N단계 점진 이동 PR 로 분리하면 각 단계마다 회귀 영향이 독립적으로 검증 가능. PR 0 의 인프라가 0개 도구만 노출하더라도 unit test 7종으로 인프라 자체의 정합성을 검증해두면 다음 PR 들에서 도메인 모듈을 추가할 때마다 test_agent_registry 가 회귀 sentinel 역할을 한다.
+- **핵심 교훈 — 새 패키지의 `__init__.py` 첫 줄에 `from . import tools  # noqa: F401`**: 데코레이터 기반 등록 시스템은 모듈 import 가 곧 등록 트리거이므로, 외부에서 `from app.services.agent import TOOL_FUNCTION_MAP` 만 호출해도 자동으로 모든 도메인 모듈이 import 되어야 한다. 패키지 `__init__.py` 첫 줄에 명시적으로 `from . import tools` 를 박고, `tools/__init__.py` 에서 모든 도메인 모듈을 명시 import. 이렇게 하면 외부 호출자는 import 순서를 신경 쓸 필요 없이 자동으로 등록이 완료된 상태의 registry 를 받는다.
+- **핵심 교훈 — `--noconftest` 로 인프라 단위 테스트를 외부 의존성 없이 실행**: 기존 `backend/tests/conftest.py` 는 httpx/Supabase 등 외부 패키지 import 가 있어 venv 미설치 환경에서 collect 단계에서 실패한다. 인프라 단위 테스트(`test_agent_registry.py`) 는 자체 import 가 stdlib + pytest 만 사용하므로 `pytest --noconftest` 로 conftest 우회 실행하면 venv 없이도 7케이스 모두 통과. 다음 PR 들의 도메인 모듈 단위 테스트도 동일 패턴(외부 의존성 mock 또는 회피)으로 작성하면 venv 없이 검증 가능.

@@ -1,6 +1,6 @@
 # SKILL_FRONTEND.md — Frontend Agent
 
-> **마지막 동기화**: 2026-03-22 | 실제 코드 기준으로 작성됨
+> **마지막 동기화**: 2026-05-04 | 실제 코드 기준으로 작성됨
 
 ## 역할
 Next.js 14 (App Router) + TypeScript + Tailwind CSS로
@@ -25,6 +25,7 @@ frontend/
 │       │   ├── partners/page.tsx
 │       │   ├── products/page.tsx
 │       │   ├── orders/page.tsx
+│       │   ├── orders/[id]/page.tsx           ← 주문 상세 페이지 (2026-05-04)
 │       │   └── chat/page.tsx       ← ai-assistant 없음 (우측 패널로 이동)
 │       └── buyer/
 │           ├── dashboard/page.tsx
@@ -33,6 +34,7 @@ frontend/
 │           ├── browse/page.tsx                  ← 상품 카드 클릭 → /buyer/browse/[productId] 라우팅
 │           ├── browse/[productId]/page.tsx     ← 상품 상세 페이지 (B.1, 2026-05-04)
 │           ├── orders/page.tsx
+│           ├── orders/[id]/page.tsx           ← 주문 상세 페이지 (2026-05-04)
 │           └── chat/page.tsx
 ├── components/
 │   ├── layout/
@@ -48,6 +50,8 @@ frontend/
 │   │   ├── SearchFilterBar.tsx
 │   │   ├── EmptyState.tsx
 │   │   └── Modal.tsx
+│   ├── orders/
+│   │   └── OrderDetailView.tsx     ← 주문 상세 공통 뷰 (myRole='SELLER'|'BUYER')
 │   └── dashboard/
 │       └── TodayTasksWidget.tsx     ← role='seller'|'buyer' — 오늘 할 일 요약
 ├── hooks/
@@ -297,13 +301,8 @@ ai-assistant 페이지의 풀 사이즈 (text-sm, max-w-[75%], px-4 py-2) 와 �
 const { isStreaming, manualReview, stream } = useAIStream();  // response 는 안 씀
 useAIHistory(100);
 const turns = useAIChatStore((s) => s.turns);
-const messagesEndRef = useRef<HTMLDivElement>(null);
 const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
 const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
-
-useEffect(() => {
-  messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-}, [turns.length, lastTurn?.response]);
 
 // pending 마지막 turn 의 AI 말풍선은 깜빡이는 캐럿만 표시
 const isLastPending = idx === turns.length - 1 && turn.pending && turn.response === '';
@@ -312,6 +311,51 @@ const isLastPending = idx === turns.length - 1 && turn.pending && turn.response 
 **핵심**: `response` state 는 useAIStream 이 외부 호환성으로 유지하되,
 실제 화면 렌더는 `useAIChatStore.turns` 가 SSOT (Single Source of Truth).
 이렇게 해야 새 응답이 와도 이전 대화가 사라지지 않고, 페이지 이동 후 돌아와도 그대로 남는다.
+
+### AIChatPanel 스크롤 동작 (검증됨, 2026-05-04)
+
+자동 스크롤은 **컨테이너 ref + scrollTop 직접 제어** 방식. 과거의 `messagesEndRef.scrollIntoView` 는 폐기 — `scrollIntoView` 는 ancestor 컨테이너에도 영향을 주어 페이지 전환 시 main 스크롤이 함께 점프하는 부작용이 있었다.
+
+```tsx
+const messagesContainerRef = useRef<HTMLDivElement>(null);
+const [isAtBottom, setIsAtBottom] = useState(true);
+
+// 1. 사용자 스크롤 위치 추적 (BOTTOM_THRESHOLD_PX = 80)
+useEffect(() => {
+  const el = messagesContainerRef.current;
+  if (!el) return;
+  const onScroll = () => {
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setIsAtBottom(distance < 80);
+  };
+  onScroll();
+  el.addEventListener('scroll', onScroll, { passive: true });
+  return () => el.removeEventListener('scroll', onScroll);
+}, [aiPanelOpen]);
+
+const scrollToBottom = useCallback((smooth = true) => {
+  const el = messagesContainerRef.current;
+  if (!el) return;
+  el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+}, []);
+
+// 2. 패널 첫 오픈 / turns hydrate 직후 즉시 점프 (페이지 전환 후 최신 메시지 보장)
+useEffect(() => {
+  if (!aiPanelOpen || turns.length === 0) return;
+  const raf = requestAnimationFrame(() => scrollToBottom(false));
+  return () => cancelAnimationFrame(raf);
+}, [aiPanelOpen, turns.length === 0]);
+
+// 3. 새 메시지 / 응답 갱신 — 사용자가 바닥 근처일 때만 자동 따라가기
+useEffect(() => {
+  if (!isAtBottom) return;
+  scrollToBottom(true);
+}, [turns.length, lastTurn?.response, isAtBottom, scrollToBottom]);
+```
+
+**"맨 밑으로 내리기" 동그란 버튼** — 입력창 영역(`relative`) 안에 `absolute -top-5 left-1/2 -translate-x-1/2` 로 입력창 바로 위 중앙에 배치. `isAtBottom || turns.length === 0` 일 때 `pointer-events-none opacity-0` 으로 숨김, 그 외에는 `opacity-100` + `transition-opacity duration-200` 로 부드럽게 노출. 스타일: `h-9 w-9 rounded-full border border-gray-200 bg-white text-gray-600 shadow-md hover:bg-gray-50 hover:text-primary-600`. 아이콘은 `lucide-react` 의 `ChevronDown h-4 w-4`.
+
+**페이지 전환 시 위치 유지**: AppLayout 이 `(dashboard)/layout.tsx` 에 마운트되어 있어 AIChatPanel 은 (dashboard) 그룹 내 라우트 변경에서 unmount 되지 않는다. 즉 컴포넌트 자체가 영속이며, 위 effect 들은 마운트가 아닌 `aiPanelOpen` 토글이나 turns 변화에만 반응한다. `messagesContainerRef.scrollTop` 자체도 라우트 전환 사이에 보존된다 — 별도의 store 저장 불필요.
 
 ---
 
@@ -377,6 +421,7 @@ content: [
 - [x] members — 회원 검색 카드, 프로필 모달, 채팅 생성, 거래처 추가 버튼
 - [ ] products — 상품 목록, 상태 필터, 등록 모달 (React Hook Form)
 - [x] orders — 탭(견적/진행/완료), 상세 패널, 상태 변경 + 협상가 제시/수락/거절 + 취소
+- [x] orders/[id] — 동적 라우트 주문 상세 페이지 (캘린더/알림에서 진입) — `OrderDetailView` 공통 컴포넌트 재사용
 - [ ] chat — 채팅방 목록 (좌), 메시지 창 (우), Realtime 구독
 
 ### 구매자
@@ -386,6 +431,7 @@ content: [
 - [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat) + 거래처 추가 버튼
 - [x] browse — 상품 카드 그리드, 카테고리/가격 필터, 견적 요청 버튼, ?seller_id= 쿼리로 판매자 필터
 - [x] orders — 견적 생성/수정/취소 모달 + 협상가 제시/수락/거절 + 상세 슬라이드
+- [x] orders/[id] — 동적 라우트 주문 상세 페이지 (캘린더/알림에서 진입) — `OrderDetailView` 공통 컴포넌트 재사용
 - [x] inventory — 자동 누적 재고 목록(테이블), 수량/메모 수정 모달, soft-delete 모달, 검색 디바운스 + 정렬(recent/quantity/name) + 페이지네이션
 - [ ] chat — 판매자와 동일 패턴
 
@@ -403,6 +449,40 @@ content: [
 > 가설이나 일반적인 Next.js 지식은 추가하지 않는다.
 
 ### 검증된 패턴
+
+#### 역할 공유 동적 라우트 상세 페이지 (2026-05-04, 검증됨)
+
+판매자/구매자 양쪽이 같은 도메인 객체 상세를 보는 동적 라우트는 **공통 뷰 컴포넌트 + 얇은 페이지 래퍼** 패턴을 사용한다. 주문 상세(`/{role}/orders/[id]`)가 그 예시.
+
+```
+app/(dashboard)/buyer/orders/[id]/page.tsx  ─┐
+                                              ├─→ components/orders/OrderDetailView.tsx (myRole prop)
+app/(dashboard)/seller/orders/[id]/page.tsx ─┘
+```
+
+**왜 이렇게 하나:**
+- 라우팅 경로는 역할별로 분리(`/buyer/...`, `/seller/...`)되어야 사이드바·미들웨어와 일관됨
+- 그러나 데이터 fetching·표시·상태별 액션 분기는 99% 동일 → 한 컴포넌트에 `myRole: UserRole` prop 으로 분기
+
+**페이지 파일 형태 (server component, 매우 얇음):**
+```tsx
+interface PageProps { params: { id: string } }
+export default function BuyerOrderDetailPage({ params }: PageProps) {
+  return <OrderDetailView orderId={params.id} myRole="BUYER" />;
+}
+```
+
+**공통 컴포넌트 핵심 규칙:**
+- `'use client'` — 훅/상태/모달이 들어가므로
+- 데이터: `useOrder(orderId)` 훅 그대로 사용 → 목록 페이지와 캐시 자동 공유
+- 로딩 / 에러(권한 없음 또는 404) / 본문 3 가지 상태를 명시적으로 분기
+- 에러 상태에서는 "주문을 찾을 수 없습니다" + "목록으로 돌아가기" 버튼 (백엔드 403/404 동일 처리)
+- 뒤로가기: `window.history.length > 1 ? router.back() : router.push('/{role}/orders')` — 직접 URL 진입 케이스 대비
+- 액션 버튼은 `myRole === 'BUYER'` 분기 + 기존 모달들(EditOrderModal/CancelOrderModal/CounterOfferModal/CancelRequestPanel) 그대로 재사용
+
+**주의사항:**
+- 캘린더 EventDetailModal 의 라우팅은 이미 `/{role}/orders/{event.order_id}` 정확한 형식으로 push 함 — 페이지만 만들면 됨
+- 목록 페이지 슬라이드 패널은 그대로 유지 (목록 행 클릭 흐름 변경 X). 동적 라우트 페이지는 외부(캘린더/알림)에서 진입할 때의 **딥링크 진입점**이 핵심 목적
 
 #### Vercel 배포 설정 (모노레포 구조)
 

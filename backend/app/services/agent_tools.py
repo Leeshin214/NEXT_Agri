@@ -32,6 +32,44 @@ def _sync_calendar_events_for_order_id(order_id: str) -> None:
 # 헬퍼: 이름 기반 상품 검색 (fuzzy fallback 포함)
 # ─────────────────────────────────────────────
 
+def _find_seller_by_name(supabase, seller_name: str) -> dict:
+    """판매자 이름 또는 회사명으로 users 테이블에서 SELLER를 검색한다.
+
+    반환:
+      {"found": True, "id": "uuid", ...}                — 1건 정확 매칭
+      {"found": False, "candidates": [...]}              — 0건 또는 2건 이상
+    """
+    result = (
+        supabase.table("users")
+        .select("id, name, company_name")
+        .or_(f"name.ilike.%{seller_name}%,company_name.ilike.%{seller_name}%")
+        .eq("role", "SELLER")
+        .is_("deleted_at", None)
+        .limit(5)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        return {"found": False, "candidates": []}
+
+    # 완전 일치 우선
+    for row in rows:
+        if row.get("name") == seller_name or row.get("company_name") == seller_name:
+            return {"found": True, **row}
+
+    if len(rows) == 1:
+        return {"found": True, **rows[0]}
+
+    # 여러 명 매칭 — 호출자가 사용자에게 후보 목록을 보여줄 수 있도록 반환
+    return {
+        "found": False,
+        "candidates": [
+            {"id": r["id"], "name": r.get("name"), "company_name": r.get("company_name")}
+            for r in rows
+        ],
+    }
+
+
 def _find_product_by_name(supabase, product_name: str, seller_id: str = "") -> Optional[dict]:
     """
     product_name으로 상품을 검색한다.
@@ -402,54 +440,66 @@ def update_product(
 # 주문 관련 도구
 # ─────────────────────────────────────────────
 
-def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
+def get_orders(
+    user_id: str,
+    role: str,
+    status: Optional[str] = None,
+    status_in: Optional[list[str]] = None,
+) -> dict:
     """사용자의 주문 목록을 조회한다. role에 따라 buyer_id / seller_id로 필터링.
 
-    응답 평탄화 (LLM 토큰 절약 + 응답 우선순위 정책 — 상품명·거래처명 메인):
-    - buyer_name / buyer_company / seller_name / seller_company
-    - product_summary: "{첫 상품명}" 또는 "{첫 상품명} 외 N건" (items 비면 None)
-    - items_count: order_items 길이
-    임베딩 객체(buyer/seller/order_items)는 응답에서 제거.
+    조회는 order_service.list_orders 에 위임한다 — soft delete (deleted_at IS NULL)
+    필터와 status_in 다중 상태 필터, 페이지네이션이 서비스 레이어에서 일관 처리된다.
+    응답은 도구 전용으로 다시 평탄화 — LLM 이 참조하는 product_summary / primary_*
+    /item_summary / items_count 필드를 유지한다 (orchestrator 시스템 프롬프트 라인
+    1643-1644, 2542 가 이 필드명으로 주문 매칭/선택을 지시).
+
+    파라미터:
+      - user_id: 조회 대상 사용자 UUID (필수).
+      - role:    "SELLER" 또는 "BUYER" (필수).
+      - status:  단일 상태 필터 (선택, 하위호환). 예) "SHIPPING".
+      - status_in: 다중 상태 필터 (선택, 권장). status 보다 우선 적용.
+                   진행 중 주문은 ["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED",
+                   "PREPARING","SHIPPING"] 5종으로 호출 (완료/취소 제외).
+
+    응답 키:
+      - buyer_name / buyer_company / seller_name / seller_company
+      - product_summary: "{첫 상품명}" 또는 "{첫 상품명} 외 N건" (items 비면 None)
+      - primary_product_name / primary_quantity / primary_unit_price / primary_subtotal
+      - item_summary: 모든 라인을 "이름 수량단위 x 단가원" 으로 join
+      - items_count: order_items 길이
+    임베딩 객체(buyer/seller/items)는 응답에서 제거 — LLM 토큰 절약.
     """
     try:
-        supabase = get_supabase_client()
+        if role not in ("SELLER", "BUYER"):
+            return {
+                "success": False,
+                "error": f"invalid role: {role} (SELLER|BUYER)",
+                "orders": [],
+                "count": 0,
+            }
 
-        # 역할에 따라 어느 컬럼으로 필터할지 결정
-        # 판매자는 자신이 받은 주문(seller_id), 구매자는 자신이 넣은 주문(buyer_id)
-        if role == "SELLER":
-            id_column = "seller_id"
-        else:
-            id_column = "buyer_id"
+        from app.services.order_service import order_service
 
-        query = (
-            supabase.table("orders")
-            .select(
-                "id, order_number, status, total_amount, delivery_date, "
-                "delivery_address, notes, created_at, buyer_id, seller_id, "
-                "buyer:users!buyer_id(name,company_name), "
-                "seller:users!seller_id(name,company_name), "
-                "order_items(quantity, unit_price, products(name))"
+        # order_service.list_orders 위임 — deleted_at IS NULL + status_in 일관 처리
+        # status_in 이 있으면 list_orders 가 우선 적용, 없으면 단일 status fallback
+        rows, _meta = _run_async_in_thread(
+            lambda: order_service.list_orders(
+                user_id=user_id,
+                role=role,
+                status=status,
+                status_in=status_in,
+                page=1,
+                limit=20,
             )
-            .eq(id_column, user_id)
         )
 
-        # 특정 상태로 필터링 (예: QUOTE_REQUESTED, SHIPPING 등)
-        if status:
-            query = query.eq("status", status)
-
-        result = query.order("created_at", desc=True).limit(20).execute()
-
-        rows = result.data or []
+        # _flatten_order_row 가 buyer_name/seller_name 등 평탄 키를 이미 채워주고
+        # items: [{quantity, unit_price, product_name, product_unit, ...}] 형태.
+        # 도구 전용 summary 필드를 추가로 재가공한다.
         flattened: list[dict] = []
         for row in rows:
-            buyer = row.pop("buyer", None) or {}
-            seller = row.pop("seller", None) or {}
-            items = row.pop("order_items", None) or []
-
-            row["buyer_name"] = buyer.get("name")
-            row["buyer_company"] = buyer.get("company_name")
-            row["seller_name"] = seller.get("name")
-            row["seller_company"] = seller.get("company_name")
+            items = row.pop("items", None) or []
 
             product_names: list[str] = []
             item_summaries: list[str] = []
@@ -460,11 +510,11 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
             row["primary_subtotal"] = None
 
             for idx, item in enumerate(items):
-                product = item.get("products") if isinstance(item, dict) else None
-                if not product:
+                if not isinstance(item, dict):
                     continue
 
-                name = product.get("name")
+                name = item.get("product_name")
+                unit = item.get("product_unit") or "kg"
                 quantity = item.get("quantity")
                 unit_price = item.get("unit_price")
 
@@ -472,9 +522,9 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
                     product_names.append(name)
 
                     if quantity is not None and unit_price is not None:
-                        item_summaries.append(f"{name} {quantity}kg x {unit_price:,}원")
+                        item_summaries.append(f"{name} {quantity}{unit} x {unit_price:,}원")
                     elif quantity is not None:
-                        item_summaries.append(f"{name} {quantity}kg")
+                        item_summaries.append(f"{name} {quantity}{unit}")
                     else:
                         item_summaries.append(name)
 
@@ -929,6 +979,30 @@ def create_order(
     try:
         supabase = get_supabase_client()
 
+        # seller_id가 UUID가 아니면 이름/회사명으로 자동 검색
+        if seller_id and not _UUID_PATTERN.match(str(seller_id)):
+            lookup = _find_seller_by_name(supabase, str(seller_id))
+            if not lookup["found"]:
+                candidates = lookup.get("candidates", [])
+                if candidates:
+                    names = ", ".join(
+                        f"{c.get('name') or c.get('company_name')}(ID:{c['id']})"
+                        for c in candidates
+                    )
+                    return {
+                        "success": False,
+                        "llm_retry": True,
+                        "error": (
+                            f"'{seller_id}' 이름에 해당하는 판매자가 여럿입니다: {names}. "
+                            "사용자에게 어느 판매자인지 확인한 뒤 seller_id=UUID 로 다시 호출하세요."
+                        ),
+                    }
+                return {
+                    "success": False,
+                    "error": f"'{seller_id}' 판매자를 찾을 수 없습니다. 정확한 이름을 확인해주세요.",
+                }
+            seller_id = lookup["id"]
+
         # product_id가 UUID가 아니면 상품명으로 자동 검색
         if product_id and not _UUID_PATTERN.match(str(product_id)):
             found = _find_product_by_name(supabase, product_id, seller_id)
@@ -1057,7 +1131,7 @@ def delete_order(order_id: str, user_id: str) -> dict:
         # 주문 존재 및 권한 확인
         check = (
             supabase.table("orders")
-            .select("id, order_number, buyer_id, seller_id")
+            .select("id, order_number, buyer_id, seller_id, status")
             .eq("id", order_id)
             .is_("deleted_at", None)
             .execute()
@@ -1071,7 +1145,29 @@ def delete_order(order_id: str, user_id: str) -> dict:
             return {"success": False, "error": "권한 없음: 해당 주문에 접근할 수 없습니다."}
 
         now_utc = datetime.now(timezone.utc).isoformat()
+
+        # soft-delete 전 status를 CANCELLED로 변경 — 안전망.
+        # 이 도구는 진짜 삭제 전용이지만, 혹여 취소 목적으로 호출됐더라도
+        # status=CANCELLED가 먼저 설정되어야 완료/취소 탭에서 보인다.
+        # (deleted_at 설정 후에는 list_orders IS NULL 필터에 걸려 완전히 사라짐)
+        current_status = order_data.get("status", "")
+        if current_status not in ("CANCELLED", "COMPLETED"):
+            supabase.table("orders").update({"status": "CANCELLED"}).eq("id", order_id).execute()
+            _sync_calendar_events_for_order_id(order_id)
+
         supabase.table("orders").update({"deleted_at": now_utc}).eq("id", order_id).execute()
+
+        # soft-delete 후에도 calendar_events 정리 — 사용자가 이미 CANCELLED/COMPLETED 주문을 삭제한 경우
+        # 위 step의 status 분기를 거치지 않아 sync가 호출되지 않으므로 누락된 일정이 남는다.
+        # _sync_calendar_events_for_order_sync 는 deleted_at 분기로 자동 soft-delete 처리.
+        # sync 실패가 delete 자체를 막지 않도록 try/except 로 감싼다.
+        try:
+            _sync_calendar_events_for_order_id(order_id)
+        except Exception as sync_err:
+            print(
+                f"[agent_tools.delete_order] calendar sync 실패 (무시): "
+                f"order_id={order_id}, error={type(sync_err).__name__}: {sync_err}"
+            )
 
         return {
             "success": True,
@@ -3745,6 +3841,92 @@ def get_incoming_subscription_requests(user_id: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def get_partners(
+    user_id: str,
+    status: Optional[str] = None,
+    status_in: Optional[list[str]] = None,
+) -> dict:
+    """현재 거래처 목록 조회.
+
+    status (단일) 또는 status_in (배열) 으로 필터링.
+    가능한 status: ACTIVE, PENDING_OUTGOING, PENDING_INCOMING, INACTIVE
+      (REJECTED 는 partners 스키마에 없어 0건 반환됨 — 거절 시 soft-delete 처리됨)
+    상태 미지정 시 ACTIVE 만 기본 (사용자 의도가 보통 '활성 거래처').
+
+    내부적으로 partner_service.list_partners 에 위임 (limit=200 으로 1페이지 조회).
+    응답 row 는 partner_user 임베딩이 평탄화된 형태:
+      {id, user_id, partner_user_id, status, nickname, notes,
+       partner_name, partner_company, partner_role, partner_phone,
+       created_at, updated_at, ...}
+    """
+    user_clean = (user_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {
+            "success": False,
+            "error": "invalid_user_id",
+            "partners": [],
+            "count": 0,
+        }
+
+    # status_in 우선 적용 — 배열이면 status 단일 필터를 무시하고 OR 조회.
+    # supabase-py 는 in_() 를 지원 — partner_service.list_partners 가 단일 status 만
+    # 지원하므로, status_in 이 들어오면 직접 supabase 쿼리로 처리한다.
+    requested_status_list: Optional[list[str]] = None
+    if status_in and isinstance(status_in, list) and len(status_in) > 0:
+        requested_status_list = [s for s in status_in if isinstance(s, str) and s]
+    elif status and isinstance(status, str):
+        requested_status_list = [status]
+    else:
+        # 기본값 — 활성 거래처만
+        requested_status_list = ["ACTIVE"]
+
+    try:
+        supabase = get_supabase_client()
+
+        # 임베디드 조인 — partner_service.list_partners 와 동일한 패턴.
+        query = (
+            supabase.table("partners")
+            .select(
+                "*, partner_user:users!partner_user_id(name, company_name, role, phone)"
+            )
+            .eq("user_id", user_clean)
+            .is_("deleted_at", None)
+        )
+
+        # 단일 vs 다중 필터 분기
+        if len(requested_status_list) == 1:
+            query = query.eq("status", requested_status_list[0])
+        else:
+            query = query.in_("status", requested_status_list)
+
+        # 최신 순, 도구 응답은 1페이지 200건 한도
+        result = query.order("created_at", desc=True).limit(200).execute()
+        rows = result.data or []
+
+        partners: list[dict] = []
+        for row in rows:
+            partner_user = row.pop("partner_user", None) or {}
+            row["partner_name"] = partner_user.get("name")
+            row["partner_company"] = partner_user.get("company_name")
+            row["partner_role"] = partner_user.get("role")
+            row["partner_phone"] = partner_user.get("phone")
+            partners.append(row)
+
+        return {
+            "success": True,
+            "partners": partners,
+            "count": len(partners),
+            "filter_status": requested_status_list,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "partners": [],
+            "count": 0,
+        }
+
+
 def get_incoming_partner_requests(user_id: str) -> dict:
     """내게 들어온 PENDING_INCOMING 거래처 등록 요청 목록을 반환한다."""
     user_clean = (user_id or "").strip()
@@ -3850,6 +4032,7 @@ TOOL_FUNCTION_MAP = {
     "get_user_profile": get_user_profile,
     "request_partner_registration": request_partner_registration,
     "request_partner_registration_by_name": request_partner_registration_by_name,
+    "get_partners": get_partners,
     "get_incoming_subscription_requests": get_incoming_subscription_requests,
     "get_incoming_partner_requests": get_incoming_partner_requests,
     "accept_partner_request": accept_partner_request,

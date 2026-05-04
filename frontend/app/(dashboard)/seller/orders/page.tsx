@@ -10,6 +10,7 @@ import StatusBadge from '@/components/common/StatusBadge';
 import NegotiationHistory from '@/components/common/NegotiationHistory';
 import DeliveryDateChangeSection from '@/components/common/DeliveryDateChangeSection';
 import CancelOrderModal from '@/components/common/CancelOrderModal';
+import CancelRequestPanel from '@/components/common/CancelRequestPanel';
 import PartnerDetailModal from '@/components/partners/PartnerDetailModal';
 import CounterOfferModal from '@/components/seller/CounterOfferModal';
 import {
@@ -311,7 +312,16 @@ export default function SellerOrdersPage() {
     {
       key: 'status',
       header: '상태',
-      render: (item) => <StatusBadge status={item.status} />,
+      render: (item) => (
+        <div className="flex flex-col items-center gap-1">
+          <StatusBadge status={item.status} />
+          {item.pending_cancel_request && (
+            <span className="inline-flex items-center rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
+              취소 요청
+            </span>
+          )}
+        </div>
+      ),
     },
     {
       key: 'actions',
@@ -734,6 +744,16 @@ export default function SellerOrdersPage() {
                 currentDeliveryDate={selectedOrder.delivery_date}
               />
             </div>
+
+            {/* 구매자 취소 요청 패널 — PENDING 요청이 있을 때만 표시 */}
+            {selectedOrder.pending_cancel_request && (
+              <div className="border-t border-gray-200 p-4">
+                <CancelRequestPanel
+                  orderId={selectedOrder.id}
+                  cancelRequest={selectedOrder.pending_cancel_request}
+                />
+              </div>
+            )}
 
             {/* 액션 버튼 영역 */}
             <div className="border-t border-gray-200 p-4">
