@@ -771,3 +771,63 @@ create_subscription_from_order,
 - **핵심 교훈 — 인프라 PR 은 "회귀 0 보장" 자체가 핵심 가치**: 큰 리팩터링은 1단계 인프라 PR + N단계 점진 이동 PR 로 분리하면 각 단계마다 회귀 영향이 독립적으로 검증 가능. PR 0 의 인프라가 0개 도구만 노출하더라도 unit test 7종으로 인프라 자체의 정합성을 검증해두면 다음 PR 들에서 도메인 모듈을 추가할 때마다 test_agent_registry 가 회귀 sentinel 역할을 한다.
 - **핵심 교훈 — 새 패키지의 `__init__.py` 첫 줄에 `from . import tools  # noqa: F401`**: 데코레이터 기반 등록 시스템은 모듈 import 가 곧 등록 트리거이므로, 외부에서 `from app.services.agent import TOOL_FUNCTION_MAP` 만 호출해도 자동으로 모든 도메인 모듈이 import 되어야 한다. 패키지 `__init__.py` 첫 줄에 명시적으로 `from . import tools` 를 박고, `tools/__init__.py` 에서 모든 도메인 모듈을 명시 import. 이렇게 하면 외부 호출자는 import 순서를 신경 쓸 필요 없이 자동으로 등록이 완료된 상태의 registry 를 받는다.
 - **핵심 교훈 — `--noconftest` 로 인프라 단위 테스트를 외부 의존성 없이 실행**: 기존 `backend/tests/conftest.py` 는 httpx/Supabase 등 외부 패키지 import 가 있어 venv 미설치 환경에서 collect 단계에서 실패한다. 인프라 단위 테스트(`test_agent_registry.py`) 는 자체 import 가 stdlib + pytest 만 사용하므로 `pytest --noconftest` 로 conftest 우회 실행하면 venv 없이도 7케이스 모두 통과. 다음 PR 들의 도메인 모듈 단위 테스트도 동일 패턴(외부 의존성 mock 또는 회피)으로 작성하면 venv 없이 검증 가능.
+
+#### 도구 모듈화 리팩터링 — PR 1 단계 1: 6개 도메인 모듈 신설 (2026-05-04 완료)
+- 단계 1 의 핵심 가치 — **회귀 0 보장 (PR 0 와 동일 원칙)**: `agent_tools.py` / `orchestrator.py` 일절 수정 X (`git diff` 0 lines). 새 도메인 모듈에 `@tool` 데코레이터로 도구를 복제 등록만 하고, 단계 2 에서 agent_tools.py 를 shim 으로 변환 + orchestrator import 경로 교체 예정.
+- 신설 6개 모듈 (절대 경로, 도구 수, 라인 수):
+  - `backend/app/services/agent/tools/product.py` (604 lines, 6 도구) — get_products, check_stock, update_stock, create_product, delete_product, update_product. 도메인 helper `_find_product_by_name` 포함 (order/subscription 모듈에서 lazy import 로 재사용).
+  - `backend/app/services/agent/tools/order.py` (861 lines, 6 도구) — get_orders, get_order_detail, update_order_status, update_order, create_order, delete_order. `_sync_calendar_events_for_order_id` / `_run_async_in_thread` / `_service_error_payload` / `_find_seller_by_name` / `_deduct_seller_stock_for_order` 는 agent_tools.py 에서 lazy import (단계 2 에서 _shared.py 로 이동 예정).
+  - `backend/app/services/agent/tools/partner.py` (900 lines, 7 도구) — find_alternative_partners, request_partner_registration, request_partner_registration_by_name, get_partners, get_incoming_partner_requests, accept_partner_request, reject_partner_request. 도메인 helper `_build_partner_response` 포함.
+  - `backend/app/services/agent/tools/subscription.py` (796 lines, 4 도구) — create_subscription_request, accept_subscription_request, reject_subscription_request, create_subscription_from_order. 도메인 helper `_normalize_frequency` / `_normalize_iso_date` / `_resolve_subscription_items` 포함. (`get_incoming_subscription_requests` 는 다음 PR 에서 추가.)
+  - `backend/app/services/agent/tools/negotiation.py` (548 lines, 6 도구) — submit/accept/reject_counter_offer + submit/accept/reject_delivery_date_change. 모든 도구가 동기 sync 래퍼로 `order_service` async 메서드를 `_run_async_in_thread` 통해 호출.
+  - `backend/app/services/agent/tools/user.py` (452 lines, 4 도구) — get_user_profile, find_sellers_by_product, find_buyers_by_product, open_chat_room. (사용자/판매자/구매자 탐색 도구는 user 도메인에 묶었음.)
+- `backend/app/services/agent/tools/__init__.py` 갱신 — 6 모듈 import 추가, calendar/chat/get_incoming_subscription_requests 는 PR 2/3 예약.
+- 검증 결과 — 5종 모두 통과:
+  1. AST 파싱: 6개 신규 모듈 모두 OK.
+  2. import 동작: `from app.services.agent import TOOL_FUNCTION_MAP` → 33개 도구 등록 (TOOLS schemas 33, TOOLS_CALENDAR 0, TOOLS_CHAT 0). 6+6+7+4+6+4 = 33 정확히 일치.
+  3. 단위 테스트: `pytest tests/test_agent_registry.py --noconftest -v` → 9 passed (기존 7 + 신규 2: `test_domain_modules_register_33_tools` + `test_domain_modules_int_fields_union`).
+  4. agent_tools.py 공존: `agent_tools.TOOL_FUNCTION_MAP` 41개 + `agent.TOOL_FUNCTION_MAP` 33개 동시 import 시 RuntimeError 미발생 — `@tool` 데코레이터가 도메인 모듈에만 있고 agent_tools.py 에는 없어 같은 이름 등록 충돌 없음.
+  5. 회귀 0: orchestrator.TOOLS 35 (변경 없음, 35 = PR 1 33 + 단계 2 미도착 2: `get_incoming_subscription_requests` + `send_chat_message`), TOOLS_CALENDAR 4, TOOLS_CHAT 3 모두 변경 없음.
+- **핵심 교훈 — cross-domain helper 는 단계 1 에서 lazy import 로 충분**: `_run_async_in_thread`, `_service_error_payload`, `_UUID_PATTERN`, `_sync_calendar_events_for_order_id` 등은 agent_tools.py top-level 에 있고 단계 2 에서 `_shared.py` 로 이동 예정. 단계 1 에서는 도메인 모듈 함수 본문 안쪽에서 `from app.services.agent_tools import _run_async_in_thread` 형태로 lazy import — 모듈 top-level import 보다 코드 가독성이 떨어지지만 **순환 import 위험을 회피**하고 단계 2 에서 한꺼번에 정리 가능. 도메인 helper (`_find_product_by_name`, `_build_partner_response`, `_normalize_frequency` 등) 는 처음부터 도메인 모듈 안에 직접 둠.
+- **핵심 교훈 — 같은 이름 함수가 두 곳에 살아도 ToolRegistry 중복 안 터지는 이유**: `agent_tools.py` 의 33 함수는 `TOOL_FUNCTION_MAP` 딕셔너리에만 등록되어 있고 `@tool` 데코레이터가 없다. 새 `app/services/agent/tools/*.py` 의 함수들만 `@tool` 데코레이터로 `ToolRegistry._items` 에 등록되므로 한 이름당 등록 1회만 발생 → 단계 1 에서 같은 함수가 두 파일에 동시 존재해도 RuntimeError("ToolRegistry 중복 등록") 발생 안 함. 단계 2 에서 agent_tools.py 의 함수 본문을 `from .agent.tools.product import get_products` 형태의 shim 으로 변환할 때 그제서야 두 곳에서 같은 함수 객체를 참조하게 되어 중복 우려가 사라짐.
+- **검증된 lazy import 패턴 (단계 1 단점 회피용)**: 모듈 top-level 에서 `from app.services.agent_tools import ...` 하면 agent_tools.py 가 로드되며 그 안에서 `from app.services.order_service import order_service` 등이 chain reaction 으로 실행될 수 있다. 단계 1 에서는 함수 안쪽에 lazy import 두면 첫 호출 시점까지 import 지연 → 다른 도구가 같은 helper 를 호출해도 Python 의 module cache 가 한 번만 import 보장.
+- 단계 2 (다음 PR) 작업 범위:
+  1. agent_tools.py 의 33 함수를 `from .agent.tools.{domain} import {fn_name}` 형태의 shim 으로 변환.
+  2. `_shared.py` 에 cross-domain helper (`_run_async_in_thread`, `_service_error_payload`, `_UUID_PATTERN`) 이동 + agent_tools.py 의 동일 helper 는 re-export shim.
+  3. orchestrator.py 의 `from app.services.agent_tools import TOOL_FUNCTION_MAP, TOOLS, ...` 를 `from app.services.agent import ...` 로 교체.
+  4. 잔여 도구(get_incoming_subscription_requests, send_chat_message, calendar 4종, chat 2종) 는 PR 2/3 별도 처리.
+
+#### 도구 모듈화 리팩터링 — PR 1 단계 2: shim 변환 + orchestrator TOOLS 정리 (2026-05-04 완료)
+- 단계 2 의 핵심 가치 — **회귀 0 + 코드 -4255 줄**: `agent_tools.py` (4052 → 1310, -2742 줄) + `orchestrator.py` (3467 → 2302, -1165 줄). 단계 1 에서 도메인 모듈에 복제만 했던 33 도구의 본문이 이제 단일 정의 위치(`agent/tools/{domain}.py`) 만 남고, `agent_tools.py` 는 외부 호환을 위한 re-export shim 으로 축소.
+- agent_tools.py 변경 (1310 줄 — 약 70% 축소):
+  - 옮긴 33 도구 함수의 **본문 제거** + `from app.services.agent.tools.{domain} import ...` 형태로 re-export. `from app.services.agent_tools import get_products` 같은 옛 import 가 그대로 동작 (function identity 보존: `agent_tools.get_products IS agent.tools.product.get_products`).
+  - 잔존 8 도구 본문 유지: `get_chat_rooms`/`get_chat_messages`/`send_chat_message` (chat 3, PR 3 이동 예정), `get_calendar_events`/`create_calendar_event`/`update_calendar_event`/`delete_calendar_event` (calendar 4, PR 2 이동 예정), `get_incoming_subscription_requests` (subscription 1, PR 2/3 이동 예정).
+  - cross-domain helper 본문 유지 (PR 4 에서 `_shared.py` 로 이동 예정): `_UUID_PATTERN`, `_sync_calendar_events_for_order_id`, `_find_seller_by_name`, `_find_product_by_name`, `_run_async_in_thread`, `_service_error_payload`, `_deduct_seller_stock_for_order`. + `_resolve_chat_room_candidates`, `_do_send_chat_message` (chat 도구 내부 helper).
+  - `analyze_chat_consensus` + `CONSENSUS_SYSTEM_PROMPT` + `_CONSENSUS_FALLBACK` 유지 (chat_ws.py 가 직접 import; TOOL_FUNCTION_MAP 미등록).
+  - **TOOL_FUNCTION_MAP 머지**: `from app.services.agent import TOOL_FUNCTION_MAP as _REGISTRY_MAP` + 잔존 8 항목 직접 추가 = **41개** (33 + 8). 외부 코드 (`from app.services.agent_tools import TOOL_FUNCTION_MAP`) 는 그대로 41개 받음.
+  - 추가 re-export: `TOOLS`, `TOOLS_CALENDAR`, `TOOLS_CHAT`, `INT_FIELDS` 도 registry 에서 재노출 (옛 import 호환). 단계 2 시점 값 = TOOLS:33 / TOOLS_CALENDAR:0 / TOOLS_CHAT:0 (calendar/chat registry 등록은 PR 2/3).
+- orchestrator.py 변경 (2302 줄 — 약 33% 축소):
+  - line 73-1316 의 **`TOOLS = [...]` 리터럴 (1244 줄, 35 schema)** 제거 → registry 기반 합성으로 교체:
+    ```python
+    from app.services.agent import TOOLS as _REGISTRY_INVENTORY_ORDER_TOOLS
+    TOOLS = list(_REGISTRY_INVENTORY_ORDER_TOOLS) + [<send_chat_message_schema>, <get_incoming_subscription_requests_schema>]
+    ```
+    33 schema 는 `@tool` 데코레이터가 자동 노출, 잔존 2 schema (`send_chat_message`, `get_incoming_subscription_requests`) 는 도메인 모듈로 이동될 때까지 직접 보유 → LLM 회귀 0.
+  - `TOOLS_CALENDAR` (line 287, 4개), `TOOLS_CHAT` (line 363, 3개) 는 **그대로 유지** — calendar_data_node / chat_node 가 직접 사용. PR 2/3 에서 도메인 모듈 신설 시 registry 기반으로 교체 예정.
+  - `_execute_tool` 내부의 inline `INT_FIELDS = {...}` set (line 947) 도 그대로 유지 — 일관성을 위해 PR 4 에서 `agent.INT_FIELDS` 로 통합 예정.
+- 검증 (모두 PASSED):
+  1. `pytest tests/test_agent_registry.py` — 9/9 통과.
+  2. agent_tools 호환 import: `from app.services.agent_tools import TOOL_FUNCTION_MAP, TOOLS, TOOLS_CALENDAR, TOOLS_CHAT, get_products, ..., _UUID_PATTERN, _sync_calendar_events_for_order_id, analyze_chat_consensus` 41 / 33 / 0 / 0 모두 정상.
+  3. orchestrator 호환 import: `from app.services import orchestrator` → TOOLS:35 / TOOLS_CALENDAR:4 / TOOLS_CHAT:3 / TOOL_FUNCTION_MAP:41.
+  4. chat_ws 호환 import: `from app.websocket import chat_ws` → 정상 (analyze_chat_consensus, _sync_calendar_events_for_order_id, find_alternative_partners, get_chat_rooms 모두 정상 import).
+  5. function identity: `agent_tools.get_products is agent.tools.product.get_products` → True (re-export 가 같은 함수 객체).
+  6. FastAPI app boot: `from app.main import app` → 70 routes 정상 로드.
+- **검증된 패턴 — Option C (TOOL_FUNCTION_MAP 머지)**: `agent_tools.py` 의 `TOOL_FUNCTION_MAP` 을 완전히 제거하면 잔존 8 도구의 호출 경로가 끊긴다 (LLM 이 `send_chat_message` 를 부르려 하면 `KeyError`). 해결 = registry map (33) 과 잔존 8 항목을 한 dict 로 머지해 노출. orchestrator 의 `from app.services.agent_tools import TOOL_FUNCTION_MAP` 는 그대로 동작하며 41 항목 모두 호출 가능.
+- **검증된 패턴 — `list(_REGISTRY_TOOLS)` 사본 합성**: `TOOLS = _REGISTRY_TOOLS + [<leftover>]` 는 registry 의 내부 list 를 직접 변형할 위험이 있다 (앞으로 다른 PR 에서 `TOOLS_CALENDAR.append(...)` 같은 코드가 나오면 즉시 폭발). `list(_REGISTRY_TOOLS)` 로 얕은 복사한 뒤 `+ [<leftover>]` 로 합성하면 registry 는 immutable 유지. 동일 패턴 권장 — `list(...) + [...]` 합성.
+- **검증된 함정 — circular import 위험 (회피됨)**: `agent_tools.py` 가 `app.services.agent` 를 import 하고, `agent.tools.{domain}.py` 가 lazy import 로 `agent_tools._UUID_PATTERN` 을 가져온다. 이 두 방향이 합쳐져 circular 가 될 위험이 있지만, **lazy import 가 함수 본문 안쪽에 있어 첫 호출 시점까지 지연** 되므로 import 시점에는 cycle 이 닫히지 않는다. agent_tools.py 의 top-level 에서 `from app.services.agent import TOOL_FUNCTION_MAP as _REGISTRY_MAP` 가 실행될 때, agent 패키지의 `tools/__init__.py` 가 도메인 모듈을 import 하는 시점에는 함수 호출이 일어나지 않으므로 안전.
+- 단계 3 (PR 2/3 — chat / calendar 도메인 모듈 신설):
+  - PR 2 — calendar 도메인 모듈 신설 (4 도구). agent_tools.py 의 `get_calendar_events`/`create_calendar_event`/`update_calendar_event`/`delete_calendar_event` 본문 → `agent/tools/calendar.py` 로 이동 + `@tool(groups=("calendar",))` 등록. orchestrator.py 의 `TOOLS_CALENDAR` 리터럴 → `from app.services.agent import TOOLS_CALENDAR` 로 교체.
+  - PR 3 — chat 도메인 모듈 신설 (3 도구 + 잔존 helper). `get_chat_rooms`/`get_chat_messages`/`send_chat_message` + `_resolve_chat_room_candidates`/`_do_send_chat_message` → `agent/tools/chat.py` + chat 그룹 등록. orchestrator.py 의 `TOOLS_CHAT` 리터럴 → registry 교체. `analyze_chat_consensus` 는 chat_ws.py 만 쓰는 standalone 함수라 chat 도메인 모듈로 이동만 (registry 등록은 안 함).
+  - 같이 처리 — `get_incoming_subscription_requests` → `agent/tools/subscription.py` 로 이동 (PR 2 또는 3 에서 합치기 가능). orchestrator.py 의 잔존 schema 2개도 함께 제거.
+  - PR 4 — `_shared.py` 통합. `_UUID_PATTERN`/`_run_async_in_thread`/`_service_error_payload`/`_sync_calendar_events_for_order_id`/`_find_seller_by_name`/`_find_product_by_name`/`_deduct_seller_stock_for_order` → `agent/_shared.py` 이동. agent_tools.py 의 helper 본문을 re-export shim 으로. 모든 도메인 모듈의 lazy import 도 `from .._shared import ...` 로 교체.
+  - PR 5 — agent_tools.py 완전 제거. orchestrator import 를 `from app.services.agent import ...` 로 직접 교체.

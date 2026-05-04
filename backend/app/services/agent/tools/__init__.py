@@ -3,18 +3,25 @@
 각 모듈의 top-level 에서 @tool 데코레이터가 실행되며 registry 에 등록된다.
 새 도메인 모듈 추가 시 이 파일에 import 한 줄만 추가하면 자동 노출됨.
 
-PR 0 — 인프라만, 도메인 모듈 0 개. 다음 PR 들에서 추가 예정:
-- product (6 개)
-- order (6 개)
-- chat (4 개)
-- calendar (4 개)
-- partner (7 개)
-- subscription (4 개)
-- negotiation (6 개)
-- user (3 개)
+PR 1 — 6 개 도메인 모듈 (33 개 도구):
+- product       (6): get_products, check_stock, update_stock, create_product, delete_product, update_product
+- order         (6): get_orders, get_order_detail, update_order_status, update_order, create_order, delete_order
+- partner       (7): find_alternative_partners, request_partner_registration,
+                     request_partner_registration_by_name, get_partners,
+                     get_incoming_partner_requests, accept_partner_request, reject_partner_request
+- subscription  (4): create_subscription_request, accept_subscription_request,
+                     reject_subscription_request, create_subscription_from_order
+- negotiation   (6): submit/accept/reject_counter_offer, submit/accept/reject_delivery_date_change
+- user          (4): get_user_profile, find_sellers_by_product, find_buyers_by_product, open_chat_room
+
+다음 PR 에서 추가 예정:
+- chat       (3): get_chat_rooms, get_chat_messages, send_chat_message
+- calendar   (4): get/create/update/delete_calendar_event
+- subscription 보강 (1): get_incoming_subscription_requests
 """
-# 도메인 모듈 import — 다음 PR 에서 채움
-# from . import product  # noqa: F401
-# from . import order    # noqa: F401
-# from . import chat     # noqa: F401
-# ... 등
+from . import product       # noqa: F401
+from . import order         # noqa: F401
+from . import partner       # noqa: F401
+from . import subscription  # noqa: F401
+from . import negotiation   # noqa: F401
+from . import user          # noqa: F401
