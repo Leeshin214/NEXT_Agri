@@ -1,46 +1,35 @@
 'use client';
 
 import { useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, Pencil, Trash2 } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import DataTable, { type Column } from '@/components/common/DataTable';
 import SearchFilterBar from '@/components/common/SearchFilterBar';
 import StatusBadge from '@/components/common/StatusBadge';
-import Modal from '@/components/common/Modal';
-import { useProducts, useCreateProduct } from '@/hooks/useProducts';
-import { CATEGORY_OPTIONS, PRODUCT_STATUS_OPTIONS, UNIT_OPTIONS } from '@/constants/options';
-import type { Product, ProductCreate, ProductCategory, ProductUnit } from '@/types';
+import ProductFormModal from '@/components/products/ProductFormModal';
+import { useProducts, useDeleteProduct } from '@/hooks/useProducts';
+import { CATEGORY_OPTIONS, PRODUCT_STATUS_OPTIONS } from '@/constants/options';
+import type { Product } from '@/types';
 
 export default function SellerProductsPage() {
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
-  const [showModal, setShowModal] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<Product | null>(null);
 
   const { data, isLoading } = useProducts({
     category: categoryFilter || undefined,
     product_status: statusFilter || undefined,
     search: search || undefined,
   });
-  const createProduct = useCreateProduct();
+  const deleteProduct = useDeleteProduct();
   const products = data?.data ?? [];
 
-  const handleCreate = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const form = new FormData(e.currentTarget);
-    const payload: ProductCreate = {
-      name: form.get('name') as string,
-      category: form.get('category') as ProductCategory,
-      origin: (form.get('origin') as string) || undefined,
-      spec: (form.get('spec') as string) || undefined,
-      unit: form.get('unit') as ProductUnit,
-      price_per_unit: Number(form.get('price_per_unit')),
-      stock_quantity: Number(form.get('stock_quantity')) || 0,
-      min_order_qty: Number(form.get('min_order_qty')) || 1,
-      description: (form.get('description') as string) || undefined,
-    };
-    await createProduct.mutateAsync(payload);
-    setShowModal(false);
+  const handleDelete = async (product: Product) => {
+    if (deleteProduct.isPending) return;
+    if (!confirm(`'${product.name}' 상품을 삭제하시겠습니까?`)) return;
+    await deleteProduct.mutateAsync(product.id);
   };
 
   const columns: Column<Product>[] = [
@@ -85,6 +74,38 @@ export default function SellerProductsPage() {
       header: '상태',
       render: (item) => <StatusBadge status={item.status} />,
     },
+    {
+      key: 'actions',
+      header: '관리',
+      className: 'w-32',
+      render: (item) => (
+        <div className="flex items-center gap-1">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              setEditingProduct(item);
+            }}
+            title="상품 수정"
+            aria-label="상품 수정"
+            className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-500 hover:border-primary-300 hover:bg-primary-50 hover:text-primary-700"
+          >
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              handleDelete(item);
+            }}
+            disabled={deleteProduct.isPending}
+            title="상품 삭제"
+            aria-label="상품 삭제"
+            className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-400 hover:border-red-300 hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ),
+    },
   ];
 
   return (
@@ -94,7 +115,7 @@ export default function SellerProductsPage() {
         description="상품 등록 및 재고를 관리하세요"
         action={
           <button
-            onClick={() => setShowModal(true)}
+            onClick={() => setShowCreateModal(true)}
             className="flex items-center gap-2 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
           >
             <Plus className="h-4 w-4" />
@@ -132,58 +153,19 @@ export default function SellerProductsPage() {
       )}
 
       {/* 상품 등록 모달 */}
-      <Modal isOpen={showModal} onClose={() => setShowModal(false)} title="상품 등록" size="lg">
-        <form onSubmit={handleCreate} className="space-y-4">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">품목명 *</label>
-              <input name="name" required className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />
-            </div>
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">카테고리 *</label>
-              <select name="category" required className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500">
-                {CATEGORY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">원산지</label>
-              <input name="origin" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />
-            </div>
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">규격</label>
-              <input name="spec" placeholder="특, 상, 중" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />
-            </div>
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">단위 *</label>
-              <select name="unit" required className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500">
-                {UNIT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">단가 (원) *</label>
-              <input name="price_per_unit" type="number" required min={0} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />
-            </div>
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">재고 수량</label>
-              <input name="stock_quantity" type="number" defaultValue={0} min={0} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />
-            </div>
-            <div>
-              <label className="mb-1 block text-sm font-medium text-gray-700">최소 주문 수량</label>
-              <input name="min_order_qty" type="number" defaultValue={1} min={1} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />
-            </div>
-          </div>
-          <div>
-            <label className="mb-1 block text-sm font-medium text-gray-700">설명</label>
-            <textarea name="description" rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500" />
-          </div>
-          <div className="flex justify-end gap-2">
-            <button type="button" onClick={() => setShowModal(false)} className="rounded-lg border border-gray-300 px-4 py-2 text-sm hover:bg-gray-50">취소</button>
-            <button type="submit" disabled={createProduct.isPending} className="rounded-lg bg-primary-600 px-4 py-2 text-sm text-white hover:bg-primary-700 disabled:opacity-50">
-              {createProduct.isPending ? '등록 중...' : '등록'}
-            </button>
-          </div>
-        </form>
-      </Modal>
+      <ProductFormModal
+        mode="create"
+        isOpen={showCreateModal}
+        onClose={() => setShowCreateModal(false)}
+      />
+
+      {/* 상품 수정 모달 — editingProduct 가 truthy 일 때만 열림 */}
+      <ProductFormModal
+        mode="edit"
+        isOpen={!!editingProduct}
+        product={editingProduct}
+        onClose={() => setEditingProduct(null)}
+      />
     </div>
   );
 }

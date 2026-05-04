@@ -1019,6 +1019,89 @@ const filtered = data?.data ?? [];  // 서버가 필터링한 결과 그대로 �
 - 클라이언트 `products.filter()` useMemo 제거 — 페이지네이션 시 전체 데이터 없어도 서버가 정확히 필터링
 - `'' || undefined` 패턴 필수: 빈 문자열을 그대로 보내면 백엔드가 빈 값으로 필터링함
 
+#### ProductFormModal — 등록/수정 단일 컴포넌트 (검증됨, 2026-05-04)
+
+판매자 상품 페이지(`/seller/products`)는 상품 등록/수정 모달을 단일 컴포넌트 `components/products/ProductFormModal.tsx` 가 `mode: 'create' | 'edit'` prop 으로 양쪽을 모두 처리한다. 폼 필드가 거의 동일(11/12 필드 공통, status 만 edit 전용)하여 별도 컴포넌트로 나누면 중복이 큼.
+
+**핵심 패턴**:
+
+```typescript
+interface ProductFormModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  mode: 'create' | 'edit';
+  product?: Product | null;  // edit 모드 prefill 용
+}
+
+const isEdit = mode === 'edit';
+const createProduct = useCreateProduct();
+const updateProduct = useUpdateProduct();
+const isPending = isEdit ? updateProduct.isPending : createProduct.isPending;
+```
+
+**함정 — input defaultValue 캐시 무효화**:
+- React 의 `defaultValue` 는 mount 시점 값으로 한 번만 설정됨. 같은 모달이 여러 상품에 재사용되면 첫 prefill 이 캐시되어 후속 product 가 반영되지 않음.
+- 해결: `<form key={isEdit ? \`edit-${product?.id}\` : 'create'}>` — key 가 바뀌면 form 트리 전체 remount → input 들이 새 defaultValue 로 초기화.
+
+**상태 필드 분기**:
+- 백엔드 `ProductCreate` 에는 `status` 필드 없음 (등록 시 항상 'NORMAL' 시작), `ProductUpdate` 만 `status` 포함.
+- create 모드: status select 자체를 렌더하지 않음 (`{isEdit && <select name="status" .../>}`).
+
+**페이지 사용**:
+```typescript
+const [showCreateModal, setShowCreateModal] = useState(false);
+const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+
+// 두 모달을 한 페이지에 동시 마운트 — isOpen 으로 제어. editingProduct truthy 시에만 edit 모달 활성.
+<ProductFormModal mode="create" isOpen={showCreateModal} onClose={() => setShowCreateModal(false)} />
+<ProductFormModal
+  mode="edit"
+  isOpen={!!editingProduct}
+  product={editingProduct}
+  onClose={() => setEditingProduct(null)}
+/>
+```
+
+`useCreateProduct` / `useUpdateProduct` 가 onSuccess 에서 `['products']` 캐시 invalidate 하므로 모달 닫은 직후 목록 자동 갱신. 별도 refetch 호출 불필요.
+
+#### DataTable 행 액션 컬럼 — 아이콘 버튼 패턴 (검증됨, 2026-05-04)
+
+판매자 상품 테이블에 "수정/삭제" 행 단위 액션을 추가할 때, 별도 행 클릭 핸들러를 쓰지 않고 마지막 컬럼에 아이콘 버튼 두 개를 넣는다. 행 클릭은 향후 상품 상세 페이지 진입에 남겨둔다 (즉, `<DataTable onRowClick={...}>` 미설정).
+
+```typescript
+{
+  key: 'actions',
+  header: '관리',
+  className: 'w-32',
+  render: (item) => (
+    <div className="flex items-center gap-1">
+      <button
+        onClick={(e) => { e.stopPropagation(); setEditingProduct(item); }}
+        title="상품 수정"
+        aria-label="상품 수정"
+        className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-500 hover:border-primary-300 hover:bg-primary-50 hover:text-primary-700"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </button>
+      <button
+        onClick={(e) => { e.stopPropagation(); handleDelete(item); }}
+        disabled={deleteProduct.isPending}
+        title="상품 삭제"
+        aria-label="상품 삭제"
+        className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-400 hover:border-red-300 hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  ),
+}
+```
+
+- 색 규약: 수정 = primary hover, 삭제 = red hover. 파트너 페이지(`/seller/partners`) 와 동일.
+- 아이콘 크기: `h-3.5 w-3.5` (DataTable 행 높이 `py-3` 와 어울림).
+- `e.stopPropagation()` 필수 — 향후 onRowClick 추가 시 충돌 방지.
+- 삭제는 `confirm()` 로 한 번 더 확인 후 `deleteProduct.mutateAsync(item.id)`.
+
 #### useOrders status_in 다중값 + 탭별 서버 필터링 (검증됨, 2026-04-27)
 
 주문/견적 페이지(`seller/orders`, `buyer/orders`)는 탭마다 백엔드를 다시 호출해 해당 상태만 받는다.
