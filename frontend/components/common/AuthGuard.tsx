@@ -65,7 +65,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
 
       // 3) store에 user 없으면 프로필 조회
       let resolvedUser: User | null = user;
-      if (!resolvedUser) {
+      if (!resolvedUser || !resolvedUser.id) {
         try {
           const result = await api.get<SuccessResponse<User>>('/users/me');
           resolvedUser = result.data;
@@ -82,7 +82,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
           } else {
             // 메타데이터 폴백
             resolvedUser = {
-              id: '',
+              id: session.user.id,
               supabase_uid: session.user.id,
               email: session.user.email ?? '',
               name: (session.user.user_metadata?.name as string) ?? '',

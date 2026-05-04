@@ -23,6 +23,7 @@ import {
 } from '@/hooks/useChat';
 import { useOrder } from '@/hooks/useOrders';
 import { useAuthStore } from '@/store/authStore';
+import { useUIStore } from '@/store/uiStore';
 import { cn } from '@/lib/utils';
 import { isSystemMessageContent } from '@/constants/chat';
 import type { AlternativePartner, NegotiationDraft } from '@/types';
@@ -80,6 +81,17 @@ export default function BuyerChatPage() {
   useEffect(() => {
     if (selectedRoomId) markAsRead.mutate(selectedRoomId);
   }, [selectedRoomId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 글로벌 AIChatPanel 이 현재 채팅방 컨텍스트를 백엔드에 함께 전달할 수 있도록
+  // selectedRoomId / linkedOrderId 를 uiStore 에 publish. 페이지 이탈 시 반드시 클리어.
+  const setAIChatContext = useUIStore((s) => s.setAIChatContext);
+  const clearAIChatContext = useUIStore((s) => s.clearAIChatContext);
+  useEffect(() => {
+    setAIChatContext({ roomId: selectedRoomId, orderId: linkedOrderId });
+    return () => {
+      clearAIChatContext();
+    };
+  }, [selectedRoomId, linkedOrderId, setAIChatContext, clearAIChatContext]);
 
   // 새 suggestion이 도착하면 dismissed 상태 초기화
   useEffect(() => {

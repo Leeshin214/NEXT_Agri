@@ -3697,6 +3697,132 @@ def create_subscription_from_order(
 
 # 오케스트레이터가 LLM 의 tool_use 응답에서 tool 이름을 보고
 # 실제 어떤 함수를 실행할지 찾을 때 이 딕셔너리를 사용한다.
+def get_incoming_subscription_requests(user_id: str) -> dict:
+    """내게 들어온 PENDING 정기배송 요청 목록을 반환한다 (내가 만들지 않은 것)."""
+    user_clean = (user_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id"}
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table("subscriptions") \
+            .select("id, seller_id, buyer_id, created_by, frequency, start_date, status, notes, subscription_items(product_id, quantity, unit_price, unit)") \
+            .eq("status", "PENDING") \
+            .neq("created_by", user_clean) \
+            .is_("deleted_at", None) \
+            .or_(f"seller_id.eq.{user_clean},buyer_id.eq.{user_clean}") \
+            .execute()
+        requests = []
+        for row in (result.data or []):
+            counterpart_id = row["buyer_id"] if row["seller_id"] == user_clean else row["seller_id"]
+            raw_items = row.get("subscription_items", []) or []
+            enriched_items = []
+            for item in raw_items:
+                pid = item.get("product_id")
+                product_name = None
+                if pid:
+                    try:
+                        pr = supabase.table("products").select("name").eq("id", pid).single().execute()
+                        product_name = (pr.data or {}).get("name")
+                    except Exception:
+                        pass
+                enriched_items.append({
+                    "product_id": pid,
+                    "product_name": product_name or pid,
+                    "quantity": item.get("quantity"),
+                    "unit_price": item.get("unit_price"),
+                    "unit": item.get("unit"),
+                })
+            requests.append({
+                "subscription_id": row["id"],
+                "from_user_id": counterpart_id,
+                "frequency": row.get("frequency", ""),
+                "start_date": row.get("start_date", ""),
+                "notes": row.get("notes", ""),
+                "items": enriched_items,
+            })
+        return {"success": True, "requests": requests, "count": len(requests)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def get_incoming_partner_requests(user_id: str) -> dict:
+    """내게 들어온 PENDING_INCOMING 거래처 등록 요청 목록을 반환한다."""
+    user_clean = (user_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id"}
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table("partners") \
+            .select("id, partner_user_id, status, notes, created_at, users!partners_partner_user_id_fkey(name, company_name, role)") \
+            .eq("user_id", user_clean) \
+            .eq("status", "PENDING_INCOMING") \
+            .is_("deleted_at", None) \
+            .execute()
+        requests = []
+        for row in (result.data or []):
+            partner_user = row.get("users") or {}
+            requests.append({
+                "partner_id": row["id"],
+                "from_user_id": row["partner_user_id"],
+                "from_name": partner_user.get("name", ""),
+                "from_company": partner_user.get("company_name", ""),
+                "from_role": partner_user.get("role", ""),
+                "created_at": row.get("created_at", ""),
+            })
+        return {"success": True, "requests": requests, "count": len(requests)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def accept_partner_request(user_id: str, partner_id: str) -> dict:
+    """들어온 거래처 등록 요청을 수락한다. partner_id는 partners 테이블 row UUID."""
+    user_clean = (user_id or "").strip()
+    partner_clean = (partner_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id"}
+    if not partner_clean or not _UUID_PATTERN.match(partner_clean):
+        return {"success": False, "error": "invalid_partner_id", "message": "partner_id가 필요합니다. get_incoming_partner_requests로 먼저 조회하세요."}
+    try:
+        supabase = get_supabase_client()
+        # 본인 row 확인
+        my_row = supabase.table("partners").select("*").eq("id", partner_clean).eq("user_id", user_clean).is_("deleted_at", None).single().execute().data
+        if not my_row:
+            return {"success": False, "error": "not_found", "message": "해당 거래처 요청을 찾을 수 없습니다."}
+        if my_row.get("status") != "PENDING_INCOMING":
+            return {"success": False, "error": "invalid_status", "message": f"수락할 수 없는 상태입니다: {my_row.get('status')}"}
+        # 양쪽 ACTIVE 전환
+        supabase.table("partners").update({"status": "ACTIVE"}).eq("id", partner_clean).execute()
+        supabase.table("partners").update({"status": "ACTIVE"}) \
+            .eq("user_id", my_row["partner_user_id"]).eq("partner_user_id", user_clean).is_("deleted_at", None).execute()
+        return {"success": True, "message": "거래처 등록 요청을 수락했습니다. 이제 거래처 목록에서 확인할 수 있습니다."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def reject_partner_request(user_id: str, partner_id: str) -> dict:
+    """들어온 거래처 등록 요청을 거절한다. partner_id는 partners 테이블 row UUID."""
+    user_clean = (user_id or "").strip()
+    partner_clean = (partner_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id"}
+    if not partner_clean or not _UUID_PATTERN.match(partner_clean):
+        return {"success": False, "error": "invalid_partner_id", "message": "partner_id가 필요합니다. get_incoming_partner_requests로 먼저 조회하세요."}
+    try:
+        supabase = get_supabase_client()
+        my_row = supabase.table("partners").select("*").eq("id", partner_clean).eq("user_id", user_clean).is_("deleted_at", None).single().execute().data
+        if not my_row:
+            return {"success": False, "error": "not_found", "message": "해당 거래처 요청을 찾을 수 없습니다."}
+        if my_row.get("status") != "PENDING_INCOMING":
+            return {"success": False, "error": "invalid_status", "message": f"거절할 수 없는 상태입니다: {my_row.get('status')}"}
+        now = datetime.utcnow().isoformat()
+        supabase.table("partners").update({"deleted_at": now}).eq("id", partner_clean).execute()
+        supabase.table("partners").update({"deleted_at": now}) \
+            .eq("user_id", my_row["partner_user_id"]).eq("partner_user_id", user_clean).is_("deleted_at", None).execute()
+        return {"success": True, "message": "거래처 등록 요청을 거절했습니다."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 TOOL_FUNCTION_MAP = {
     "get_products": get_products,
     "check_stock": check_stock,
@@ -3724,6 +3850,10 @@ TOOL_FUNCTION_MAP = {
     "get_user_profile": get_user_profile,
     "request_partner_registration": request_partner_registration,
     "request_partner_registration_by_name": request_partner_registration_by_name,
+    "get_incoming_subscription_requests": get_incoming_subscription_requests,
+    "get_incoming_partner_requests": get_incoming_partner_requests,
+    "accept_partner_request": accept_partner_request,
+    "reject_partner_request": reject_partner_request,
     # 카운터오퍼 / 납품일 변경 — order_service async 메서드를 thread+loop 로 호출
     "submit_counter_offer": submit_counter_offer,
     "accept_counter_offer": accept_counter_offer,
