@@ -589,3 +589,24 @@ create_subscription_from_order,
 - 핵심 안전장치: 가격/날짜/주기 같은 필수 정보가 발화에서 빠지면 도구 호출 X → 되묻기. 정보가 명확히 있으면 이중 confirmation 없이 즉시 호출(UX). 카드는 즉시 발송되어 채팅방에 PENDING 으로 노출되므로 도구 호출 직후 "○○으로 카드를 보냈습니다. 상대방이 수락/거절하면 알려드릴게요" 형식의 후속 흐름 안내 강조.
 - 환각 방지: "참치 찾아줘" → product_name='참치'만 정확 검색. 0건이라도 새우/연어 같은 다른 품목 추천 절대 금지. 사용자 명시 동의 후에만 find_alternative_partners 호출. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에 동시 호출 금지.
 - 도구 시그니처는 실제 함수 정의 그대로 매핑 (notes/proposed_total_amount/proposed_delivery_date/offer_id/change_id 등 실제 키 사용). placeholder 추가 없음 → KeyError 위험 0. AST OK, SELLER/BUYER 합성본 모두 _render_agent_system 통과 확인 완료.
+
+#### 구매자 자동 주문 확정 / 협상 분기 가이드 (2026-05-04)
+- 백엔드(`order_service.create_order`)에 `auto_confirm: bool` 파라미터가 추가되어 단가 비교 자동 분기 로직이 들어왔다 (`agent_tools.create_order` 는 항상 `auto_confirm=True` 로 호출). LLM 이 단가 비교를 흉내 내면 분기 판단이 이중으로 일어나 UX 가 망가지므로, 시스템 프롬프트에서 "백엔드가 알아서 분기한다"를 명시적으로 박는 것이 핵심.
+- 동작 분기:
+  - `unit_price >= product.price_per_unit` → 즉시 CONFIRMED + 재고 자동 차감 + 채팅 SYSTEM 메시지.
+  - `unit_price < product.price_per_unit` → QUOTE_REQUESTED 로 시작 후 자동 카운터오퍼 발송 → NEGOTIATING + PENDING 카드.
+- 적용 위치 (orchestrator.py):
+  - `BUYER_ROLE_APPENDIX` 의 `[🚨 구매자 주문/견적 생성 규칙 — 자동 확정 / 협상 분기]` 섹션 (4가지 발화 패턴 분기), `[🚨 단가 자동 조회 강제]` 섹션, `[🚨 주문 생성 결과 응답 표현]` 섹션. 기존 `[🚨 구매자 주문/견적 생성 규칙]` (단순히 create_order 호출만 안내하던 1줄짜리) 를 교체.
+  - `chat_node` 시스템 프롬프트 — `[재고 검색 vs 대체 거래처 분리]` 직후에 `[구매자 자동 주문 확정 / 협상 분기 가이드]` 섹션 추가. chat intent 로 라우팅된 구매자 주문 발화도 동일 분기 인식.
+- 핵심 발화 패턴 (4종):
+  1. 가격 미명시 ("망고 2kg 주문해줘") → `check_stock` 또는 `find_sellers_by_product` 로 `price_per_unit` 조회 → 그 값을 그대로 `unit_price` 로 채워 `create_order` → 백엔드가 단가 일치로 판단해 CONFIRMED.
+  2. 가격 명시 ("13만원에 망고 2kg 주문해줘") → 명시 가격 그대로 `unit_price` → 일치/이상이면 CONFIRMED, 낮으면 NEGOTIATING + 자동 카운터오퍼.
+  3. 협상 명시 ("깎아줘", "할인 받고 싶어") → `submit_counter_offer` 사용 (이미 PENDING/NEGOTIATING 주문 있어야). 가격 함께 언급된 새 주문이면 그 가격으로 `create_order` 해서 자동 협상 분기에 태움.
+  4. 수량만 + 의도 모호 ("망고 2kg") → 즉시 호출 X, "바로 주문할지 채팅방에서 조율할지" 한 번 확인.
+- 단가 자동 조회 강제: `unit_price` 가 비어있으면 안 됨. 사용자가 명시 안 했으면 반드시 조회 도구로 `price_per_unit` 확보 후 채울 것. "단가를 모르겠어요" 답변 금지.
+- 응답 표현 가이드 (별표/표/헤더 금지, 자연체):
+  - CONFIRMED (auto_confirmed=true): "○○ ○단위 주문이 확정됐습니다. 납품일은 ○월 ○일 예정입니다. 변경이 필요하시면 말씀해 주세요."
+  - NEGOTIATING (negotiating=true): "○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 판매자가 수락/거절하면 알려드릴게요."
+  - QUOTE_REQUESTED 등: "주문이 접수됐고 판매자 확인을 기다리고 있습니다."
+- placeholder 추가 없음 (한국어 본문만 추가). format KeyError 위험 0. AST OK, BUYER/SELLER 합성본 `_render_agent_system` 통과 확인 완료, 신규 BUYER 가이드는 SELLER 합성본에 누출되지 않음 확인.
+- 주의: SELLER 합성본에는 의도적으로 추가하지 않음 — 판매자는 직접 주문을 만들지 않으므로(`create_order` 권한 없음) 분기 판단 가이드가 불필요. SELLER 의 주문 확정은 `update_order_status(new_status="CONFIRMED")` 흐름이라 별개.

@@ -973,7 +973,7 @@ pytest-cov==6.0.0
   - 동일 패턴이지만 "재시도" 가 의미있는 경우(예: order_number 자동생성)는 except 블록에서 재시도 후 최종 실패 시 변환.
 
 - **order_number UNIQUE 충돌 방어 패턴 — 랜덤 + 재시도**: `_generate_order_number` 가 `ORD-{YYYYMMDD}-{HHMMSS}` (시분초) 기반이면 동시 합의 자동 주문 (chat_ws._handle_consensus) 에서 같은 초 두 요청이 충돌해 23505 → 500. 두 단계로 방어:
-  1. 패턴을 `ORD-{YYYYMMDD}-{random.randint(1000,9999)}` 로 통일 (agent_tools.create_order 와 동일)
+  1. 패턴을 `ORD-{YYYYMMDD}-{random.randint(1000,9999)}` 로 통일
   2. INSERT 23505 catch → order_number 재생성 + 재시도 (max 3회). 그래도 실패 시 409 변환.
   ```python
   for attempt in range(3):
@@ -988,7 +988,29 @@ pytest-cov==6.0.0
   else:
       raise HTTPException(409, "주문 번호 생성 반복 실패")
   ```
-  적용 위치: `order_service.create_order` 와 `agent_tools.create_order` 양쪽 모두.
+  적용 위치: `order_service.create_order` 단일 진입점. 이전에는 `agent_tools.create_order` 가 직접 INSERT 하며 같은 패턴을 중복 구현했으나, 2026-05-04 부터 `order_service.create_order` 로 통합됨 (아래 auto_confirm 항목 참조).
+
+- **`order_service.create_order` auto_confirm 단가 비교 분기 (2026-05-04)**: 구매자가 상품 목록 가격 그대로 살 의도면 즉시 CONFIRMED, 가격을 깎으면 NEGOTIATING + 자동 카운터오퍼로 분기. 라우터(POST /orders)는 기본값 `auto_confirm=False` 로 호출해 기존 CreateOrderModal 흐름 (QUOTE_REQUESTED 시작) 유지. AI 도구 (`agent_tools.create_order`) 와 chat consensus 자동 주문은 `auto_confirm=True` 로 호출해 즉시 확정/협상으로 분기.
+  ```python
+  async def create_order(self, buyer_id: UUID, data: dict, auto_confirm: bool = False) -> dict:
+      # 1) auto_confirm=True 면 products.price_per_unit 일괄 조회 → 라인별 비교
+      #    모든 라인 unit_price >= price_per_unit → "MATCH" (CONFIRMED)
+      #    한 라인이라도 unit_price < price_per_unit → "NEGOTIATE" (QUOTE_REQUESTED + 카운터오퍼)
+      # 2) MATCH 분기:
+      #    - status='CONFIRMED' 로 INSERT
+      #    - _deduct_seller_stock_for_order() 명시 호출 (재고 부족 → HTTPException 400)
+      #    - 채팅 ORDER_STATUS 메시지 ("○○ N단위 주문이 확정되었습니다. 납품일은 ○월 ○일 입니다.")
+      # 3) NEGOTIATE 분기:
+      #    - status='QUOTE_REQUESTED' 로 INSERT
+      #    - 기존 "새 견적 요청" SYSTEM 메시지 emit
+      #    - submit_counter_offer 호출 (proposed_total_amount=구매자 제시 합계)
+      #      → submit_counter_offer 내부에서 NEGOTIATING 자동 전환 + COUNTER_OFFER 카드 emit
+  ```
+  - 호출처별 정책: 라우터 = `auto_confirm` 미전달(기본 False); `agent_tools.create_order` = `auto_confirm=True` 명시; chat_ws consensus = agent_tools 경유로 자동 적용.
+  - `agent_tools.create_order` 는 더 이상 자체 INSERT 하지 않고 `_run_async_in_thread(lambda: order_service.create_order(buyer_id, data, auto_confirm=True))` 로 위임. product_id UUID/이름 해석 + seller 소속 검증 로직만 유지.
+  - MATCH 분기 재고 부족 시 HTTPException 400 (주문 행은 INSERT 된 상태로 남음 — buyer 가 재시도/취소 가능). NEGOTIATE 분기 자동 카운터오퍼 실패는 logger.error 만 + 주문은 QUOTE_REQUESTED 로 살아남음 (best-effort).
+  - 회귀 안전: 라우터 호출은 시그니처 변경 없음 (auto_confirm 기본값 False), 기존 CreateOrderModal/E2E 테스트 동작 그대로.
+  - 검증: AST 파싱 + venv import + signature 검증 (`['self', 'buyer_id', 'data', 'auto_confirm']`).
 
 - **PostgREST 임베딩으로 N+1 제거 (2026-04-27 검증)**: orders 같은 부모 테이블 응답에 buyer/seller(users), items+product 정보를 함께 내려야 할 때, 서비스 안에서 N개의 자식 select 를 따로 부르는 대신 PostgREST 의 select 임베딩 한 번으로 처리한다. count="exact" 와 임베딩이 동시에 잘 동작한다 (HTTP 206 + content-range 헤더 정상).
   ```python

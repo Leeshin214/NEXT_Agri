@@ -8,7 +8,6 @@ agent_tools.py — LangGraph 오케스트레이터에서 실제로 호출되는 
 
 import asyncio
 import json
-import random
 import re
 from calendar import monthrange
 from datetime import datetime, timezone
@@ -911,15 +910,14 @@ def create_order(
     delivery_address: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> dict:
-    """새 주문을 생성한다.
+    """새 주문을 생성한다 (AI 도우미 흐름 — auto_confirm=True 단가 비교 분기 적용).
 
-    order_number UNIQUE 충돌 (PostgreSQL 23505) 발생 시 최대 3회 재시도.
-    동시 합의 자동 주문 (chat_ws._handle_consensus) 흐름에서 동일 초 + 동일 random 4자리 시 발생 가능.
+    내부적으로 product_id 해석/검증을 마친 뒤 order_service.create_order(auto_confirm=True)
+    에 위임한다. 라우터(POST /orders) 와 달리 자동 분기를 거치므로:
+      - unit_price == products.price_per_unit (또는 그 이상): 즉시 CONFIRMED + 재고 차감 + 채팅 SYSTEM 메시지
+      - unit_price < products.price_per_unit: QUOTE_REQUESTED → 자동 카운터오퍼 → NEGOTIATING (PENDING 카드)
     product_id가 UUID가 아닌 상품명으로 들어온 경우 자동으로 이름 검색해 UUID로 변환한다.
     """
-    # 지연 import — 모듈 임포트 시점 의존성 회피
-    from postgrest.exceptions import APIError as PostgrestAPIError
-
     try:
         supabase = get_supabase_client()
 
@@ -941,7 +939,6 @@ def create_order(
             )
             if not verify.data:
                 # seller 소속 상품이 아님 → 올바른 상품 찾아서 에러에 힌트 포함
-                correct = _find_product_by_name(supabase, "", seller_id)
                 # seller 전체 상품 조회해서 힌트 제공
                 all_products = (
                     supabase.table("products")
@@ -965,80 +962,81 @@ def create_order(
                     ),
                 }
 
-        subtotal = quantity * unit_price
-        total_amount = subtotal
+        # order_service.create_order 호출용 payload 구성 (OrderCreate 스키마와 같은 키)
+        from app.services.order_service import order_service
 
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        order_payload: dict = {
+            "seller_id": str(seller_id),
+            "delivery_date": delivery_date,
+            "delivery_address": delivery_address,
+            "notes": notes,
+            "items": [
+                {
+                    "product_id": str(product_id),
+                    "quantity": int(quantity),
+                    "unit_price": int(unit_price),
+                    "notes": None,
+                }
+            ],
+        }
 
-        # order_number UNIQUE 충돌 시 최대 3회 재생성 + 재시도
-        order_result = None
-        last_err: Optional[Exception] = None
-        for attempt in range(3):
-            order_number = f"ORD-{today}-{random.randint(1000, 9999)}"
-            try:
-                order_result = (
-                    supabase.table("orders")
-                    .insert({
-                        "order_number": order_number,
-                        "buyer_id": buyer_id,
-                        "seller_id": seller_id,
-                        "status": "QUOTE_REQUESTED",
-                        "total_amount": total_amount,
-                        "delivery_date": delivery_date,
-                        "delivery_address": delivery_address,
-                        "notes": notes,
-                    })
-                    .execute()
+        try:
+            order = _run_async_in_thread(
+                lambda: order_service.create_order(
+                    buyer_id=buyer_id,
+                    data=order_payload,
+                    auto_confirm=True,  # AI 흐름 — 단가 비교 자동 분기 활성화
                 )
-                break
-            except PostgrestAPIError as e:
-                err_code = getattr(e, "code", "") or ""
-                err_msg = (getattr(e, "message", "") or "") + " " + str(e)
-                if err_code == "23505" or "23505" in err_msg or "duplicate" in err_msg.lower():
-                    last_err = e
-                    continue
-                raise
-        if order_result is None or not order_result.data:
-            return {
-                "success": False,
-                "error": f"주문 번호 생성에 반복 실패했습니다. {last_err}" if last_err else "주문 생성에 실패했습니다.",
-            }
+            )
+        except Exception as e:
+            return _service_error_payload(e)
 
-        order = order_result.data[0]
-        order_id = order["id"]
+        order_id = str(order.get("id", ""))
+        order_number = order.get("order_number", "")
+        order_status = order.get("status", "QUOTE_REQUESTED")
 
-        # order_items 테이블에 INSERT
-        items_result = (
-            supabase.table("order_items")
-            .insert({
-                "order_id": order_id,
-                "product_id": product_id,
-                "quantity": quantity,
-                "unit_price": unit_price,
-                "subtotal": subtotal,
-            })
-            .execute()
-        )
-        _sync_calendar_events_for_order_id(order_id)
+        # 분기에 따른 안내 메시지 (LLM 자연어 응답 생성에 도움)
+        if order_status == "CONFIRMED":
+            human_message = (
+                f"주문 {order_number}이 즉시 확정되었습니다. 판매자 재고가 자동 차감되었습니다."
+            )
+            next_action_hint = (
+                "사용자에게 주문 확정과 납품일을 안내하세요. 추가 변경이 필요하면 "
+                "submit_delivery_date_change 또는 update_order_status 를 사용하세요."
+            )
+        elif order_status == "NEGOTIATING":
+            human_message = (
+                f"주문 {order_number}이 생성되어 자동 협상이 시작되었습니다. "
+                f"채팅방에 카운터오퍼(PENDING) 카드가 노출되었습니다."
+            )
+            next_action_hint = (
+                "사용자에게 협상 카드를 발송했음을 알리세요. 판매자가 수락/거절하기 전까지 PENDING."
+            )
+        else:
+            human_message = f"주문 {order_number}이 생성되었습니다."
+            next_action_hint = (
+                "사용자가 이어서 '채팅방 열어줘'라고 하면 "
+                "open_chat_room 호출 시 반드시 이 order_id와 seller_id를 함께 사용하세요."
+            )
 
         return {
             "success": True,
             "order": order,
             "order_id": order_id,
             "order_number": order_number,
+            "status": order_status,
+            "auto_confirmed": order_status == "CONFIRMED",
+            "negotiating": order_status == "NEGOTIATING",
             "seller_id": seller_id,
             "buyer_id": buyer_id,
             "product_id": product_id,
             "quantity": quantity,
             "unit_price": unit_price,
-            "order_items": items_result.data or [],
-            "message": f"주문 {order_number}이 생성되었습니다.",
-            "next_action_hint": (
-                "사용자가 이어서 '채팅방 열어줘'라고 하면 "
-                "open_chat_room 호출 시 반드시 이 order_id와 seller_id를 함께 사용하세요."
-            ),
+            "order_items": order.get("items") or [],
+            "message": human_message,
+            "next_action_hint": next_action_hint,
         }
-    
+
     except Exception as e:
         return {"success": False, "error": str(e)}
 

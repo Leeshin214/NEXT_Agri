@@ -1569,9 +1569,39 @@ BUYER_ROLE_APPENDIX = """
 - 구매자는 상품을 검색하고, 판매자를 찾고, 견적/주문을 생성하고, 주문 건 채팅방을 열 수 있다.
 - 구매자는 상품 등록/수정/삭제, 판매자 재고 수정, 출고/배송 처리 권한이 없다.
 
-[🚨 구매자 주문/견적 생성 규칙]
-사용자가 "주문해줘", "발주 넣어줘", "견적 요청해줘"라고 명확히 말하면 create_order를 실행한다.
-단, 사용자가 수량만 말한 경우에는 바로 주문하지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인한다.
+[🚨 구매자 주문/견적 생성 규칙 — 자동 확정 / 협상 분기]
+구매자가 "○○ 주문해줘", "○○ 발주 넣어줘"처럼 명확한 주문 의도를 표현하면 망설이지 말고 즉시 create_order 를 호출한다.
+백엔드는 unit_price 와 상품의 price_per_unit 을 자동으로 비교해서 분기 처리하므로, LLM 은 단가 비교 로직을 직접 흉내 내려 하지 마라.
+
+발화 패턴별 처리:
+1) 가격이 명시되지 않은 경우 ("망고 2kg 주문해줘", "사과 한 박스 발주해줘"):
+   먼저 check_stock 또는 find_sellers_by_product 로 해당 상품을 조회해 price_per_unit 을 확인한다.
+   그 값을 그대로 unit_price 로 사용해 create_order 를 호출한다. 백엔드가 단가 일치로 판단해 CONFIRMED 로 즉시 확정하고 재고를 자동 차감한다.
+   "단가 ○○원으로 진행해도 될까요?"처럼 되묻지 마라. 사용자는 시세대로 사겠다는 의도이므로 이중 확인 없이 진행.
+
+2) 가격이 명시된 경우 ("13만원에 망고 2kg 주문해줘", "박스당 38000원에 사과 5박스 발주"):
+   사용자가 말한 가격을 그대로 unit_price 로 넣어 create_order 를 호출한다.
+   - 단가 일치 (또는 그 이상): 백엔드가 CONFIRMED 로 즉시 확정 + 재고 차감.
+   - 단가가 상품 시세보다 낮음: 백엔드가 QUOTE_REQUESTED 로 시작해 자동으로 카운터오퍼를 제시하고 NEGOTIATING 으로 전환. 채팅방에 PENDING 카드가 노출된다.
+   LLM 이 "단가가 낮은데 그래도 보낼까요?"처럼 되묻지 마라. 사용자가 단가를 명시했다는 건 협상을 시도하겠다는 의도이므로 그대로 호출.
+
+3) 협상 명시 ("그 가격은 좀 깎아줘", "할인 받고 싶어", "협상해줘"):
+   create_order 가 아니라 submit_counter_offer 를 사용한다. 이미 PENDING/NEGOTIATING 상태의 주문이 있을 때만 가능 — 없으면 먼저 주문을 만들어야 한다고 안내하거나, 가격이 함께 언급되면 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.
+
+4) 수량만 있고 주문 의도가 모호한 경우 ("망고 2kg"):
+   바로 create_order 를 부르지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인한다.
+
+[🚨 단가 자동 조회 강제]
+create_order 호출 시 unit_price 가 비어있으면 절대 안 된다. 사용자가 단가를 명시하지 않았으면 반드시 check_stock 또는 find_sellers_by_product 로 상품을 조회해 price_per_unit 을 확보한 뒤 그 값을 unit_price 로 채워라.
+"단가를 모르겠어요" 같은 답은 금지 — 조회 도구로 직접 확인할 수 있다.
+
+[🚨 주문 생성 결과 응답 표현]
+create_order 결과의 status 값에 따라 응답을 다르게 작성한다. 별표/표/헤더 사용 금지, 자연체 한국어로.
+- status="CONFIRMED" (auto_confirmed=true): "○○ ○단위 주문이 확정됐습니다. 납품일은 ○월 ○일 예정입니다. 변경이 필요하시면 말씀해 주세요." 형식. 재고가 자동 차감되었음을 함께 안내해도 좋다.
+- status="NEGOTIATING" (negotiating=true): "○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 판매자가 수락/거절하면 알려드릴게요." 형식. 채팅방에 PENDING 카드가 노출됐다는 점도 자연스럽게 덧붙인다.
+- status="QUOTE_REQUESTED" 등 그 외: "주문이 접수됐고 판매자 확인을 기다리고 있습니다." 형식.
+
+주문 직후 사용자가 "○월 ○일에 받고 싶어"처럼 납품일을 추가로 말하면 submit_delivery_date_change 를 호출하면 된다 (자연어 → 카드 도구 매핑 가이드 참고).
 
 [🚨 주문 생성 후 채팅방 연결 규칙]
 create_order 실행 직후 사용자가 "채팅방 열어줘", "판매자랑 얘기할래", "채팅 연결해줘"라고 말하면 일반 채팅방을 열지 말고, 직전 create_order 결과의 order_id를 open_chat_room에 반드시 전달한다.
@@ -2393,6 +2423,18 @@ async def chat_node(state: AgentState) -> dict:
         "[재고 검색 vs 대체 거래처 분리 (환각 방지)]\n"
         "- 사용자가 '참치 찾아줘'라고 하면 find_sellers_by_product 또는 check_stock 으로 product_name='참치'만 정확 검색. 결과 0건이라도 새우/연어 같은 다른 품목을 추천하는 행위는 절대 금지.\n"
         "- 결과 0건이거나 전부 OUT_OF_STOCK 이면 그 사실을 그대로 안내하고 '다른 품목이나 비슷한 카테고리로 대체 거래처를 찾아볼까요?'라고 사용자 동의를 구한 뒤에만 find_alternative_partners 호출.\n"
+        "\n"
+        "[구매자 자동 주문 확정 / 협상 분기 가이드]\n"
+        "- 구매자가 '○○ 주문해줘', '○○ 발주 넣어줘'처럼 명확한 주문 의도를 표현하면 즉시 create_order 를 호출한다. 백엔드가 unit_price 와 상품의 price_per_unit 을 자동으로 비교해 분기 처리하므로 LLM 이 단가 비교를 직접 흉내 내지 않는다.\n"
+        "- 가격 미명시 발화 ('망고 2kg 주문해줘'): 먼저 check_stock 또는 find_sellers_by_product 로 상품을 조회해 price_per_unit 을 확보한 뒤 그 값을 그대로 unit_price 로 넣어 create_order 호출. 백엔드가 단가 일치로 판단해 CONFIRMED 로 즉시 확정하고 재고를 자동 차감한다. '단가 ○○원으로 진행할까요?' 되묻기 금지.\n"
+        "- 가격 명시 발화 ('13만원에 망고 2kg 주문해줘'): 사용자가 말한 가격을 그대로 unit_price 로 넣어 create_order 호출. 백엔드가 단가와 비교해서 일치하면 CONFIRMED, 낮으면 NEGOTIATING + 자동 카운터오퍼 카드(PENDING) 발송으로 분기. '단가가 낮은데 보낼까요?' 되묻기 금지.\n"
+        "- 협상 명시 발화 ('그 가격 좀 깎아줘', '할인 받고 싶어', '협상해줘'): create_order 가 아니라 submit_counter_offer 를 사용. PENDING/NEGOTIATING 상태 주문이 이미 있을 때만 가능. 가격이 함께 언급된 새 주문이면 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.\n"
+        "- 단가 자동 조회 강제: create_order 호출 시 unit_price 가 비어있으면 안 된다. 사용자가 단가를 명시하지 않았으면 반드시 check_stock 또는 find_sellers_by_product 로 price_per_unit 을 확보한 뒤 그 값으로 채워라. '단가를 모르겠어요' 답변 금지.\n"
+        "- 결과 응답 표현 (별표/표/헤더 금지, 자연체 한국어):\n"
+        "  - status=CONFIRMED (auto_confirmed=true): '○○ ○단위 주문이 확정됐습니다. 납품일은 ○월 ○일 예정입니다. 변경이 필요하시면 말씀해 주세요.' 형식.\n"
+        "  - status=NEGOTIATING (negotiating=true): '○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 채팅방에 카드를 발송했고, 판매자가 수락/거절하면 알려드릴게요.' 형식.\n"
+        "  - 그 외(QUOTE_REQUESTED): '주문이 접수됐고 판매자 확인을 기다리고 있습니다.' 형식.\n"
+        "- 주문 직후 사용자가 '○월 ○일에 받고 싶어'처럼 납품일을 말하면 submit_delivery_date_change 를 호출 (자연어 협상/납품일 → 카드 도구 매핑 가이드 참고).\n"
     )
 
     agent_messages = [

@@ -662,18 +662,86 @@ class OrderService:
             detail="Access denied",
         )
 
-    async def create_order(self, buyer_id: UUID, data: dict) -> dict:
+    async def create_order(
+        self,
+        buyer_id: UUID,
+        data: dict,
+        auto_confirm: bool = False,
+    ) -> dict:
+        """주문 생성.
+
+        auto_confirm 분기 (AI 도구 흐름 전용):
+          - False (기본 / CreateOrderModal 경로): 기존 동작 그대로 — status='QUOTE_REQUESTED'
+            로 INSERT 후 채팅방에 "새 견적 요청" SYSTEM 메시지 발송. 판매자 검토 대기.
+          - True (구매자가 상품 목록 가격 그대로 구매하려는 의도):
+              * 모든 라인의 unit_price 가 products.price_per_unit 와 같거나 높으면 →
+                즉시 CONFIRMED 로 INSERT + 판매자 재고 자동 차감 + 채팅방에 "주문 확정" SYSTEM
+                메시지 발송 (납품일 포함). 재고 부족 시 HTTPException 으로 실패.
+              * 한 라인이라도 unit_price < price_per_unit (구매자가 가격을 깎음) 이면 →
+                일반 QUOTE_REQUESTED 로 INSERT 후 즉시 자동 counter offer 생성
+                (submit_counter_offer 가 NEGOTIATING 자동 전환 + 채팅방에 PENDING 카드 노출).
+        """
         items_data = data.pop("items", [])
 
         # 총액 계산
         total = sum(item["quantity"] * item["unit_price"] for item in items_data)
+
+        # ────────────────────────────────────────────
+        # auto_confirm 사전 분기 — 상품 단가와 비교해 초기 status 결정
+        # ────────────────────────────────────────────
+        # 비교 결과:
+        #   "MATCH"     — 모든 라인 unit_price >= price_per_unit → CONFIRMED 로 INSERT
+        #   "NEGOTIATE" — 한 라인이라도 unit_price < price_per_unit → QUOTE_REQUESTED + 자동 카운터오퍼
+        #   None        — auto_confirm=False (기본 흐름)
+        auto_confirm_decision: Optional[str] = None
+        product_meta_by_id: dict[str, dict] = {}  # product_id -> {"name", "unit", "price_per_unit"}
+        if auto_confirm and items_data:
+            try:
+                product_ids = list({str(i["product_id"]) for i in items_data})
+                products_result = await asyncio.to_thread(
+                    lambda: self.client.table("products")
+                    .select("id, name, unit, price_per_unit")
+                    .in_("id", product_ids)
+                    .is_("deleted_at", None)
+                    .execute()
+                )
+                for p in products_result.data or []:
+                    product_meta_by_id[str(p["id"])] = p
+
+                negotiate = False
+                for item in items_data:
+                    pid = str(item["product_id"])
+                    pmeta = product_meta_by_id.get(pid)
+                    if not pmeta or pmeta.get("price_per_unit") is None:
+                        # 상품을 못 찾으면 안전하게 기존 흐름(QUOTE_REQUESTED)으로 회귀
+                        negotiate = True
+                        auto_confirm_decision = None
+                        break
+                    listed = int(pmeta["price_per_unit"])
+                    offered = int(item["unit_price"])
+                    if offered < listed:
+                        negotiate = True
+                        # 협상 흐름은 break 해도 되지만, 메시지 표시용으로 product_meta 는 유지
+                        break
+
+                if auto_confirm_decision is None:
+                    auto_confirm_decision = "NEGOTIATE" if negotiate else "MATCH"
+            except Exception as e:
+                print(
+                    f"[order_service.create_order] auto_confirm 가격 비교 실패 (기본 흐름으로 회귀): "
+                    f"{type(e).__name__}: {e}"
+                )
+                auto_confirm_decision = None
+
+        # 초기 status 결정 — MATCH 만 CONFIRMED 직접 INSERT, 그 외는 QUOTE_REQUESTED
+        initial_status = "CONFIRMED" if auto_confirm_decision == "MATCH" else "QUOTE_REQUESTED"
 
         base_payload = {
             **data,
             "buyer_id": str(buyer_id),
             "seller_id": str(data["seller_id"]),
             "total_amount": total,
-            "status": "QUOTE_REQUESTED",
+            "status": initial_status,
         }
 
         # order_number UNIQUE 충돌 시 최대 3회 재생성 + 재시도 (동시 합의 자동 주문 보호)
@@ -719,30 +787,123 @@ class OrderService:
                 ).execute()
             )
 
+        # ────────────────────────────────────────────
+        # MATCH 분기: CONFIRMED 로 INSERT 했으니 판매자 재고 차감
+        # ────────────────────────────────────────────
+        # 재고 부족 시 update_status 와 동일한 의미로 HTTPException(400) 을 던진다.
+        # 호출자(API/agent_tools)는 이 케이스에서 주문이 이미 INSERT 됐다는 점을 인지해야 한다 —
+        # update_status(CONFIRMED) 가 실패한 것과 동치이므로 buyer 가 재시도 시 같은 주문을
+        # CANCELLED 처리하거나 NEGOTIATING 으로 진행할 수 있도록 주문 행은 보존한다.
+        if auto_confirm_decision == "MATCH":
+            inventory_result = await self._deduct_seller_stock_for_order(order["id"])
+            if not inventory_result.get("success"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=inventory_result.get("error", "재고 차감에 실패했습니다."),
+                )
+
         created_order = await self.get_order(order["id"])
         if created_order:
             await self._sync_calendar_events_for_order(created_order)
 
-        # 견적 요청 ↔ 채팅 자동 연결: chat_room ensure + 시스템 메시지 발송
+        # ────────────────────────────────────────────
+        # 채팅방 자동 연결 + 분기별 시스템 메시지
+        # ────────────────────────────────────────────
         try:
             room = await self._ensure_chat_room_for_order(order)
             if room:
-                await self._emit_chat_event(
-                    room=room,
-                    sender_id=str(order["seller_id"]),
-                    message_type="SYSTEM",
-                    content=(
-                        f"새 견적 요청이 도착했습니다 - {order['order_number']}"
-                    ),
-                    metadata={
-                        "order_id": str(order["id"]),
-                        "order_number": order["order_number"],
-                        "total_amount": order.get("total_amount"),
-                    },
-                )
+                if auto_confirm_decision == "MATCH":
+                    # 즉시 확정 — 납품일 포함한 사용자 친화 SYSTEM 메시지
+                    delivery_date_str = self._date_only(order.get("delivery_date"))
+                    if delivery_date_str:
+                        try:
+                            d = datetime.fromisoformat(delivery_date_str).date()
+                            delivery_label = f"{d.month}월 {d.day}일"
+                        except Exception:
+                            delivery_label = delivery_date_str
+                    else:
+                        delivery_label = "협의 예정"
+
+                    # 첫 라인 기준 표시 (다중 라인 케이스는 외 N건)
+                    first_item = items_data[0] if items_data else {}
+                    pid = str(first_item.get("product_id", ""))
+                    pmeta = product_meta_by_id.get(pid, {})
+                    pname = pmeta.get("name") or "상품"
+                    punit = pmeta.get("unit") or ""
+                    qty = first_item.get("quantity", 0)
+                    extra = ""
+                    if len(items_data) > 1:
+                        extra = f" 외 {len(items_data) - 1}건"
+                    content = (
+                        f"{pname} {qty}{punit}{extra} 주문이 확정되었습니다. "
+                        f"납품일은 {delivery_label} 입니다."
+                    )
+                    await self._emit_chat_event(
+                        room=room,
+                        sender_id=str(order["buyer_id"]),
+                        message_type="ORDER_STATUS",
+                        content=content,
+                        metadata={
+                            "order_id": str(order["id"]),
+                            "order_number": order["order_number"],
+                            "from_status": "QUOTE_REQUESTED",
+                            "to_status": "CONFIRMED",
+                        },
+                    )
+                else:
+                    # QUOTE_REQUESTED — 기존 견적 요청 시스템 메시지
+                    await self._emit_chat_event(
+                        room=room,
+                        sender_id=str(order["seller_id"]),
+                        message_type="SYSTEM",
+                        content=(
+                            f"새 견적 요청이 도착했습니다 - {order['order_number']}"
+                        ),
+                        metadata={
+                            "order_id": str(order["id"]),
+                            "order_number": order["order_number"],
+                            "total_amount": order.get("total_amount"),
+                        },
+                    )
         except Exception as e:
             # 채팅 자동 연결 실패는 주문 생성을 막지 않음
             print(f"[order_service.create_order] chat 자동 연결 실패 (무시): {type(e).__name__}: {e}")
+
+        # ────────────────────────────────────────────
+        # NEGOTIATE 분기: 자동 카운터오퍼 발사 (PENDING 카드)
+        # ────────────────────────────────────────────
+        # submit_counter_offer 가 QUOTE_REQUESTED → NEGOTIATING 자동 전환 + 채팅 PENDING
+        # 카드 발송까지 처리한다. buyer 가 제시한 합계 금액으로 그대로 박는다.
+        if auto_confirm_decision == "NEGOTIATE":
+            try:
+                proposed_items = [
+                    {
+                        "product_id": str(i["product_id"]),
+                        "quantity": int(i["quantity"]),
+                        "unit_price": int(i["unit_price"]),
+                        "notes": i.get("notes"),
+                    }
+                    for i in items_data
+                ]
+                buyer_user = {"id": str(buyer_id), "role": "BUYER"}
+                await self.submit_counter_offer(
+                    order_id=order["id"],
+                    payload={
+                        "proposed_total_amount": int(total),
+                        "proposed_items": proposed_items,
+                        "notes": data.get("notes") or "구매자 제시 가격 (자동 협상)",
+                    },
+                    user=buyer_user,
+                )
+                # submit_counter_offer 안에서 status 가 NEGOTIATING 으로 전환되므로
+                # 응답에 반영하기 위해 created_order 를 다시 로드한다.
+                created_order = await self.get_order(order["id"])
+            except Exception as e:
+                # 카운터오퍼 자동 발사 실패는 주문 자체를 막지 않음 (QUOTE_REQUESTED 상태로 남김)
+                print(
+                    f"[order_service.create_order] 자동 카운터오퍼 실패 (QUOTE_REQUESTED 유지): "
+                    f"{type(e).__name__}: {e}"
+                )
 
         if not created_order:
             raise HTTPException(
