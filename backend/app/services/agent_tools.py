@@ -1157,6 +1157,18 @@ def delete_order(order_id: str, user_id: str) -> dict:
 
         supabase.table("orders").update({"deleted_at": now_utc}).eq("id", order_id).execute()
 
+        # soft-delete 후에도 calendar_events 정리 — 사용자가 이미 CANCELLED/COMPLETED 주문을 삭제한 경우
+        # 위 step의 status 분기를 거치지 않아 sync가 호출되지 않으므로 누락된 일정이 남는다.
+        # _sync_calendar_events_for_order_sync 는 deleted_at 분기로 자동 soft-delete 처리.
+        # sync 실패가 delete 자체를 막지 않도록 try/except 로 감싼다.
+        try:
+            _sync_calendar_events_for_order_id(order_id)
+        except Exception as sync_err:
+            print(
+                f"[agent_tools.delete_order] calendar sync 실패 (무시): "
+                f"order_id={order_id}, error={type(sync_err).__name__}: {sync_err}"
+            )
+
         return {
             "success": True,
             "order_id": order_id,
