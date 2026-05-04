@@ -14,9 +14,10 @@ OpenAI API 를 활용한 AI 업무 도우미 기능을 구현한다.
 |------|-----------|------|
 | 일반 대화 | POST /ai/chat | 프롬프트 자유 입력, 스트리밍 응답 |
 | 채팅 요약 | POST /ai/summarize-chat | 채팅 내용 요약 |
-| 메시지 초안 | POST /ai/draft-message | 상황에 맞는 메시지 초안 작성 |
+| 채팅 답장 초안 | POST /chat/draft | 채팅방 컨텍스트 기반 답장 본문 초안 (메시지 DB 저장 X). `services/draft_service.generate_chat_draft` |
 | 재고 분석 | POST /ai/inventory-alert | 재고 현황 분석 및 경고 |
 | 채팅 합의 감지 | agent_tools.analyze_chat_consensus | 채팅 메시지 → 합의/협상/거절/일반 분류, 합의 시 주문·캘린더 자동 생성 (AgenticPay) |
+| 채팅 협상 의도 감지 | services.negotiation_detection_service | 평문 메시지 → 품목/수량/단가 추출. confidence>=0.7 만 metadata.draft_negotiation 저장 + 발신자 본인에게만 WS push. **자동 등록 X** (사용자 [등록] 클릭 필수). |
 | 메인 오케스트레이터 | POST /ai/agent/chat | tool_use 기반 — DB 조회/수정 도구 자체 선택 |
 
 ---
@@ -551,3 +552,18 @@ find_alternative_partners, get_user_profile
 - consensus 후속 처리(`_handle_consensus`) 내부도 각 단계별 try/except — product 미매칭 시 주문 스킵 후 시스템 메시지만 broadcast
 - rejected 후속 처리(`_handle_rejected`) — `_infer_category(product_name)` 헬퍼로 카테고리 추론, 매칭 실패 시 "VEGETABLE" 기본값
 - `last_analysis` 인메모리 dict는 서버 재시작 시 초기화 — 의도된 동작, 영속성 불필요
+
+#### negotiation_detection_service 구현 패턴 (US-2, 2026-05-04)
+- `analyze_chat_consensus` 와 다르게 **비동기 async 함수** + `get_openai_client()` 사용 — `BackgroundTasks` 가 동일 이벤트 루프에서 실행되므로 await 가능 (asyncio.to_thread 래핑 불필요).
+- POST `/chat/rooms/{room_id}/messages` 라우터에서 `BackgroundTasks.add_task(process_message_for_negotiation, ...)` 로 전달 → 응답 시간에 영향 X.
+- `response_format={"type": "json_object"}` + `temperature=0.0` + `max_tokens=200` → 토큰 절약 + 결정적 출력.
+- 시스템 프롬프트 핵심: "B2B 농산물 채팅에서 가격 협상 의도 감지", confidence 가이드 명시 (셋 다 명확하면 0.85+, 둘만 있으면 0.6 이하, 잡담 0.2 이하), few-shot 예시 (옥수수 50kg 7만원 → 0.9 / 안녕하세요 → 0.0) 포함.
+- `room_context` 에 (있으면) 연결 주문의 상품 후보를 채워넣어 LLM 추론 가이드. order_id 없으면 빈 리스트.
+- `_normalize_detection_result` 가 LLM 출력을 강제 정규화 — 음수/0/문자열 콤마 단가 등 모두 안전 처리. 의미 없는 감지(product_name + quantity + unit_price 모두 None)는 None 반환해 호출 측에서 즉시 skip.
+- WS push 는 `manager.send_private_message(sender_id, payload)` — 채팅방 broadcast 가 아니므로 상대방은 절대 못 봄. 동일 user 다중 탭 모두 받음.
+- 모든 예외는 try/except 로 흡수 — `process_message_for_negotiation` 외부에서 raise 가 발생해도 chat 흐름이 안 막히도록.
+
+#### detect vs consensus 분리 정책 (검증된 설계)
+- `analyze_chat_consensus` (chat_ws.py 안에서 호출) — 합의/거절 감지 시 **자동으로** 주문 INSERT + 캘린더 등록 + 시스템 메시지 broadcast.
+- `negotiation_detection_service` (chat.py 라우터에서 호출) — 단순 협상 의도 감지 + metadata 저장 + 본인에게만 알림 → **사용자 [등록] 클릭 시에만** propose_counter_offer 호출.
+- 두 흐름은 동시 동작 가능 (한 메시지가 협상 의도 + 합의 양쪽 트리거 가능). consensus 가 먼저 자동 주문을 만들어도 draft_negotiation 은 별도 metadata 키라 충돌 없음.

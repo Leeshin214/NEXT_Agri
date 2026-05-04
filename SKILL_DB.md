@@ -224,6 +224,15 @@ CREATE INDEX idx_messages_room_type ON messages(room_id, message_type);
 { order_id: UUID, order_number: str, reason: str, cancelled_by: UUID }
 // SYSTEM (견적 요청 알림 등)
 { order_id: UUID, order_number: str, total_amount: int? }
+// TEXT 메시지의 draft_negotiation (US-2, 2026-05-04) — message_type 무관, AI 가 평문에서 감지한 협상 초안
+// 같은 metadata JSONB 안에 'draft_negotiation' 키로 머지 저장됨 (다른 키와 공존 가능)
+{ draft_negotiation: {
+    product_name: str|null, quantity: int|null, unit: str|null,
+    unit_price: int|null,        // KRW 정수
+    confidence: float,            // 0.0~1.0, 실제 저장된 값은 모두 >=0.7
+    detected_at: ISO timestamp,
+    dismissed_at: ISO timestamp|null
+}}
 ```
 
 ### notifications 테이블 — 우상단 종 아이콘 알림 (2026-04-29)

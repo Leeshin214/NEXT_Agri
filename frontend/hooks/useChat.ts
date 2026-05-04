@@ -10,6 +10,7 @@ import type {
   CounterOfferCreate,
   Message,
   MessageType,
+  NegotiationDraft,
   SuccessResponse,
 } from '@/types';
 import { useWebSocketChat } from './useWebSocketChat';
@@ -146,10 +147,58 @@ export function useMessagesWithWebSocket(roomId: string | null) {
   const alternativePartnersSuggestion =
     lastMessage?.type === 'alternative_partners_suggestion' ? lastMessage : null;
 
+  // 본인 user_id — negotiation_draft_detected 가드용
+  const { user } = useAuthStore();
+
   // WebSocket으로 수신한 메시지를 React Query 캐시에 즉시 반영
   // message 타입과 system 타입 모두 캐시에 추가
   useEffect(() => {
     if (!lastMessage || !roomId) return;
+
+    // ─ negotiation_draft_detected (US-2) ─────────────────────────────
+    // 발신자 본인에게만 도착하는 이벤트. 해당 message_id 의 metadata.draft_negotiation
+    // 를 캐시에 채워 MessageBubble 이 NegotiationDraftCard 를 렌더하도록 한다.
+    // 메시지 자체 INSERT 는 별도 'message' 이벤트로 도착하므로 도착 순서 무관하게
+    // 둘 다 처리할 수 있도록 캐시에 메시지가 아직 없으면 무시 (다음 message 도착 후
+    // 이 분기는 다시 트리거되지 않으므로 fallback 으로 messages 캐시 invalidate).
+    if (lastMessage.type === 'negotiation_draft_detected') {
+      const draft = lastMessage.draft;
+      const messageId = lastMessage.message_id;
+      const targetUserId = lastMessage.target_user_id;
+      // 본인에게 온 이벤트만 처리 (백엔드도 막지만 프론트도 가드)
+      if (
+        !draft ||
+        !messageId ||
+        !targetUserId ||
+        !user?.id ||
+        targetUserId !== user.id
+      ) {
+        return;
+      }
+      queryClient.setQueryData(
+        ['messages', roomId],
+        (old: SuccessResponse<Message[]> | undefined) => {
+          if (!old) return old;
+          let touched = false;
+          const next = old.data.map((m) => {
+            if (m.id !== messageId) return m;
+            touched = true;
+            return {
+              ...m,
+              metadata: { ...(m.metadata ?? {}), draft_negotiation: draft },
+            };
+          });
+          // 메시지가 아직 캐시에 없으면 fallback 으로 refetch
+          if (!touched) {
+            queryClient.invalidateQueries({ queryKey: ['messages', roomId] });
+            return old;
+          }
+          return { ...old, data: next };
+        }
+      );
+      return;
+    }
+
     if (lastMessage.type !== 'message' && lastMessage.type !== 'system') return;
     if (
       !lastMessage.id ||
@@ -250,7 +299,7 @@ export function useMessagesWithWebSocket(roomId: string | null) {
         }
       }
     }
-  }, [lastMessage, roomId, queryClient]);
+  }, [lastMessage, roomId, queryClient, user?.id]);
 
   return {
     messageQuery,
@@ -314,6 +363,30 @@ export function useSummarizeChat() {
   });
 }
 
+// ─── AI 답장 초안 생성 ───
+// 백엔드 POST /chat/draft — 본인 채팅방 검증·컨텍스트 자동 주입.
+// 사용자는 채팅 입력창에 `/초안 [지시]` 형태로 입력 → 메시지 전송이 아닌
+// 이 mutation 으로 분기됨. 응답의 draft 텍스트는 미리보기 박스로 표시 후
+// 사용자가 "사용" 버튼을 누르면 입력창에 채워진다 (자동 발송 안 함).
+
+export function useGenerateChatDraft() {
+  return useMutation({
+    mutationFn: async ({
+      roomId,
+      instruction,
+    }: {
+      roomId: string;
+      instruction: string;
+    }) => {
+      const res = await api.post<SuccessResponse<{ draft: string }>>(
+        '/chat/draft',
+        { room_id: roomId, instruction }
+      );
+      return res.data?.draft ?? '';
+    },
+  });
+}
+
 // ─── 채팅방에서 협상가 제시 ───
 // 백엔드 POST /chat/rooms/{room_id}/counter-offer 호출.
 // chat_room.order_id 가 없으면 백엔드가 400 으로 거부 → 호출 측에서 가드 필요.
@@ -344,6 +417,48 @@ export function useSubmitCounterOfferViaChat(roomId: string | null) {
       // 현재 roomId 뿐 아니라 다른 채팅방을 열어둔 탭도 함께 동기화하도록 broad 하게 invalidate.
       queryClient.invalidateQueries({ queryKey: ['messages'] });
       queryClient.invalidateQueries({ queryKey: ['chatRooms'] });
+    },
+  });
+}
+
+// ─── 협상 의도 감지 카드 [무시] (US-2) ─────────────────────────────
+// PATCH /chat/messages/{message_id}/dismiss-draft-negotiation
+// 발신자 본인만 호출 가능. 응답으로 dismissed_at 채워진 NegotiationDraft 받음.
+// onSuccess 시 messages 캐시의 해당 메시지 metadata 만 낙관적 업데이트
+// (전체 invalidate 안 함 — 다른 메시지 흔들림 방지).
+
+interface DismissDraftResponse {
+  message_id: string;
+  draft_negotiation: NegotiationDraft;
+}
+
+export function useDismissNegotiationDraft(roomId: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (messageId: string) =>
+      api.patch<SuccessResponse<DismissDraftResponse>>(
+        `/chat/messages/${messageId}/dismiss-draft-negotiation`
+      ),
+    onSuccess: (res, messageId) => {
+      const updatedDraft = res.data.draft_negotiation;
+      if (!roomId) return;
+      queryClient.setQueryData(
+        ['messages', roomId],
+        (old: SuccessResponse<Message[]> | undefined) => {
+          if (!old) return old;
+          const next = old.data.map((m) => {
+            if (m.id !== messageId) return m;
+            return {
+              ...m,
+              metadata: {
+                ...(m.metadata ?? {}),
+                draft_negotiation: updatedDraft,
+              },
+            };
+          });
+          return { ...old, data: next };
+        }
+      );
     },
   });
 }

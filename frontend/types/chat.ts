@@ -37,11 +37,31 @@ export type MessageType =
   | 'DELIVERY_DATE_REJECTED';
 
 /**
+ * 협상 의도 감지 결과 (US-2 — 2026-05-04 추가).
+ * 평문 메시지에서 백엔드가 추출한 가격/수량/품목 후보. 자동 등록 X — 발신자 본인이
+ * [등록] 클릭 시 기존 PriceOfferPopover 흐름으로 prefill.
+ *
+ * 백엔드 schemas/chat.py NegotiationDraft 와 1:1 매칭. messages.metadata.draft_negotiation
+ * JSONB 에 저장되어 새로고침 후에도 복원 가능. dismissed_at 채워지면 카드 숨김.
+ */
+export interface NegotiationDraft {
+  product_name: string | null;
+  quantity: number | null;
+  unit: string | null;
+  unit_price: number | null;
+  confidence: number;
+  detected_at: string;
+  dismissed_at: string | null;
+}
+
+/**
  * 메시지의 metadata 필드는 message_type 별로 형태가 다르다.
  * 모든 키는 optional 로 선언해 서버 응답을 그대로 받을 수 있게 한다.
  * 페이지/컴포넌트 단계에서 message_type 으로 좁힌 뒤 사용한다.
  */
 export interface MessageMetadata {
+  // US-2 — 평문 메시지에서 감지된 협상 후보 (TEXT 타입에만 채워짐)
+  draft_negotiation?: NegotiationDraft;
   // SYSTEM (견적 요청 알림)
   order_id?: string;
   order_number?: string;

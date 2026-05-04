@@ -279,6 +279,52 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 #     + messages.metadata.status 도 동기화 (negotiation 패턴과 동일)
 ```
 
+### chat.py (채팅 API)
+```python
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+# GET    /chat/rooms                              - 내 채팅방 목록
+# POST   /chat/rooms                              - 채팅방 생성 (or 기존 반환)
+# GET    /chat/rooms/{room_id}/messages           - 메시지 목록 (limit, before)
+# POST   /chat/rooms/{room_id}/messages           - 메시지 전송 (REST, 보통 WS 사용)
+# POST   /chat/rooms/{room_id}/read               - 읽음 처리
+# POST   /chat/rooms/{room_id}/counter-offer      - 채팅방 연결 주문에 협상가 제시
+#
+# AI 답장 초안 (US-1, 2026-05-03)
+# POST   /chat/draft
+#   Body: { room_id: UUID, instruction: str (1~500) }
+#   응답: { data: { draft: str } }
+#   특징:
+#     - 메시지 DB INSERT 없음 — 초안 텍스트만 반환 (사용자 검토 후 직접 발송)
+#     - 채팅방 참여자(seller/buyer) 검증 — 외부 호출 시 403
+#     - 컨텍스트: chat_room.order_id 의 주문 상세 + 최근 20개 메시지 + 상대방 정보
+#     - OpenAI gpt-4o-mini, temperature=0.5, max_tokens=400, 일반 응답 (스트리밍 X)
+#     - 실패 시 502 + type(e).__name__ (네트워크/환각 빈 텍스트 모두 통일)
+#   서비스 위치: app/services/draft_service.py (단일 함수 generate_chat_draft)
+#   chat_node 와 별도 — send_chat_message 도구 미사용으로 의도치 않은 발송 차단
+#
+# AI 협상 의도 감지 (US-2, 2026-05-04)
+# POST   /chat/rooms/{room_id}/messages — BackgroundTasks 로 detect 호출
+#   기존 동작 유지(메시지 INSERT 응답 즉시) + add_task(process_message_for_negotiation)
+#   감지 결과는 messages.metadata['draft_negotiation'] JSONB 에 저장,
+#   confidence>=0.7 일 때만 저장 + WS push.
+#
+# PATCH  /chat/messages/{message_id}/dismiss-draft-negotiation
+#   사용자가 [무시] 클릭 시 dismissed_at=NOW() 채움 (멱등).
+#   응답: { data: { message_id, draft_negotiation: {...} } }
+#   가드:
+#     - 메시지 미존재 → 404
+#     - sender_id != current_user → 403 (본인 메시지에만 dismiss 가능)
+#     - draft_negotiation 자체 없음 → 404
+#   주의: 5분 timeout 자동 dismiss 는 프론트가 시각적으로만 처리 (백엔드는 timeout 처리 X).
+#   서비스 위치: app/services/negotiation_detection_service.py
+#   - detect_negotiation_intent: OpenAI gpt-4o-mini, temperature=0,
+#       response_format=json_object, max_tokens=200
+#   - process_message_for_negotiation: 진입점 (BG task). 모든 예외 흡수 (chat 흐름 보호)
+#   - dismiss_draft_negotiation: 본인 검증 + dismissed_at 멱등 갱신
+#   ⚠️ 자동 등록 절대 X — 등록은 별도 사용자 [등록] 클릭으로 기존 propose_counter_offer 흐름.
+```
+
 ### calendar.py (일정 API)
 ```python
 router = APIRouter(prefix="/calendar", tags=["calendar"])

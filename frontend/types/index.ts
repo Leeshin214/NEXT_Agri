@@ -23,6 +23,7 @@ export type {
   Message,
   MessageType,
   MessageMetadata,
+  NegotiationDraft,
   AlternativePartner,
 } from './chat';
 export type { SuccessResponse, PaginationMeta, ErrorResponse } from './api';

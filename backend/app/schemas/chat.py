@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ChatRoomCreate(BaseModel):
@@ -62,3 +62,34 @@ class CounterOfferMetadata(BaseModel):
     from_role: str  # "SELLER" | "BUYER"
     notes: Optional[str] = None
     status: str = "PENDING"  # "PENDING" | "ACCEPTED" | "REJECTED" | "SUPERSEDED"
+
+
+# AI 답장 초안 — POST /chat/draft (2026-05-03 추가)
+# 채팅방 입력창에 `/초안 ...` 명령으로 호출. 메시지 DB 저장 안 함.
+class ChatDraftRequest(BaseModel):
+    room_id: UUID
+    instruction: str = Field(..., min_length=1, max_length=500)
+
+
+class ChatDraftResponse(BaseModel):
+    draft: str
+
+
+# 협상 의도 감지 — US-2 (2026-05-04 추가)
+# 평문 메시지에서 가격 협상 의도 감지 → metadata.draft_negotiation 저장 + WS 푸시.
+# 자동 등록 절대 X — 발신자 본인이 [등록] 클릭 시 기존 propose_counter_offer 흐름 사용.
+class NegotiationDraft(BaseModel):
+    """messages.metadata['draft_negotiation'] JSONB 구조 (검증/문서화 목적)."""
+    product_name: Optional[str] = None
+    quantity: Optional[int] = None
+    unit: Optional[str] = None  # kg | box | piece | bag | 개 | 포대 등
+    unit_price: Optional[int] = None  # KRW 정수
+    confidence: float = 0.0  # 0.0 ~ 1.0
+    detected_at: Optional[datetime] = None
+    dismissed_at: Optional[datetime] = None
+
+
+class NegotiationDraftDismissResponse(BaseModel):
+    """PATCH /chat/messages/{message_id}/dismiss-draft-negotiation 응답."""
+    message_id: UUID
+    draft_negotiation: NegotiationDraft
