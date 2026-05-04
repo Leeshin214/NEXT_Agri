@@ -10,6 +10,7 @@ import StatusBadge from '@/components/common/StatusBadge';
 import NegotiationHistory from '@/components/common/NegotiationHistory';
 import DeliveryDateChangeSection from '@/components/common/DeliveryDateChangeSection';
 import CancelOrderModal from '@/components/common/CancelOrderModal';
+import CancelRequestModal from '@/components/common/CancelRequestModal';
 import CreateOrderModal from '@/components/buyer/CreateOrderModal';
 import EditOrderModal from '@/components/buyer/EditOrderModal';
 import PartnerDetailModal from '@/components/partners/PartnerDetailModal';
@@ -71,12 +72,10 @@ const FREQUENCY_LABEL: Record<SubscriptionFrequency, string> = {
   MONTHLY: '매월',
 };
 
-const cancellableStatuses: OrderStatus[] = [
+// 구매자가 직접 취소 가능한 상태 (CONFIRMED 이후는 불가)
+const buyerDirectCancelStatuses: OrderStatus[] = [
   'QUOTE_REQUESTED',
   'NEGOTIATING',
-  'CONFIRMED',
-  'PREPARING',
-  'SHIPPING',
 ];
 
 const counterOfferableStatuses: OrderStatus[] = [
@@ -124,6 +123,7 @@ export default function BuyerOrdersPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
   const [showCancel, setShowCancel] = useState(false);
+  const [showCancelRequest, setShowCancelRequest] = useState(false);
   const [showCounter, setShowCounter] = useState(false);
 
   const activeTabDef = tabs.find((t) => t.key === activeTab);
@@ -300,7 +300,16 @@ export default function BuyerOrdersPage() {
     {
       key: 'status',
       header: '상태',
-      render: (item) => <StatusBadge status={item.status} />,
+      render: (item) => (
+        <div className="flex flex-col items-center gap-1">
+          <StatusBadge status={item.status} />
+          {item.pending_cancel_request && (
+            <span className="inline-flex items-center rounded-full bg-orange-100 px-2 py-0.5 text-[10px] font-medium text-orange-700">
+              취소 요청 대기중
+            </span>
+          )}
+        </div>
+      ),
     },
     {
       key: 'actions',
@@ -769,13 +778,29 @@ export default function BuyerOrdersPage() {
                     수령 완료
                   </button>
                 )}
-                {cancellableStatuses.includes(selectedOrder.status) && (
+                {/* 직접 취소: QUOTE_REQUESTED / NEGOTIATING */}
+                {buyerDirectCancelStatuses.includes(selectedOrder.status) && (
                   <button
                     onClick={() => setShowCancel(true)}
                     className="rounded-lg border border-red-300 bg-white px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50"
                   >
                     취소
                   </button>
+                )}
+                {/* 취소 요청: CONFIRMED — 이미 요청 중이면 비활성 표시 */}
+                {selectedOrder.status === 'CONFIRMED' && (
+                  selectedOrder.pending_cancel_request ? (
+                    <span className="rounded-lg border border-orange-300 bg-orange-50 px-3 py-2 text-xs font-medium text-orange-700">
+                      취소 요청 대기중
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => setShowCancelRequest(true)}
+                      className="rounded-lg border border-orange-300 bg-white px-3 py-2 text-xs font-medium text-orange-700 hover:bg-orange-50"
+                    >
+                      취소 요청
+                    </button>
+                  )
                 )}
               </div>
             </div>
@@ -794,6 +819,12 @@ export default function BuyerOrdersPage() {
           <CancelOrderModal
             isOpen={showCancel}
             onClose={() => setShowCancel(false)}
+            orderId={selectedOrder.id}
+            orderNumber={selectedOrder.order_number}
+          />
+          <CancelRequestModal
+            isOpen={showCancelRequest}
+            onClose={() => setShowCancelRequest(false)}
             orderId={selectedOrder.id}
             orderNumber={selectedOrder.order_number}
           />

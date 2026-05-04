@@ -32,6 +32,44 @@ def _sync_calendar_events_for_order_id(order_id: str) -> None:
 # 헬퍼: 이름 기반 상품 검색 (fuzzy fallback 포함)
 # ─────────────────────────────────────────────
 
+def _find_seller_by_name(supabase, seller_name: str) -> dict:
+    """판매자 이름 또는 회사명으로 users 테이블에서 SELLER를 검색한다.
+
+    반환:
+      {"found": True, "id": "uuid", ...}                — 1건 정확 매칭
+      {"found": False, "candidates": [...]}              — 0건 또는 2건 이상
+    """
+    result = (
+        supabase.table("users")
+        .select("id, name, company_name")
+        .or_(f"name.ilike.%{seller_name}%,company_name.ilike.%{seller_name}%")
+        .eq("role", "SELLER")
+        .is_("deleted_at", None)
+        .limit(5)
+        .execute()
+    )
+    rows = result.data or []
+    if not rows:
+        return {"found": False, "candidates": []}
+
+    # 완전 일치 우선
+    for row in rows:
+        if row.get("name") == seller_name or row.get("company_name") == seller_name:
+            return {"found": True, **row}
+
+    if len(rows) == 1:
+        return {"found": True, **rows[0]}
+
+    # 여러 명 매칭 — 호출자가 사용자에게 후보 목록을 보여줄 수 있도록 반환
+    return {
+        "found": False,
+        "candidates": [
+            {"id": r["id"], "name": r.get("name"), "company_name": r.get("company_name")}
+            for r in rows
+        ],
+    }
+
+
 def _find_product_by_name(supabase, product_name: str, seller_id: str = "") -> Optional[dict]:
     """
     product_name으로 상품을 검색한다.
@@ -941,6 +979,30 @@ def create_order(
     try:
         supabase = get_supabase_client()
 
+        # seller_id가 UUID가 아니면 이름/회사명으로 자동 검색
+        if seller_id and not _UUID_PATTERN.match(str(seller_id)):
+            lookup = _find_seller_by_name(supabase, str(seller_id))
+            if not lookup["found"]:
+                candidates = lookup.get("candidates", [])
+                if candidates:
+                    names = ", ".join(
+                        f"{c.get('name') or c.get('company_name')}(ID:{c['id']})"
+                        for c in candidates
+                    )
+                    return {
+                        "success": False,
+                        "llm_retry": True,
+                        "error": (
+                            f"'{seller_id}' 이름에 해당하는 판매자가 여럿입니다: {names}. "
+                            "사용자에게 어느 판매자인지 확인한 뒤 seller_id=UUID 로 다시 호출하세요."
+                        ),
+                    }
+                return {
+                    "success": False,
+                    "error": f"'{seller_id}' 판매자를 찾을 수 없습니다. 정확한 이름을 확인해주세요.",
+                }
+            seller_id = lookup["id"]
+
         # product_id가 UUID가 아니면 상품명으로 자동 검색
         if product_id and not _UUID_PATTERN.match(str(product_id)):
             found = _find_product_by_name(supabase, product_id, seller_id)
@@ -1069,7 +1131,7 @@ def delete_order(order_id: str, user_id: str) -> dict:
         # 주문 존재 및 권한 확인
         check = (
             supabase.table("orders")
-            .select("id, order_number, buyer_id, seller_id")
+            .select("id, order_number, buyer_id, seller_id, status")
             .eq("id", order_id)
             .is_("deleted_at", None)
             .execute()
@@ -1083,6 +1145,16 @@ def delete_order(order_id: str, user_id: str) -> dict:
             return {"success": False, "error": "권한 없음: 해당 주문에 접근할 수 없습니다."}
 
         now_utc = datetime.now(timezone.utc).isoformat()
+
+        # soft-delete 전 status를 CANCELLED로 변경 — 안전망.
+        # 이 도구는 진짜 삭제 전용이지만, 혹여 취소 목적으로 호출됐더라도
+        # status=CANCELLED가 먼저 설정되어야 완료/취소 탭에서 보인다.
+        # (deleted_at 설정 후에는 list_orders IS NULL 필터에 걸려 완전히 사라짐)
+        current_status = order_data.get("status", "")
+        if current_status not in ("CANCELLED", "COMPLETED"):
+            supabase.table("orders").update({"status": "CANCELLED"}).eq("id", order_id).execute()
+            _sync_calendar_events_for_order_id(order_id)
+
         supabase.table("orders").update({"deleted_at": now_utc}).eq("id", order_id).execute()
 
         return {

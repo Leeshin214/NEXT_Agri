@@ -70,6 +70,26 @@ class OrderCancel(BaseModel):
     reason: str = Field(..., min_length=1)
 
 
+class CancelRequestCreate(BaseModel):
+    reason: str = Field(..., min_length=1)
+
+
+class CancelRequestRespond(BaseModel):
+    action: str = Field(..., pattern="^(approve|reject)$")
+
+
+class CancelRequestResponse(BaseModel):
+    id: UUID
+    order_id: UUID
+    requester_id: UUID
+    reason: str
+    status: str
+    responded_at: Optional[datetime] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class CounterOfferCreate(BaseModel):
     proposed_total_amount: int = Field(..., ge=0)
     proposed_items: Optional[list[OrderItemUpdate]] = None
@@ -158,6 +178,7 @@ class OrderResponse(BaseModel):
     cancellation_reason: Optional[str] = None
     cancelled_at: Optional[datetime] = None
     cancelled_by: Optional[UUID] = None
+    pending_cancel_request: Optional[Any] = None
     items: list[OrderItemResponse] = []
     # join 필드 — users!buyer_id / users!seller_id 임베딩에서 평탄화. 사용자 soft-delete 시 None 허용.
     buyer_name: Optional[str] = None

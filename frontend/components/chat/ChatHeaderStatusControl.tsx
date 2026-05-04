@@ -8,6 +8,7 @@ import { ORDER_STATUS_OPTIONS } from '@/constants/options';
 import { cn } from '@/lib/utils';
 import type { OrderStatus } from '@/types';
 
+
 interface ChatHeaderStatusControlProps {
   orderId: string | null;
   currentStatus: OrderStatus | null;
@@ -26,17 +27,9 @@ const SELLER_NEXT_STATUS_MAP: Partial<Record<OrderStatus, OrderStatus>> = {
   SHIPPING: 'COMPLETED',
 };
 
-/**
- * 구매자가 직접 보낼 수 있는 다음 상태.
- * QUOTE_REQUESTED → NEGOTIATING (협상 시작)
- * NEGOTIATING → CONFIRMED (가격 합의 후 확정)
- * SHIPPING → COMPLETED (수령 확인)
- */
-const BUYER_NEXT_STATUS_MAP: Partial<Record<OrderStatus, OrderStatus>> = {
-  QUOTE_REQUESTED: 'NEGOTIATING',
-  NEGOTIATING: 'CONFIRMED',
-  SHIPPING: 'COMPLETED',
-};
+// 구매자는 채팅 헤더에서 상태를 변경할 수 없다 — 표시만.
+// 상태 변경은 주문/견적 관리 페이지에서만 허용.
+const BUYER_NEXT_STATUS_MAP: Partial<Record<OrderStatus, OrderStatus>> = {};
 
 function getStatusLabel(status: OrderStatus): string {
   return ORDER_STATUS_OPTIONS.find((o) => o.value === status)?.label ?? status;

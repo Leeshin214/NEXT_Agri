@@ -34,7 +34,10 @@ export type MessageType =
   // 납품일 변경 요청·승인 (2026-04-29 추가)
   | 'DELIVERY_DATE_CHANGE'
   | 'DELIVERY_DATE_ACCEPTED'
-  | 'DELIVERY_DATE_REJECTED';
+  | 'DELIVERY_DATE_REJECTED'
+  // 취소 요청 워크플로우 (2026-05-05 추가)
+  | 'CANCEL_REQUESTED'
+  | 'CANCEL_REQUEST_REJECTED';
 
 /**
  * 협상 의도 감지 결과 (US-2 — 2026-05-04 추가).

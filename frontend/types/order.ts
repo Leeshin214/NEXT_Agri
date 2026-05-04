@@ -69,11 +69,24 @@ export interface Order {
   // V1.5 Phase 2 — 정기배송 자동 생성 주문 추적용. 일반 주문은 null.
   subscription_id?: string | null;
   subscription_round?: number | null;
+  pending_cancel_request?: CancelRequest | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
   /** 백엔드가 제공하는 상품 요약 (예: "사과 외 2건"). 미제공 시 items[0].product_name 으로 폴백. */
   product_summary?: string | null;
+}
+
+export type CancelRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+export interface CancelRequest {
+  id: string;
+  order_id: string;
+  requester_id: string;
+  reason: string;
+  status: CancelRequestStatus;
+  responded_at: string | null;
+  created_at: string;
 }
 
 export interface OrderCreate {

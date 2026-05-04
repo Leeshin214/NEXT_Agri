@@ -137,6 +137,10 @@ class OrderService:
         return self.client.table("delivery_date_change_history")
 
     @property
+    def cancel_requests(self):
+        return self.client.table("order_cancel_requests")
+
+    @property
     def calendar_events(self):
         return self.client.table("calendar_events")
 
@@ -622,6 +626,13 @@ class OrderService:
 
         orders = [_flatten_order_row(row) for row in (result.data or [])]
 
+        # PENDING 취소 요청 batch 조회 후 주입
+        if orders:
+            order_ids = [str(o["id"]) for o in orders]
+            pending_map = await self._get_pending_cancel_requests_map(order_ids)
+            for order in orders:
+                order["pending_cancel_request"] = pending_map.get(str(order["id"]))
+
         meta = PaginationMeta(
             total=total,
             page=page,
@@ -629,6 +640,26 @@ class OrderService:
             total_pages=math.ceil(total / limit) if total > 0 else 0,
         )
         return orders, meta
+
+    async def _get_pending_cancel_requests_map(self, order_ids: list[str]) -> dict[str, dict]:
+        """order_id 리스트의 PENDING 취소 요청을 batch 조회 → {order_id: request} 맵."""
+        if not order_ids:
+            return {}
+        try:
+            result = await asyncio.to_thread(
+                lambda: self.cancel_requests
+                .select("*")
+                .in_("order_id", order_ids)
+                .eq("status", "PENDING")
+                .execute()
+            )
+            mapping: dict[str, dict] = {}
+            for row in (result.data or []):
+                mapping[str(row["order_id"])] = row
+            return mapping
+        except Exception as e:
+            print(f"[order_service._get_pending_cancel_requests_map] 실패 (무시): {type(e).__name__}: {e}")
+            return {}
 
     async def get_order(self, order_id: UUID) -> Optional[dict]:
         # join 임베딩으로 buyer/seller/products 정보 포함
@@ -640,7 +671,11 @@ class OrderService:
         )
         if not result.data:
             return None
-        return _flatten_order_row(result.data[0])
+        order = _flatten_order_row(result.data[0])
+        # PENDING 취소 요청 주입
+        pending_map = await self._get_pending_cancel_requests_map([str(order_id)])
+        order["pending_cancel_request"] = pending_map.get(str(order_id))
+        return order
 
     async def _get_order_or_404(self, order_id: UUID) -> dict:
         order = await self.get_order(order_id)
@@ -1508,7 +1543,14 @@ class OrderService:
     async def cancel_order(
         self, order_id: UUID, reason: str, user: dict
     ) -> dict:
-        """주문 취소 — 양쪽 모두 가능, COMPLETED 이후 불가. soft delete 와 별개로 이력 보존."""
+        """주문 취소.
+
+        역할·상태별 취소 정책:
+          BUYER  + QUOTE_REQUESTED/NEGOTIATING → 즉시 취소 가능
+          BUYER  + CONFIRMED                   → 불가 (cancel-request API 사용)
+          BUYER  + PREPARING/SHIPPING          → 불가 (판매자만 가능)
+          SELLER + 모든 활성 상태              → 즉시 취소 가능
+        """
         order = await self._get_order_or_404(order_id)
         user_id_str = str(user["id"])
         self._assert_participant(order, user_id_str)
@@ -1523,6 +1565,19 @@ class OrderService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Order is already cancelled",
             )
+
+        user_role = user.get("role", "")
+        if user_role == "BUYER":
+            if order["status"] in ("PREPARING", "SHIPPING"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="출하 준비 이후 단계에서는 구매자가 취소할 수 없습니다.",
+                )
+            if order["status"] == "CONFIRMED":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="주문 확정 단계에서 취소하려면 판매자에게 취소 요청을 보내주세요.",
+                )
 
         cancelled_at = datetime.now(timezone.utc).isoformat()
         await asyncio.to_thread(
@@ -1572,6 +1627,182 @@ class OrderService:
         return updated_order
 
     # ===========================================
+    # 취소 요청 (cancel-request) — CONFIRMED 단계 구매자 취소 워크플로우
+    # ===========================================
+
+    async def create_cancel_request(
+        self, order_id: UUID, reason: str, user: dict
+    ) -> dict:
+        """구매자가 CONFIRMED 주문에 대한 취소 요청을 생성한다."""
+        order = await self._get_order_or_404(order_id)
+        user_id_str = str(user["id"])
+        self._assert_participant(order, user_id_str)
+
+        if user.get("role") != "BUYER":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="취소 요청은 구매자만 생성할 수 있습니다.",
+            )
+        if order["status"] != "CONFIRMED":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="취소 요청은 주문 확정(CONFIRMED) 상태에서만 가능합니다.",
+            )
+
+        # 이미 PENDING 요청이 있으면 중복 방지
+        existing = await asyncio.to_thread(
+            lambda: self.cancel_requests
+            .select("id")
+            .eq("order_id", str(order_id))
+            .eq("status", "PENDING")
+            .execute()
+        )
+        if existing.data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="이미 처리 대기 중인 취소 요청이 있습니다.",
+            )
+
+        result = await asyncio.to_thread(
+            lambda: self.cancel_requests.insert({
+                "order_id": str(order_id),
+                "requester_id": user_id_str,
+                "reason": reason,
+                "status": "PENDING",
+            }).execute()
+        )
+        cancel_request = result.data[0] if result.data else None
+        if not cancel_request:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="취소 요청 생성에 실패했습니다.",
+            )
+
+        # 채팅 이벤트 발송
+        try:
+            room = await self._ensure_chat_room_for_order(order)
+            if room:
+                await self._emit_chat_event(
+                    room=room,
+                    sender_id=user_id_str,
+                    message_type="CANCEL_REQUESTED",
+                    content=f"취소 요청: {reason}",
+                    metadata={
+                        "order_id": str(order_id),
+                        "order_number": order.get("order_number"),
+                        "cancel_request_id": str(cancel_request["id"]),
+                        "reason": reason,
+                        "requester_id": user_id_str,
+                    },
+                )
+        except Exception as e:
+            print(f"[order_service.create_cancel_request] chat event 실패 (무시): {type(e).__name__}: {e}")
+
+        # 판매자 알림
+        try:
+            await self._emit_order_notification(
+                order=order,
+                sender_id=user_id_str,
+                notif_type="CANCEL_REQUESTED",
+                title="주문 취소 요청",
+                body=f"주문 {order.get('order_number')} 취소 요청이 도착했습니다.",
+            )
+        except Exception as e:
+            print(f"[order_service.create_cancel_request] notification 실패 (무시): {type(e).__name__}: {e}")
+
+        return cancel_request
+
+    async def respond_cancel_request(
+        self, order_id: UUID, request_id: UUID, action: str, user: dict
+    ) -> dict:
+        """판매자가 취소 요청에 승인(approve) 또는 거절(reject) 응답."""
+        order = await self._get_order_or_404(order_id)
+        user_id_str = str(user["id"])
+        self._assert_participant(order, user_id_str)
+
+        if user.get("role") != "SELLER":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="취소 요청 응답은 판매자만 할 수 있습니다.",
+            )
+
+        result = await asyncio.to_thread(
+            lambda: self.cancel_requests
+            .select("*")
+            .eq("id", str(request_id))
+            .eq("order_id", str(order_id))
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="취소 요청을 찾을 수 없습니다.",
+            )
+
+        cancel_request = result.data[0]
+        if cancel_request["status"] != "PENDING":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"이미 처리된 취소 요청입니다 (상태: {cancel_request['status']})",
+            )
+
+        now_utc = datetime.now(timezone.utc).isoformat()
+        new_status = "APPROVED" if action == "approve" else "REJECTED"
+
+        await asyncio.to_thread(
+            lambda: self.cancel_requests.update({
+                "status": new_status,
+                "responded_at": now_utc,
+            }).eq("id", str(request_id)).execute()
+        )
+
+        updated_request = dict(cancel_request)
+        updated_request["status"] = new_status
+        updated_request["responded_at"] = now_utc
+
+        if action == "approve":
+            # 판매자로서 실제 취소 처리 (새 정책 하에서 판매자는 모든 상태 취소 가능)
+            await self.cancel_order(
+                order_id=order_id,
+                reason=cancel_request["reason"],
+                user=user,
+            )
+        else:
+            # 거절 — 채팅 이벤트 발송
+            try:
+                room = await self._ensure_chat_room_for_order(order)
+                if room:
+                    await self._emit_chat_event(
+                        room=room,
+                        sender_id=user_id_str,
+                        message_type="CANCEL_REQUEST_REJECTED",
+                        content="취소 요청이 거절되었습니다.",
+                        metadata={
+                            "order_id": str(order_id),
+                            "order_number": order.get("order_number"),
+                            "cancel_request_id": str(request_id),
+                            "reason": cancel_request.get("reason"),
+                            "rejected_by": user_id_str,
+                        },
+                    )
+            except Exception as e:
+                print(f"[order_service.respond_cancel_request] chat event 실패 (무시): {type(e).__name__}: {e}")
+
+            # 구매자 알림
+            try:
+                await self._emit_order_notification(
+                    order=order,
+                    sender_id=user_id_str,
+                    notif_type="CANCEL_REQUEST_REJECTED",
+                    title="취소 요청 거절",
+                    body=f"주문 {order.get('order_number')} 취소 요청이 거절되었습니다.",
+                )
+            except Exception as e:
+                print(f"[order_service.respond_cancel_request] notification 실패 (무시): {type(e).__name__}: {e}")
+
+        return updated_request
+
+    # ===========================================
     # 협상 (counter-offer)
     # ===========================================
 
@@ -1584,9 +1815,19 @@ class OrderService:
         actor_role = self._assert_participant(order, user_id_str)
 
         if order["status"] not in ("QUOTE_REQUESTED", "NEGOTIATING"):
+            status_label = {
+                "CONFIRMED": "주문 확정",
+                "PREPARING": "출하 준비 중",
+                "SHIPPING": "배송 중",
+                "COMPLETED": "완료",
+                "CANCELLED": "취소",
+            }.get(order["status"], order["status"])
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Counter-offer is only allowed in QUOTE_REQUESTED or NEGOTIATING status",
+                detail=(
+                    f"가격 협상은 견적 요청(QUOTE_REQUESTED) 또는 협상 중(NEGOTIATING) 상태에서만 가능합니다. "
+                    f"현재 주문 상태가 '{status_label}'이므로 협상을 진행할 수 없습니다."
+                ),
             )
 
         proposed_items = payload.get("proposed_items")

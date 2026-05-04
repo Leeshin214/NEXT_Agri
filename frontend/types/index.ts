@@ -18,6 +18,8 @@ export type {
   OrderUpdate,
   OrderItemCreate,
   OrderItemInput,
+  CancelRequest,
+  CancelRequestStatus,
   CounterOffer,
   CounterOfferCreate,
   CounterOfferStatus,

@@ -379,7 +379,10 @@ TOOLS = [
                 "판매자가 '출고 준비 완료', '배송 보냈어', '배송 시작했어', '납품 완료'라고 말하면 이 도구를 사용한다. "
                 "상태 매핑: 출고 준비 완료=PREPARING, 배송 보냈어/배송 시작/출하 완료=SHIPPING, 납품 완료/배송 완료=COMPLETED. "
                 "상태 변경 후 캘린더 일정은 자동 동기화된다. "
-                "주의: SHIPPING, PREPARING, COMPLETED는 calendar event_type이 아니라 orders.status 값이다."
+                "주의: SHIPPING, PREPARING, COMPLETED는 calendar event_type이 아니라 orders.status 값이다. "
+                "[취소 전용] 사용자(구매자·판매자 모두)가 '주문 취소해줘', '이 주문 취소', '취소 처리해줘', '주문 없던 걸로 해줘' 등 "
+                "취소 의사를 표현하면 반드시 이 도구를 new_status='CANCELLED'로 호출한다. "
+                "delete_order는 취소 목적으로 절대 사용하지 않는다."
             ),
             "parameters": {
                 "type": "object",
@@ -430,9 +433,12 @@ TOOLS = [
             "name": "create_order",
             "description": (
                 "새 주문을 생성한다. "
-                "[절대 주의] 사용자가 단순히 수량(예: 30kg)만 말했을 때는 절대 이 도구를 호출하지 마시오! "
+                "[절대 주의 1] 사용자가 단순히 수량(예: 30kg)만 말했을 때는 절대 이 도구를 호출하지 마시오! "
                 "수량만 입력된 경우 호출을 멈추고, 반드시 사용자에게 '판매자와 채팅방을 열어 조율할지, 아니면 바로 견적/주문을 넣을지' 물어봐야 한다. "
-                "사용자가 명확하게 '바로 주문해', '그냥 넣어'라고 선택했을 때만 이 도구를 실행하라."
+                "사용자가 명확하게 '바로 주문해', '그냥 넣어'라고 선택했을 때만 이 도구를 실행하라. "
+                "[절대 주의 2 — 납품일] delivery_date 는 반드시 이번 대화에서 사용자가 직접 말한 날짜만 사용한다. "
+                "사용자가 납품일을 말하지 않았다면 이 도구를 호출하지 말고 '납품일은 언제로 할까요? (예: 5월 20일)' 라고 먼저 물어봐라. "
+                "'오늘', '내일', '다음 주' 처럼 모호한 표현을 LLM 임의로 날짜로 변환하거나 임의 날짜를 추측해 채우는 행위는 금지한다."
             ),
             "parameters": {
                 "type": "object",
@@ -457,7 +463,7 @@ TOOLS = [
                         ),
                     },
                     "product_id": {
-                        "type": "string", 
+                        "type": "string",
                         "description": "주문할 상품의 UUID. 정확한 UUID를 모른다면 '감자', '사과' 처럼 한글 상품명을 직접 입력해도 됩니다."
                     },
                     "quantity": {
@@ -470,7 +476,12 @@ TOOLS = [
                     },
                     "delivery_date": {
                         "type": "string",
-                        "description": "납품 희망일 (필수, ISO 8601 형식: YYYY-MM-DD). 사용자가 명시하지 않았으면 반드시 확인해서 채워야 한다.",
+                        "description": (
+                            "납품 희망일 (ISO 8601 형식: YYYY-MM-DD). "
+                            "반드시 사용자가 이번 대화에서 직접 언급한 날짜만 입력한다. "
+                            "사용자가 날짜를 말하지 않았으면 이 필드를 채우지 말고, "
+                            "이 도구 자체를 호출하지 말고, '납품일은 언제로 할까요?' 라고 먼저 물어봐라."
+                        ),
                     },
                     "delivery_address": {
                         "type": "string",
@@ -481,7 +492,7 @@ TOOLS = [
                         "description": "주문 관련 메모/요청사항 (선택)",
                     },
                 },
-                "required": ["buyer_id", "seller_id", "product_id", "quantity", "unit_price", "delivery_date"],
+                "required": ["buyer_id", "seller_id", "product_id", "quantity", "unit_price"],
             },
         },
     },
@@ -490,8 +501,11 @@ TOOLS = [
         "function": {
             "name": "delete_order",
             "description": (
-                "주문을 삭제한다(soft delete). deleted_at을 현재 시간으로 설정하며, "
-                "buyer_id 또는 seller_id 중 하나라도 user_id와 일치하면 삭제 가능하다."
+                "주문을 완전히 숨긴다(soft delete — deleted_at 설정). "
+                "잘못 생성된 주문·테스트 주문처럼 기록 자체를 제거해야 할 때만 사용한다. "
+                "[절대 금지] 사용자가 '취소해줘', '취소 처리', '없던 걸로' 등 취소 의사를 표현한 경우에는 "
+                "이 도구를 호출하지 마라. 취소는 반드시 update_order_status(new_status='CANCELLED')로 처리한다. "
+                "이 도구로 삭제된 주문은 완료/취소 탭을 포함한 모든 화면에서 영구적으로 사라진다."
             ),
             "parameters": {
                 "type": "object",
@@ -859,7 +873,7 @@ TOOLS = [
                 "'좀 더 싸게 안 돼?', '단가 협상하고 싶어', '가격 제시할게' 같이 가격 협상을 시도하면 "
                 "평문 채팅 메시지(send_chat_message)가 아니라 반드시 이 도구로 호출하라. "
                 "발송 즉시 상대방 채팅창에 수락/거절 버튼이 있는 PENDING 카드가 노출된다. "
-                "주문 상태가 QUOTE_REQUESTED 또는 NEGOTIATING 일 때만 가능 — 그 외 상태에서는 거절됨. "
+                "상태 확인 없이 즉시 호출하라 — 허용 여부는 서버가 검증하며, 불가한 경우 서버가 에러를 반환한다. "
                 "이전 PENDING 카운터오퍼는 자동으로 SUPERSEDED 처리되므로 안전하게 새로 제시 가능."
             ),
             "parameters": {
@@ -872,7 +886,11 @@ TOOLS = [
                     "order_id": {
                         "type": "string",
                         "description": (
-                            "대상 주문 UUID. 모르면 get_orders 또는 get_chat_rooms 로 먼저 찾아라."
+                            "협상가 제시 대상 주문의 UUID. status 가 QUOTE_REQUESTED 또는 NEGOTIATING 인 주문만 가능 — "
+                            "CONFIRMED 이후 상태는 백엔드가 거절한다. "
+                            "사용자 발화로 어떤 주문인지 모호하면 먼저 get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING']) 로 후보를 추출한 뒤, "
+                            "후보가 정확히 1개면 그 id 를 그대로 사용하고, 2개 이상이면 사용자에게 어느 주문인지 되물은 뒤 사용. "
+                            "0개면 '협상 가능한 주문이 없습니다' 안내. 절대 사용자에게 UUID 를 직접 묻거나 임의로 한 후보를 추측 선택하지 마라."
                         ),
                     },
                     "proposed_total_amount": {
@@ -987,7 +1005,13 @@ TOOLS = [
                     },
                     "order_id": {
                         "type": "string",
-                        "description": "대상 주문 UUID.",
+                        "description": (
+                            "납품일 변경 대상 주문의 UUID. status 가 QUOTE_REQUESTED, NEGOTIATING, CONFIRMED 인 주문만 가능 — "
+                            "PREPARING 이후 상태는 출하 준비 단계라 백엔드가 거절한다. "
+                            "사용자 발화로 어떤 주문인지 모호하면 먼저 get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED']) 로 후보를 추출한 뒤, "
+                            "후보가 정확히 1개면 그 id 를 그대로 사용하고, 2개 이상이면 사용자에게 어느 주문인지 되물은 뒤 사용. "
+                            "0개면 '납품일 변경 가능한 주문이 없습니다' 안내. 절대 사용자에게 UUID 를 직접 묻거나 임의로 한 후보를 추측 선택하지 마라."
+                        ),
                     },
                     "proposed_delivery_date": {
                         "type": "string",
@@ -1594,9 +1618,9 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 
 [자연어 → 카드 도구 자동 호출 핵심 매핑]
 사용자가 자연스럽게 발화한 협상·납품일·거래처 등록·정기배송 요청은 일반 채팅 메시지(send_chat_message)로 보내지 말고 아래 전용 도구를 사용해 카드 형태로 발송한다. 카드는 상대방이 [수락]/[거절] 버튼으로 응답할 수 있어 합의 흐름이 명확해진다.
-- 가격 협상: "○○원으로 협상해줘", "○○만원에 어때요", "가격 조정해줘", "단가 깎아달라고 해줘" → submit_counter_offer(user_id, order_id, proposed_total_amount, notes?)
+- 가격 협상: "○○원으로 협상해줘", "○○만원에 어때요", "가격 조정해줘", "단가 깎아달라고 해줘" → submit_counter_offer(user_id, order_id, proposed_total_amount, notes?). order_id 를 특정하기 위해 반드시 아래 절차를 따른다. (1) get_orders(user_id, role, status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"]) 로 진행 중 주문을 조회한다. (2) 사용자가 언급한 품목명이 포함된 주문만 후보로 추린다. (3) 후보 중 CONFIRMED/PREPARING/SHIPPING/COMPLETED/CANCELLED 상태는 협상 불가이므로 제외한다. (4) 남은 후보(QUOTE_REQUESTED 또는 NEGOTIATING)가 정확히 1건이면 즉시 submit_counter_offer 호출. (5) 2건 이상이면 각 주문번호·상태를 보여주며 "어느 주문의 협상가를 제시할까요?"라고 물어본 뒤 답을 받고 호출. (6) 0건이면 "해당 상품의 진행 중인 주문이 모두 확정 이후 단계라 협상 요청을 할 수 없습니다"라고 안내. "주문 ID를 알려주세요"라고 UUID 를 직접 묻지 마라.
 - 카운터오퍼 응답: 채팅방 PENDING 카운터오퍼 카드 보고 사용자가 "수락해줘"/"OK"/"좋아요" → accept_counter_offer(user_id, order_id, offer_id), "거절해줘"/"안 돼"/"이 가격은 못 받아" → reject_counter_offer(user_id, order_id, offer_id)
-- 납품일 변경: "5월 20일로 납품일 바꿔줘", "○월 ○일에 받고 싶어", "납품일 변경 요청 보내줘" → submit_delivery_date_change(user_id, order_id, proposed_delivery_date='YYYY-MM-DD', notes?). 허용 상태: QUOTE_REQUESTED, NEGOTIATING, CONFIRMED (PREPARING 이상만 차단). 상태를 직접 판단하지 말고 반드시 도구를 호출하라 — 서버가 검증한다. order_id 모르면 get_orders(user_id, role) 로 먼저 조회해 품목명이 일치하는 주문의 id 를 찾아라. "주문 ID를 알려주세요"라고 사용자에게 묻지 마라.
+- 납품일 변경: "5월 20일로 납품일 바꿔줘", "○월 ○일에 받고 싶어", "납품일 변경 요청 보내줘" → submit_delivery_date_change(user_id, order_id, proposed_delivery_date='YYYY-MM-DD', notes?). 허용 상태: QUOTE_REQUESTED, NEGOTIATING, CONFIRMED (PREPARING/SHIPPING/COMPLETED/CANCELLED 는 차단). order_id 모르면 get_orders(user_id, role) 로 먼저 조회해 품목명이 일치하는 주문의 id 를 찾아라. 이때 반드시 아래 절차를 따른다. (1) 조회 결과 중 PREPARING/SHIPPING/COMPLETED/CANCELLED 상태 주문은 후보에서 제외한다. (2) 허용 상태(QUOTE_REQUESTED/NEGOTIATING/CONFIRMED) 주문이 정확히 1건이면 그 order_id 로 즉시 호출한다. (3) 허용 상태 주문이 2건 이상이면 사용자에게 "어느 주문의 납품일을 변경할까요? (예: ○○ 상품 CONFIRMED 건 / △△ 상품 NEGOTIATING 건)" 처럼 후보 목록을 보여주고 선택을 기다려라 — 이 경우 submit_delivery_date_change 를 절대 호출하지 마라. (4) 허용 상태 주문이 0건이면 "출하 준비 이후 단계의 주문은 납품일 변경 요청을 보낼 수 없습니다"라고 안내하라. "주문 ID를 알려주세요"라고 사용자에게 UUID 를 직접 묻지 마라.
 - 납품일 응답: PENDING 납품일 변경 카드 보고 "수락해줘"/"OK" → accept_delivery_date_change(user_id, order_id, change_id), "거절해줘"/"그 날짜는 어려워" → reject_delivery_date_change(user_id, order_id, change_id)
 - 거래처 등록: "○○를 거래처로 등록해줘", "○○ 추가해줘", "거래처 신청 보내줘" → 상대방 UUID 정확히 알면 request_partner_registration(user_id, target_user_id, note?), 이름/회사명만 알면 request_partner_registration_by_name(user_id, target_name_or_company, note?)
 - 거래처 요청 조회: "들어온 거래처 요청 있어?", "거래처 신청 왔어?" → get_incoming_partner_requests(user_id). 결과 안내 시 반드시 partner_id 값을 응답에 포함.
@@ -1609,12 +1633,46 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 - 정기배송 거절: "거절해줘" → 마찬가지로 subscription_id 를 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 를 먼저 호출해 ID 를 확보한 뒤 reject_subscription_request(user_id, subscription_id, reason?) 호출. 절대 사용자에게 ID 를 물어보지 마라.
 - 정기배송 수정 요청: "1kg로 바꿔줘", "수량 바꿀 수 있어?", "조건 수정하고 싶어" 등 → 정기배송 직접 수정 기능은 없으므로 "현재 요청을 거절한 뒤 새 조건으로 다시 요청을 보내야 합니다. 원하시면 바로 거절하고 새 요청 안내해 드릴게요."라고 자연스럽게 안내하라. ID 를 묻지 말고 직전 대화의 subscription_id 를 사용하라.
 
+[협상가 제시 / 납품일 변경 도구 호출 절차 — 매우 중요]
+submit_counter_offer / submit_delivery_date_change / accept_counter_offer / reject_counter_offer / accept_delivery_date_change / reject_delivery_date_change 호출 시 order_id 가 필요하다. 다음 절차로 결정하라. 이 절차를 절대 어기지 마라.
+
+[1단계 — 협상 가능 주문 목록 가져오기]
+get_orders(user_id={user_id}, role="BUYER" 또는 "SELLER", status_in=["QUOTE_REQUESTED","NEGOTIATING"]) 호출.
+※ CONFIRMED, PREPARING, SHIPPING, COMPLETED, CANCELLED 상태는 이미 확정 이후 단계라 협상 / 납품일 변경 불가능. status_in 으로 사전 필터링하라. 단 납품일 변경(submit_delivery_date_change)은 CONFIRMED 까지 허용되므로 status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED"] 로 조회한다.
+
+[2단계 — 후보 필터링]
+사용자 발화에서 추출한 상품명 / 거래처 / 수량 등으로 매칭되는 주문만 후보로 추려라.
+- 정확한 상품명 매칭 ("감자")
+- 동시에 수량 명시 시 수량도 매칭 ("감자 10kg")
+- 거래처 명시 시 거래처도 매칭 ("test3 의 감자")
+
+[3단계 — 후보 수에 따른 처리]
+A. 후보 0개:
+   안내: "○○ 상품에 대한 협상 가능한 주문이 없습니다. (이미 확정 이후 상태이거나 해당 상품 주문이 진행 중이지 않습니다.)" 라고만 짧게 답하고 끝낸다. 다른 주문 정보를 늘어놓지 마라.
+
+B. 후보 1개:
+   즉시 submit_counter_offer(order_id=그_주문의_id, proposed_total_amount=..., notes=...) 호출. 결과를 자연체로 안내.
+
+C. 후보 2개 이상:
+   사용자에게 어떤 주문인지 묻는다: "옥수수 50kg 주문 (ORD-20260505-1234) 과 옥수수 80kg 주문 (ORD-20260505-5678) 중 어느 주문에 협상가를 제시할까요?" 형식. 사용자 답변을 받기 전에는 절대 도구를 호출하지 마라.
+
+[발화 모호성 처리]
+사용자 발화가 너무 모호한 경우 (예: "테스트 관리 협상가를 제시해줘" — 어떤 상품인지 불명확) 임의로 한 주문을 추측해 진행하지 말고 사용자에게 "어떤 상품의 주문에 대한 협상인가요?" 라고 되묻는다. 진행 중 주문 목록을 짧게 보여주는 것은 OK 지만, 임의로 한 주문을 선택하면 안 된다.
+
+[금지사항]
+- 사용자가 안 물은 다른 주문 정보를 줄줄이 늘어놓는 행위.
+- 후보가 여러 개일 때 임의로 한 주문을 선택해서 진행하는 행위 (반드시 되묻기).
+- 후보가 0개일 때 다른 상품 주문 정보를 끼워서 응답하는 행위.
+- 사용자에게 order UUID 직접 입력을 요구하는 행위 ("주문 ID를 알려주세요" 금지).
+- accept_counter_offer / reject_counter_offer / accept_delivery_date_change / reject_delivery_date_change 도 동일 절차 적용 (수락 / 거절할 PENDING 카드의 order_id 결정 시).
+
 [자연어 → 카드 도구 안전장치 (매우 중요)]
+- 이전 대화에서 동일한 협상·납품일 변경·취소·주문 요청을 거절하거나 불가하다고 답한 이력이 있더라도, 현재 요청은 완전히 독립적으로 처리한다. 이전 응답을 참고하거나 반복하지 말고 반드시 관련 도구를 새로 호출해 현재 상태를 확인하라.
 - 정보 부족 시 호출 금지: 사용자가 "협상해줘"라고만 했고 가격을 안 알려줬으면 도구 호출 X, "어떤 가격으로 제시할까요?"처럼 되묻기. "납품일 바꿔줘"만 했고 날짜를 안 알려줬어도 마찬가지로 되묻기. "정기배송 해줘"만 했으면 주기(매주/격주/매월)와 시작일을 묻기.
 - 가격·날짜·주기·품목이 명확히 나오면 카드 발송은 즉시 호출 (이중 confirmation 은 UX 나쁨). "1,300,000원으로 협상해줘" 같은 명확한 발화는 한 번에 submit_counter_offer 호출.
 - 직전 대화 컨텍스트 활용: 방금 create_order 결과로 받은 order_id 가 있으면 그 값을 그대로 카드 도구에 넘긴다. "주문 ID가 필요합니다"라고 되묻지 말 것.
 - 카드는 즉시 발송돼 상대방 화면에 노출되므로 도구 호출 후에는 "1,300,000원으로 카운터오퍼를 보냈습니다. 상대방이 수락/거절하면 알려드릴게요"처럼 발송 사실 + 후속 흐름 안내.
-- 도구 오류 해석 금지: 도구가 success:false 를 반환해도 "주문이 없어서"라고 말하지 마라. 오류 내용을 보고 사용자에게 정확히 안내하라. 예: submit_counter_offer 가 "QUOTE_REQUESTED 또는 NEGOTIATING 상태에서만 가능" 오류 반환 → "해당 주문은 이미 확정(CONFIRMED) 상태라 가격 협상이 불가합니다. 협상은 견적 요청 또는 협상 중 상태에서만 가능합니다."처럼 안내.
+- 도구 오류 해석 금지: 도구가 success:false 를 반환해도 "주문이 없어서"라고 말하지 마라. 오류 내용(error 필드)을 그대로 읽어 사용자에게 정확히 안내하라. submit_counter_offer 가 "현재 주문 상태가 '주문 확정'이므로 협상을 진행할 수 없습니다" 오류를 반환하면 → "해당 주문은 이미 주문 확정 상태라 가격 협상이 불가합니다. 협상은 견적 요청 또는 협상 중 단계에서만 가능합니다."처럼 error 필드를 그대로 반영해 안내하라. 절대로 에러 메시지에서 언급된 허용 상태(QUOTE_REQUESTED, NEGOTIATING)를 현재 주문 상태로 오독하지 마라.
 
 [재고 검색 vs 대체 거래처 추천 분리 원칙 (환각 방지)]
 - 1차 검색은 사용자가 명시한 품목명만 사용해서 정확 검색을 한다. 예: "참치 찾아줘" → find_sellers_by_product 또는 check_stock 으로 product_name='참치' 만 조회. 1차 결과 0건이거나 모두 OUT_OF_STOCK 인 경우라도 절대로 LLM 임의로 새우/연어/다른 품목을 끼워 넣지 말 것 (환각 = 신뢰 파탄).
@@ -1717,6 +1775,19 @@ product_id를 모르면 빈 문자열로 두고 product_name에 상품명을 넣
 
 get_orders, get_order_detail, check_stock만 호출하고 "확정했습니다"라고 답하지 마라.
 
+[🚨 주문 취소 규칙 — 판매자 전용]
+판매자가 "주문 취소해줘", "취소 처리해줘", "이 주문 취소", "없던 걸로 해줘", "취소 넣어줘" 등 취소 의사를 표현하면 반드시 update_order_status(new_status="CANCELLED")를 호출한다.
+delete_order는 취소에 절대 사용하지 마라. delete_order로 처리된 주문은 완료/취소 탭을 포함한 모든 화면에서 영구적으로 사라진다.
+
+판매자는 QUOTE_REQUESTED / NEGOTIATING / CONFIRMED / PREPARING / SHIPPING 어느 단계에서도 취소 가능하다.
+
+실행 순서:
+1. get_orders로 주문 조회 후 취소 대상 특정
+2. 조회 결과를 받는 즉시 "취소하겠습니다" 같은 중간 발화 없이 update_order_status(order_id=주문 UUID, new_status="CANCELLED") 를 바로 호출한다
+3. 성공 시 "○○ 주문이 취소됐습니다" 형식으로 안내
+
+[절대 금지] get_orders 결과를 받은 뒤 "취소 처리하겠습니다", "취소해드리겠습니다" 같은 말을 먼저 출력하지 마라. update_order_status를 호출한 이후에만 결과를 안내한다.
+
 [🚨 배송/출고 상태 변경 규칙]
 판매자가 "출고 준비 완료", "배송 보냈어", "배송 시작했어", "출하 완료", "납품 완료"라고 말하면 캘린더 일정만 수정하지 말고 반드시 주문 상태 변경으로 처리한다.
 
@@ -1759,11 +1830,13 @@ LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대�
    "단가가 낮은데 보낼까요?"처럼 되묻지 말고 그대로 호출한다.
 
 3) 납품일이 빠진 경우 ("망고 2kg 주문해줘", "사과 한 박스 발주해줘"):
-   create_order 호출 금지. 먼저 사용자에게 "납품일은 언제로 할까요? (예: 5월 20일)" 라고 자연체로 묻는다.
-   사용자가 정확한 날짜를 답하기 전까지는 어떤 경우에도 create_order 를 부르지 마라. "오늘", "내일", "다음 주" 같은 모호한 표현을 LLM 임의로 날짜로 바꿔치지 마라.
+   create_order 호출 절대 금지.
+   사용자에게 "납품일은 언제로 할까요? (예: 5월 20일)" 라고 자연체로 물어봐라.
+   사용자가 "YYYY-MM-DD" 또는 "○월 ○일" 형식으로 정확한 날짜를 직접 말하기 전까지는 create_order 를 절대 호출하지 마라.
+   ▶ 금지 행동: "오늘+7일", "내일", "다음 주 월요일" 처럼 LLM 이 스스로 날짜를 추측하거나 변환해서 delivery_date 에 채우는 것. 사용자 발화에 날짜가 없으면 delivery_date 필드 자체를 비워두고 도구를 호출하지 마라.
 
 4) 협상 명시 ("그 가격은 좀 깎아줘", "할인 받고 싶어", "협상해줘"):
-   create_order 가 아니라 submit_counter_offer 를 사용한다. 이미 PENDING/NEGOTIATING 상태의 주문이 있을 때만 가능. 가격이 함께 언급된 새 주문이면 납품일까지 받아낸 뒤 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.
+   create_order 가 아니라 submit_counter_offer 를 사용한다. 허용 여부는 서버가 검증하므로 주문 상태를 사전에 확인하거나 판단하지 말고 즉시 호출하라. 가격이 함께 언급된 새 주문이면 납품일까지 받아낸 뒤 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.
 
 5) 수량만 있고 주문 의도가 모호한 경우 ("망고 2kg"):
    바로 create_order 를 부르지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인하고, 주문이 맞다면 납품일도 함께 받아낸다.
@@ -1792,7 +1865,10 @@ create_order 호출 시 seller_id 는 반드시 UUID 형식이어야 한다. 사
 [🚨 단가 / 납품일 필수 확보]
 create_order 호출 시 unit_price 와 delivery_date 둘 다 비어있으면 안 된다.
 - unit_price 가 없으면 반드시 check_stock 또는 find_sellers_by_product 로 price_per_unit 을 확보해 채운다. "단가를 모르겠어요" 답변 금지.
-- delivery_date 가 없으면 사용자에게 정확한 날짜를 받기 전까지 호출하지 마라. 예: "납품일은 언제로 할까요? (예: 5월 20일)". 'YYYY-MM-DD' 형식으로 정규화해 전달.
+- delivery_date 규칙 (최우선):
+  · 사용자가 이번 대화에서 명시적으로 날짜를 말했을 때만 그 날짜를 'YYYY-MM-DD' 로 정규화해 넣는다.
+  · 사용자 발화에 날짜가 없으면 delivery_date 를 채우지 말고, create_order 를 호출하지 말고, 반드시 "납품일은 언제로 할까요? (예: 5월 20일)" 라고 묻는다.
+  · LLM 이 임의로 날짜를 추측·계산해 채우는 것은 어떤 이유에서도 허용되지 않는다.
 
 [🚨 주문 생성 결과 응답 표현]
 create_order 결과의 status 값에 따라 응답을 다르게 작성한다. 별표/표/헤더 사용 금지, 자연체 한국어로.
@@ -1820,6 +1896,25 @@ create_order 실행 직후 사용자가 "채팅방 열어줘", "판매자랑 얘
 - order_id 없이 주문/견적 채팅방 열기 금지
 - 기존 일반 채팅방 재사용 금지
 - "채팅방 열어줘"를 단순 일반 채팅으로 해석 금지
+
+[🚨 주문 취소 규칙 — 구매자 전용]
+구매자는 주문 상태에 따라 취소 방법이 다르다.
+
+■ QUOTE_REQUESTED / NEGOTIATING 상태
+→ update_order_status(new_status="CANCELLED") 즉시 호출 가능.
+  실행: 1) get_orders로 주문 특정 2) 조회 결과를 받는 즉시 "취소하겠습니다" 같은 중간 발화 없이 update_order_status 바로 호출 3) "취소됐습니다" 안내
+  [절대 금지] get_orders 결과를 받은 뒤 "취소 처리하겠습니다"라고 먼저 출력하지 마라. update_order_status 호출 후에만 결과를 안내한다.
+
+■ CONFIRMED 상태
+→ 구매자는 직접 취소 불가. 판매자에게 취소 요청을 보내야 한다.
+→ AI는 자동으로 취소를 시도하지 말고, 사용자에게 아래와 같이 안내한다:
+  "주문 확정 이후에는 판매자 승인이 필요합니다. 주문 상세 페이지에서 '취소 요청' 버튼을 눌러 요청을 보내주세요."
+
+■ PREPARING / SHIPPING 상태
+→ 구매자 취소 불가. 판매자에게 직접 연락해야 한다.
+→ AI는 취소를 시도하지 말고 안내: "출하 준비 이후에는 구매자가 취소할 수 없습니다. 판매자에게 채팅으로 취소를 요청해 주세요."
+
+delete_order는 취소 목적으로 절대 사용하지 마라. delete_order를 쓰면 주문이 완료/취소 탭 포함 모든 화면에서 영구적으로 사라진다.
 
 [🚨 구매자 대체 공급처 추천 (find_alternative_partners)]
 구매자는 평소 거래처가 부르는 가격이 안 맞거나, 재고가 부족하다고 답을 받았거나, 납품일이 막혀서 다른 후보가 필요한 상황이 자주 생긴다. 아래 발화 패턴을 보면 망설이지 말고 즉시 find_alternative_partners(user_id={user_id}, role="BUYER", category=품목 카테고리, reason=상황 한 줄)을 호출해라.
@@ -2177,9 +2272,11 @@ async def inventory_order_node(state: AgentState) -> dict:
                 model=model,
                 messages=agent_messages,
                 tools=TOOLS,
-                # 첫 round는 반드시 도구를 호출하도록 강제 (사전 안내 텍스트만 내고 stop 방지)
-                # 두 번째 round 이상은 도구 결과를 받고 자연어로 응답할 수 있도록 auto
-                tool_choice="required" if round_idx == 0 and not all_tool_results else "auto",
+                # 항상 auto: 납품일·seller_id 등 필수 정보가 빠진 경우 LLM이 먼저 되물어야 하는데
+                # required 강제 시 불완전한 인자로 tool을 호출해 오류가 발생하는 문제가 있었음.
+                # 시스템 프롬프트가 충분히 강하므로 정보가 갖춰진 경우엔 auto도 tool을 선택한다.
+                tool_choice="auto",
+                temperature=0,
             )
 
             choice = response.choices[0]
@@ -2190,8 +2287,100 @@ async def inventory_order_node(state: AgentState) -> dict:
             if choice.finish_reason == "stop":
                 # tool 호출 없이 답변 완료
                 final_text = choice.message.content or ""
-                fianl_text = final_text.replace("**", "").replace("- [", "[")
-                new_messages.append({"role": "assistant", "content": final_text})
+                final_text = final_text.replace("**", "").replace("- [", "[")
+                assistant_stop_msg = {"role": "assistant", "content": final_text}
+                new_messages.append(assistant_stop_msg)
+
+                # 취소 요청인데 get_orders만 실행하고 update_order_status는 아직 호출 안 한 경우:
+                # LLM이 "~하겠습니다" 식 중간 발화로 stop을 보낸 것 → 강제로 계속 진행
+                _cancel_keywords = ["취소"]
+                _guidance_phrases = ["판매자 승인", "취소 요청 버튼", "판매자에게 채팅", "직접 연락", "주문 상세 페이지"]
+                _is_cancel_req = any(k in original_user_message for k in _cancel_keywords)
+                _is_guidance = any(p in final_text for p in _guidance_phrases)
+                _has_orders = any(r["tool_name"] in ("get_orders", "get_order_detail") for r in all_tool_results)
+                _action_done = "update_order_status" in tools_used
+
+                if (_is_cancel_req and not _is_guidance and _has_orders
+                        and not _action_done and round_idx < MAX_TOOL_ROUNDS - 1):
+                    # 중간 발화를 context에 포함하고 도구 호출 강제
+                    agent_messages.append(assistant_stop_msg)
+                    agent_messages.append({
+                        "role": "user",
+                        "content": "즉시 update_order_status 도구를 호출해서 취소를 완료하라. 추가 설명 없이 도구만 호출하라.",
+                    })
+                    continue
+
+                # ── 주문생성/납품일변경/협상 날조 감지 ──────────────────────
+                # 도구를 호출하지 않고 완료를 가장한 응답, 또는
+                # get_orders 이후 "~하겠습니다" 중간 발화로 멈춘 경우를 모두 잡는다.
+                _order_fab_markers = [
+                    "ORD-", "주문 번호는", "주문번호는",
+                    "접수되었습니다", "견적 요청으로 전달",
+                ]
+                _delivery_fab_markers = [
+                    "판매자 확인을 기다리는 상태", "변경 요청을 보냈습니다",
+                    "납품일 변경 요청이 전송", "변경 요청이 접수",
+                ]
+                _counter_fab_markers = [
+                    "협상 요청을 진행하겠습니다", "가격 협상 요청을 하겠습니다",
+                    "카운터오퍼를 보내겠습니다", "협상가를 제시하겠습니다",
+                    "협상 요청을 보내겠습니다",
+                ]
+                _order_intent_kw = ["주문 넣어줘", "주문해줘", "발주", "주문할게"]
+                _delivery_intent_kw = ["납품일", "배송일", "납기"]
+                _counter_intent_kw = ["협상", "협상가", "가격 제시", "가격 조정", "깎아"]
+
+                _is_order_fab = (
+                    any(m in final_text for m in _order_fab_markers)
+                    and any(k in original_user_message for k in _order_intent_kw)
+                    and "create_order" not in tools_used
+                    and not all_tool_results
+                )
+                _is_delivery_fab = (
+                    any(m in final_text for m in _delivery_fab_markers)
+                    and any(k in original_user_message for k in _delivery_intent_kw)
+                    and "submit_delivery_date_change" not in tools_used
+                    and not all_tool_results
+                )
+                # 협상: 도구 미호출이면서 날조 마커가 있거나,
+                # get_orders 결과는 있는데 submit_counter_offer를 호출 안 하고 멈춘 경우
+                _has_orders_result = any(
+                    r["tool_name"] in ("get_orders", "get_order_detail")
+                    for r in all_tool_results
+                )
+                _is_counter_fab = (
+                    any(k in original_user_message for k in _counter_intent_kw)
+                    and "submit_counter_offer" not in tools_used
+                    and (
+                        (any(m in final_text for m in _counter_fab_markers) and not all_tool_results)
+                        or _has_orders_result  # get_orders 이후 중간 발화로 멈춘 경우
+                    )
+                )
+
+                if (_is_order_fab or _is_delivery_fab or _is_counter_fab) and round_idx < MAX_TOOL_ROUNDS - 1:
+                    agent_messages.append(assistant_stop_msg)
+                    if _is_order_fab:
+                        _force_msg = (
+                            "방금 응답은 무효입니다. 도구를 호출하지 않고 가상의 주문 완료 응답을 출력했습니다. "
+                            "반드시 실제 도구(find_sellers_by_product, create_order 등)를 호출해 처리하라. "
+                            "납품일이 없으면 create_order를 호출하지 말고 '납품일은 언제로 할까요?'라고 물어봐라."
+                        )
+                    elif _is_delivery_fab:
+                        _force_msg = (
+                            "방금 응답은 무효입니다. 도구를 호출하지 않고 가상의 납품일 변경 완료 응답을 출력했습니다. "
+                            "반드시 실제 도구를 사용해 처리하라. "
+                            "먼저 get_orders로 대상 주문을 조회하고, 허용 상태 주문이 복수면 사용자에게 선택을 요청한 뒤 submit_delivery_date_change를 호출하라."
+                        )
+                    else:
+                        _force_msg = (
+                            "방금 응답은 무효입니다. '~하겠습니다' 식 발화 없이 즉시 submit_counter_offer를 호출하라. "
+                            "사용자가 언급한 품목명으로 후보를 좁히고, QUOTE_REQUESTED/NEGOTIATING 상태 주문이 "
+                            "1건이면 바로 호출, 2건 이상이면 사용자에게 선택을 물어봐라."
+                        )
+                    agent_messages.append({"role": "user", "content": _force_msg})
+                    continue
+                # ───────────────────────────────────────────────────────────
+
                 # tool_results가 있으면 response_node가 요약, 없으면 직접 final_response 설정
                 if not all_tool_results:
                     return {
@@ -2658,6 +2847,17 @@ async def chat_node(state: AgentState) -> dict:
         "- 납품일 응답: PENDING 납품일 변경 카드에 '수락해줘' → accept_delivery_date_change(user_id, order_id, change_id), '거절해줘' → reject_delivery_date_change(user_id, order_id, change_id).\n"
         "- 카드 발송 후에는 '130만원으로 카운터오퍼 카드를 발송했습니다. 상대방이 수락/거절하면 알려드릴게요'처럼 발송 사실과 후속 흐름을 자연체로 안내. 별표/표/헤더 금지.\n"
         "\n"
+        "[협상가 제시 / 납품일 변경 도구 호출 절차 — 매우 중요]\n"
+        "- submit_counter_offer / submit_delivery_date_change / accept_counter_offer / reject_counter_offer / accept_delivery_date_change / reject_delivery_date_change 호출 시 order_id 가 필요하다. 아래 절차를 반드시 따른다.\n"
+        "- [1단계 — 협상 가능 주문 목록 조회] 협상가 제시는 get_orders(user_id={user_id}, role=현재 역할, status_in=['QUOTE_REQUESTED','NEGOTIATING']) 로, 납품일 변경은 status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED'] 로 사전 필터링. CONFIRMED 이후(협상) / PREPARING 이후(납품일 변경)는 차단되므로 사전 필터링 필수.\n"
+        "- [2단계 — 후보 필터링] 사용자 발화에서 추출한 상품명 / 거래처 / 수량으로 매칭되는 주문만 후보로 추린다. 정확한 상품명 매칭, 수량 명시 시 수량 매칭, 거래처 명시 시 거래처 매칭.\n"
+        "- [3단계 — 후보 수에 따른 처리]\n"
+        "  · 후보 0개: '○○ 상품에 대한 협상 가능한 주문이 없습니다. (이미 확정 이후 상태이거나 해당 상품 주문이 진행 중이지 않습니다.)' 안내만 하고 끝낸다. 다른 주문 정보 늘어놓지 마라.\n"
+        "  · 후보 1개: 즉시 submit_counter_offer(order_id=그_주문의_id, ...) 호출. 결과를 자연체로 안내.\n"
+        "  · 후보 2개 이상: '옥수수 50kg 주문(ORD-...) 과 옥수수 80kg 주문(ORD-...) 중 어느 주문에 협상가를 제시할까요?' 형식으로 사용자에게 묻기. 답변 받기 전에는 절대 호출 금지.\n"
+        "- [발화 모호성 처리] 사용자 발화가 모호한 경우 (예: '테스트 관리 협상가를 제시해줘' — 어떤 상품인지 불명확) 임의로 추측하지 말고 '어떤 상품의 주문에 대한 협상인가요?' 라고 되묻기. 진행 중 주문 목록을 짧게 보여주는 것은 OK 지만 임의로 한 주문을 선택해 진행하면 안 된다.\n"
+        "- [금지] 사용자가 안 물은 다른 주문 정보 줄줄이 나열, 후보 여러 개일 때 임의 선택, 후보 0개일 때 다른 상품 주문 끼워 넣기, 'order ID를 알려주세요'로 UUID 직접 요구. accept/reject 도 동일 절차 적용.\n"
+        "\n"
         "[거래처 등록 / 정기배송 자연어 매핑]\n"
         "- 거래처 등록 발화: '○○를 거래처로 등록해줘', '○○ 추가해줘', '거래처 신청 보내줘'.\n"
         "  - 상대방 UUID 가 정확히 알려진 경우만 request_partner_registration(user_id, target_user_id, note?) 호출.\n"
@@ -2687,7 +2887,7 @@ async def chat_node(state: AgentState) -> dict:
         "- 납품일 + 수량 명시 발화 ('망고 2kg 5월 20일에 받게 주문해줘'): check_stock 또는 find_sellers_by_product 로 price_per_unit 을 확보해 unit_price 에 채우고, 사용자가 말한 날짜를 'YYYY-MM-DD' 로 정규화해 delivery_date 에 넣은 뒤 create_order 호출. 가격 일치면 QUOTE_REQUESTED, 낮으면 NEGOTIATING.\n"
         "- 가격까지 명시 발화 ('13만원에 망고 2kg 5/20일 받기로 주문해줘'): 명시된 가격을 그대로 unit_price 로, 날짜를 그대로 delivery_date 로 넣어 create_order 호출. '단가가 낮은데 보낼까요?' 되묻기 금지.\n"
         "- 납품일 빠진 발화 ('망고 2kg 주문해줘'): create_order 호출 금지. 먼저 사용자에게 '납품일은 언제로 할까요? (예: 5월 20일)' 라고 자연체로 되묻고, 정확한 날짜를 받기 전까지는 어떤 경우에도 호출하지 마라. '오늘', '내일' 같은 모호한 표현을 LLM 임의로 날짜로 바꿔치지 마라.\n"
-        "- 협상 명시 발화 ('그 가격 좀 깎아줘', '할인 받고 싶어', '협상해줘'): create_order 가 아니라 submit_counter_offer 사용. PENDING/NEGOTIATING 주문이 이미 있을 때만 가능. 가격이 함께 언급된 새 주문이면 납품일까지 받아낸 뒤 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.\n"
+        "- 협상 명시 발화 ('그 가격 좀 깎아줘', '할인 받고 싶어', '협상해줘'): create_order 가 아니라 submit_counter_offer 사용. 허용 여부는 서버가 검증하므로 주문 상태를 사전에 확인하거나 판단하지 말고 즉시 호출하라. 서버가 불가하다고 에러를 반환하면 error 필드 내용을 사용자에게 그대로 전달하라. 가격이 함께 언급된 새 주문이면 납품일까지 받아낸 뒤 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.\n"
         "- 단가/납품일 필수 확보: create_order 호출 시 unit_price, delivery_date 둘 다 비어있으면 안 된다. unit_price 없으면 조회 도구로 확보, delivery_date 없으면 사용자에게 받아내기 전까지 호출 금지. '단가를 모르겠어요' 답변 금지.\n"
         "- 결과 응답 표현 (별표/표/헤더 금지, 자연체 한국어, 절대 '주문이 확정됐습니다'라고 말하지 말 것 — 판매자 수락 전에는 확정이 아니다):\n"
         "  - status=QUOTE_REQUESTED (정상 신규 견적): '○○ ○단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일. 판매자가 수락하면 알려드릴게요.' 형식.\n"
@@ -2829,7 +3029,50 @@ async def response_node(state: AgentState) -> dict:
                         "주문번호를 확인해서 다시 처리해 주세요."
                     )
                 }
-            
+
+    # ── 주문 생성 / 납품일 변경 날조 최종 안전망 ────────────────────────
+    # 각 도구가 실행되지 않았는데 완료 문구가 응답에 있으면 차단.
+    # get_orders/get_order_detail 로 기존 주문을 조회해 보여주는 정상 케이스는 제외.
+    _final_resp = state.get("final_response", "")
+    _query_tools_used = {"get_orders", "get_order_detail"} & set(tools_used)
+
+    _order_fab_markers = ["ORD-", "주문 번호는", "주문번호는", "접수되었습니다", "견적 요청으로 전달"]
+    if (any(m in _final_resp for m in _order_fab_markers)
+            and "create_order" not in tools_used
+            and not _query_tools_used):
+        return {
+            "final_response": (
+                "주문 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
+            )
+        }
+
+    _delivery_fab_markers = [
+        "판매자 확인을 기다리는 상태", "변경 요청을 보냈습니다",
+        "납품일 변경 요청이 전송", "변경 요청이 접수",
+    ]
+    if (any(m in _final_resp for m in _delivery_fab_markers)
+            and "submit_delivery_date_change" not in tools_used):
+        return {
+            "final_response": (
+                "납품일 변경 요청 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
+            )
+        }
+
+    _counter_offer_fab_markers = [
+        "협상 요청을 진행하겠습니다", "가격 협상 요청을 하겠습니다",
+        "카운터오퍼를 보냈습니다", "협상가를 제시했습니다",
+        "협상 요청을 보내겠습니다", "협상가를 전달했습니다",
+        "가격 협상 요청이 전송", "협상 요청이 접수",
+    ]
+    if (any(m in _final_resp for m in _counter_offer_fab_markers)
+            and "submit_counter_offer" not in tools_used):
+        return {
+            "final_response": (
+                "협상가 제시 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
+            )
+        }
+    # ────────────────────────────────────────────────────────────────────
+
     # orchestrator_node 또는 inventory_order_node에서 이미 답변이 생성된 경우
     if state.get("final_response"):
         return {}
@@ -3095,6 +3338,7 @@ class AgentOrchestrator:
             return {
                 "response": final_state.get("final_response") or "응답을 생성하지 못했습니다.",
                 "tools_used": final_state.get("tools_used", []),
+                "tool_results": final_state.get("tool_results", []),
                 "manual_review": final_state.get("manual_review", False),
             }
         except Exception as e:

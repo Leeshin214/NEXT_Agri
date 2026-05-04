@@ -7,6 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.dependencies import get_current_user, require_buyer
 from app.schemas.common import SuccessResponse
 from app.schemas.order import (
+    CancelRequestCreate,
+    CancelRequestResponse,
+    CancelRequestRespond,
     CounterOfferCreate,
     CounterOfferResponse,
     DeliveryDateChangeCreate,
@@ -146,13 +149,58 @@ async def cancel_order(
     data: OrderCancel,
     current_user: dict = Depends(get_current_user),
 ):
-    """주문 취소 — 양쪽 모두 가능, COMPLETED 이후 불가"""
+    """주문 취소.
+
+    - BUYER: QUOTE_REQUESTED/NEGOTIATING 에서만 직접 취소 가능.
+    - BUYER + CONFIRMED: 취소 요청(POST /cancel-request) 을 사용해야 함 → 403.
+    - BUYER + PREPARING/SHIPPING: 취소 불가 → 403.
+    - SELLER: 모든 활성 상태에서 직접 취소 가능.
+    """
     order = await order_service.cancel_order(
         order_id=order_id,
         reason=data.reason,
         user=current_user,
     )
     return {"data": order}
+
+
+@router.post(
+    "/{order_id}/cancel-request",
+    response_model=SuccessResponse[CancelRequestResponse],
+    status_code=201,
+)
+async def create_cancel_request(
+    order_id: UUID,
+    data: CancelRequestCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    """구매자가 CONFIRMED 주문에 대해 판매자에게 취소 승인을 요청한다."""
+    req = await order_service.create_cancel_request(
+        order_id=order_id,
+        reason=data.reason,
+        user=current_user,
+    )
+    return {"data": req}
+
+
+@router.patch(
+    "/{order_id}/cancel-request/{request_id}/respond",
+    response_model=SuccessResponse[CancelRequestResponse],
+)
+async def respond_cancel_request(
+    order_id: UUID,
+    request_id: UUID,
+    data: CancelRequestRespond,
+    current_user: dict = Depends(get_current_user),
+):
+    """판매자가 취소 요청에 승인(approve) 또는 거절(reject) 응답한다."""
+    req = await order_service.respond_cancel_request(
+        order_id=order_id,
+        request_id=request_id,
+        action=data.action,
+        user=current_user,
+    )
+    return {"data": req}
 
 
 # ===========================================

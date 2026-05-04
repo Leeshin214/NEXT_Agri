@@ -2,9 +2,8 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { Sparkles, ArrowLeft, AlertTriangle, X } from 'lucide-react';
+import { ArrowLeft, AlertTriangle, X } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
-import Modal from '@/components/common/Modal';
 import MessageBubble from '@/components/chat/MessageBubble';
 import OrderContextBanner from '@/components/chat/OrderContextBanner';
 import ChatRoomInquiryProduct from '@/components/chat/ChatRoomInquiryProduct';
@@ -17,7 +16,6 @@ import {
   useChatRooms,
   useMessagesWithWebSocket,
   useMarkAsRead,
-  useSummarizeChat,
   useCreateChatRoom,
   useDismissNegotiationDraft,
 } from '@/hooks/useChat';
@@ -36,8 +34,6 @@ export default function BuyerChatPage() {
   const { user, isHydrated } = useAuthStore();
   const searchParams = useSearchParams();
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
-  const [showSummary, setShowSummary] = useState(false);
-  const [summary, setSummary] = useState('');
   // 모바일에서 채팅방 선택 시 메시지 뷰로 전환하는 상태
   const [mobileView, setMobileView] = useState<'list' | 'messages'>('list');
   // 대체 거래처 제안 배너 닫기 상태 (다음 suggestion 도착 시 자동 초기화)
@@ -57,7 +53,6 @@ export default function BuyerChatPage() {
   const { messageQuery, isConnected, sendMessage: wsSendMessage, wsError, alternativePartnersSuggestion } =
     useMessagesWithWebSocket(selectedRoomId);
   const markAsRead = useMarkAsRead();
-  const summarize = useSummarizeChat();
   const createChatRoom = useCreateChatRoom();
   // US-2 협상 의도 감지 — [무시] PATCH + [등록] 시 PriceOfferPopover prefill
   const dismissDraft = useDismissNegotiationDraft(selectedRoomId);
@@ -141,17 +136,6 @@ export default function BuyerChatPage() {
     dismissDraft.mutate(messageId);
   };
 
-  const handleSummarize = async () => {
-    if (messages.length === 0) return;
-    const recentMessages = messages
-      .slice(-20)
-      .map((m) => `${m.sender_id === user?.id ? '나' : selectedRoom?.partner_name || '상대방'}: ${m.content}`)
-      .join('\n');
-
-    const result = await summarize.mutateAsync(recentMessages);
-    setSummary(result.data.summary);
-    setShowSummary(true);
-  };
 
   // 대체 거래처 클릭 → 채팅방 개설 후 해당 방으로 이동
   const handleAlternativeClick = async (partner: AlternativePartner) => {
@@ -216,7 +200,7 @@ export default function BuyerChatPage() {
         {/* 메시지 영역 — 모바일: mobileView==='messages'일 때만 표시, md 이상: 항상 표시 */}
         <div
           className={cn(
-            'flex flex-1 flex-col',
+            'flex flex-1 flex-col min-w-0',
             mobileView === 'messages' ? 'flex' : 'hidden md:flex'
           )}
         >
@@ -263,15 +247,6 @@ export default function BuyerChatPage() {
                     currentStatus={linkedOrderStatus}
                     role="buyer"
                   />
-                  <button
-                    onClick={handleSummarize}
-                    disabled={summarize.isPending || messages.length === 0}
-                    className="flex items-center gap-1.5 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
-                  >
-                    <Sparkles className="h-3.5 w-3.5 text-purple-500" />
-                    <span className="hidden sm:inline">{summarize.isPending ? 'AI 요약 중...' : 'AI 요약'}</span>
-                    <span className="sm:hidden">요약</span>
-                  </button>
                 </div>
               </div>
 
@@ -419,12 +394,6 @@ export default function BuyerChatPage() {
         </div>
       </div>
 
-      {/* AI 요약 모달 */}
-      <Modal isOpen={showSummary} onClose={() => setShowSummary(false)} title="AI 대화 요약" size="md">
-        <div className="prose prose-sm max-w-none whitespace-pre-wrap text-gray-800">
-          {summary}
-        </div>
-      </Modal>
     </div>
   );
 }
