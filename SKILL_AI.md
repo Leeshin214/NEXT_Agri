@@ -618,3 +618,15 @@ create_subscription_from_order,
 - 응답 표현 예시를 가이드에 박을 때 "○○ N단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일." 처럼 수치 (수량·가격·날짜) 를 먼저 풀어서 제시하는 형식이, "주문 견적이 발송됐고 가격은 ₩○○이고 납품일은 ○월 ○일입니다" 처럼 산문체로 풀어쓰는 형식보다 LLM 모방률이 높음.
 - 이유: GPT-4o-mini 는 가이드의 마지막 예시 문장을 그대로 따라가는 경향이 있어, **명사 + 수치 + 핵심 정보를 마침표로 끊어 나열**하는 패턴이 채팅창에서 가독성도 좋고 LLM 도 잘 재현함.
 - 반대로 부정형 ("절대 X 라고 말하지 마라") 은 한 번 더 강조 — `[응답 표현]` 섹션 본문 + 헤더 옆 강조 + 가이드 맨 마지막 문장 3중으로 박아야 LLM 이 무의식적으로 옛 표현으로 돌아가는 걸 막을 수 있음 (이번 작업에서 "주문이 확정됐습니다 절대 금지"를 3곳에 분산 명시).
+
+#### 주문 대상 판매자 식별 절차 + 도구 실패 시 환각 방지 (2026-05-04 추가)
+- 실제 사용자 시나리오 실패: "test3한테 감자 10kg 주문해줘" → AI 가 `create_order(seller_id="test3")` 처럼 이름을 UUID 자리에 직접 넣어 호출 실패 + 그 후 환각으로 컨텍스트 메모리에 있던 다른 주문(동해 참치·참나물 등)을 줄줄이 노출. 두 가지 결함을 동시에 강제로 차단해야 한다.
+- (1) **schema description 강화** (orchestrator.py 라인 ~423-434): `create_order` 의 `seller_id` 와 `buyer_id` description 에 "이름/회사명 평문 금지", "get_user_profile / find_sellers_by_product 로 UUID 조회 후 사용", "UUID 아닌 값은 백엔드가 즉시 실패시킨다"를 명시. JSON schema description 은 OpenAI 가 tool_call 인자 생성 시점에 직접 참조하므로, 이 위치에서 막는 것이 BUYER_ROLE_APPENDIX 본문 가이드보다 LLM 준수율이 더 높다.
+- (2) **BUYER_ROLE_APPENDIX 신규 섹션** `[🚨 주문 대상 판매자 식별 절차]` (라인 ~1693 근방, [구매자 주문/견적 생성 규칙] 직후, [단가/납품일 필수 확보] 직전): 1단계 get_user_profile / find_sellers_by_product 호출 → 2단계 정확 1명 매칭 → create_order, 여러 명 → 되묻기, 0건 → "정확한 이름 알려주세요" 의 4단계 절차 명시. 사용자 명시 동의 없이 find_alternative_partners 호출 금지 함께 박음.
+- (3) **chat_node 시스템 프롬프트** (라인 ~2556 근방, [needs_confirmation 응답 가이드] / [자연어 협상/납품일 → 카드 도구 매핑] 사이): chat intent 라우팅 시 가장 자주 호출되는 노드라 BUYER_ROLE_APPENDIX 와 별도로 동일 매핑 명시. UUID 조회 → seller_id 채우기 → create_order 호출 순서.
+- (4) **AGENT_BASE_SYSTEM 신규 섹션** `[도구 실패 시 응답 가이드 — 매우 중요 (환각 방지)]` (라인 ~1591 근방, [재고 검색 vs 대체 거래처 추천 분리 원칙] 직후, [주의사항] 직전): SELLER/BUYER 합성본 양쪽에 자동 반영. 핵심 원칙 6개 — (a) 실패 사실+원인을 한 줄, (b) 안 물은 다른 정보 끌어와 늘어놓지 마라, (c) 다음 액션 1개만 짧게, (d) 실패를 성공으로 포장 금지, (e) 컨텍스트 메모리의 다른 주문/거래처 자기멋대로 노출 금지, (f) error 코드 영문 그대로 노출 금지.
+- (5) **chat_node** 에도 동일한 [도구 실패 시 응답 가이드] 섹션을 직접 명시. BASE 안에서도 들어가지만, chat 라우팅이 가장 자주 도구 실패를 마주치는 노드라 중복 명시 — 5번 정도가 LLM 망각을 가장 잘 방어하는 표준 패턴 (가독성/마크다운 금지 가이드도 같은 5중 패턴).
+- 검증 결과: AST OK, placeholder 11개 모두 보존 (`role_label`, `role_label_short`, `case1/2/10/11_action`, `auth_product_rule`, `ambiguity_modify_rule`, `user_id`, `company_name`, `user_name`), BUYER 합성본 잔여 placeholder 0, SELLER 합성본 잔여 placeholder 0, BUYER 전용 가이드(`주문 대상 판매자 식별 절차`)가 SELLER 합성본에 누출 0건, 도구 실패 가이드는 BASE 에 박힌 결과 SELLER/BUYER 양쪽 자동 반영 확인. 이전 가이드 14종(가독성, 핵심 대화 원칙, 대체 거래처, send_chat_message needs_confirmation, 자연어→카드 도구, 안전장치, 재고 vs 대체, 구매자 주문/견적, 단가/납품일 필수, 주문 결과 응답 표현, 납품일 변경, 채팅방 연결, 신규 구매자 발굴, 카드 도구 매핑) 모두 보존.
+- 회귀 검증 통과: "자동 확정 / 협상 분기", "auto_confirmed=true", "재고를 자동 차감한다", "[🚨 단가 자동 조회 강제]" 등 옛 표현 모두 미존재.
+- 핵심 교훈: **이름→UUID 매핑 가이드는 LLM 본문 프롬프트보다 schema description 에 박아야 효과 있음.** OpenAI tool_call 은 schema 의 description 을 인자 생성 직전에 다시 읽어 들이므로, "이 필드는 UUID 만 받음"을 schema 차원에서 못 박으면 LLM 이 평문(이름)을 넣을 확률이 거의 사라진다. 본문 프롬프트는 보조 — schema 가 1차 방어선.
+- 핵심 교훈 2: **도구 실패 시 환각 방지는 "안 물은 정보 끌어오지 마라"를 명시적으로 박아야 함.** 단순히 "에러를 정확히 안내하라"만 박으면 LLM 이 친절을 가장해 컨텍스트 메모리의 다른 주문/거래처를 줄줄이 추가로 노출한다. "사용자가 직접 물은 대상의 에러만 답한다"를 본문에 단정문으로 박아야 멈춘다.
