@@ -19,7 +19,12 @@ export function useAIStream() {
   const abortRef = useRef<AbortController | null>(null);
 
   const stream = useCallback(
-    async (prompt: string, promptType?: string) => {
+    async (
+      prompt: string,
+      promptType?: string,
+      orderId?: string | null,
+      roomId?: string | null
+    ) => {
       if (!prompt.trim() || isStreaming) return;
 
       // 1. 스토어에 pending turn 추가 — 사용자 메시지 즉시 표시
@@ -39,13 +44,20 @@ export function useAIStream() {
         const { data } = await supabase.auth.getSession();
         const token = data.session?.access_token;
 
+        // null 은 undefined 로 정규화 — JSON.stringify 가 undefined 키를 제거하므로
+        // 채팅 컨텍스트가 없는 페이지에서는 order_id / room_id 가 페이로드에 포함되지 않는다.
         const res = await fetch(`${apiUrl}/api/v1/ai/agent/chat`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
-          body: JSON.stringify({ prompt, prompt_type: promptType }),
+          body: JSON.stringify({
+            prompt,
+            prompt_type: promptType,
+            order_id: orderId ?? undefined,
+            room_id: roomId ?? undefined,
+          }),
           signal: abortRef.current.signal,
         });
 

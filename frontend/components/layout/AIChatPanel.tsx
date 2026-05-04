@@ -15,6 +15,8 @@ export default function AIChatPanel() {
   const { isStreaming, manualReview, stream } = useAIStream();
   const { user } = useAuthStore();
   const { aiPanelOpen, toggleAIPanel, setAIPanelOpen } = useUIStore();
+  // 채팅 페이지에서 publish 한 현재 채팅방 컨텍스트 — stream 호출 시 백엔드에 함께 전달
+  const aiChatContext = useUIStore((s) => s.aiChatContext);
 
   // AI 히스토리 hydrate 트리거 + store 의 turns 구독
   useAIHistory(100);
@@ -47,7 +49,7 @@ export default function AIChatPanel() {
   const handleSubmit = (text: string) => {
     if (!text.trim()) return;
     setInput('');
-    stream(text);
+    stream(text, undefined, aiChatContext.orderId, aiChatContext.roomId);
   };
 
   // 채팅 UI — 확장 상태에서 공통으로 사용
@@ -79,7 +81,9 @@ export default function AIChatPanel() {
           {quickPrompts.map((qp) => (
             <button
               key={qp.type}
-              onClick={() => stream(qp.prompt, qp.type)}
+              onClick={() =>
+                stream(qp.prompt, qp.type, aiChatContext.orderId, aiChatContext.roomId)
+              }
               disabled={isStreaming}
               className="flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-600 hover:border-primary-300 hover:bg-primary-50 hover:text-primary-700 disabled:opacity-50"
             >

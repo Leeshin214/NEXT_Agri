@@ -61,6 +61,8 @@ class AgentState(TypedDict):
     tool_round: int          # tool 실행 라운드 카운터 (무한루프 방지)
     validation_status: str   # PASSED / RETRY / FAILED
     manual_review: bool      # 검증 실패로 수동 검토 필요 여부
+    order_id: Optional[str]  # 현재 채팅방 컨텍스트 — 협상/납품일 변경 도구의 기본 order_id
+    room_id: Optional[str]   # 현재 채팅방 ID
 
 
 # ─────────────────────────────────────────────
@@ -300,6 +302,8 @@ TOOLS = [
                 "사용자의 주문 목록을 조회한다. "
                 "판매자는 받은 주문, 구매자는 넣은 주문이 조회된다. "
                 "status로 특정 상태(예: QUOTE_REQUESTED, SHIPPING)만 필터링할 수 있다."
+                "주의: 사용자가 '거래요청 들어온거 있어?', '새로운 거래' 등을 물어보면 "
+                "이것은 새로운 주문/견적 요청을 의미하므로 반드시 이 도구를 호출하여 확인하라."
             ),
             "parameters": {
                 "type": "object",
@@ -434,7 +438,7 @@ TOOLS = [
                     },
                     "delivery_date": {
                         "type": "string",
-                        "description": "납품 희망일 (선택, ISO 8601 형식: YYYY-MM-DD)",
+                        "description": "납품 희망일 (필수, ISO 8601 형식: YYYY-MM-DD). 사용자가 명시하지 않았으면 반드시 확인해서 채워야 한다.",
                     },
                     "delivery_address": {
                         "type": "string",
@@ -445,7 +449,7 @@ TOOLS = [
                         "description": "주문 관련 메모/요청사항 (선택)",
                     },
                 },
-                "required": ["buyer_id", "seller_id", "product_id", "quantity", "unit_price"],
+                "required": ["buyer_id", "seller_id", "product_id", "quantity", "unit_price", "delivery_date"],
             },
         },
     },
@@ -666,6 +670,537 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_partner_registration",
+            "description": (
+                "거래처 등록 요청을 상대방에게 보낸다 (양방향 PENDING 모델). "
+                "사용자가 '○○를 거래처로 등록해줘', '○○ 추가해줘', '거래처 신청 보내줘', "
+                "'○○랑 거래 트고 싶어' 같은 자연어 요청 시 호출. "
+                "이 도구는 상대방 user_id(UUID) 를 정확히 아는 경우만 사용한다. "
+                "이름/회사명만 알면 request_partner_registration_by_name 을 먼저 사용하거나 "
+                "get_user_profile 로 UUID 를 조회한 뒤 호출하라. "
+                "성공 시 상대 화면에 PENDING_INCOMING 상태로 보이며, 상대가 수락해야 ACTIVE 거래처가 된다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "신청자(현재 로그인 사용자)의 UUID. 서버에서 현재 user_id 로 강제 주입됨.",
+                    },
+                    "target_user_id": {
+                        "type": "string",
+                        "description": "거래처로 등록할 상대방 사용자의 UUID. 자기 자신 UUID 는 거부됨.",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "본인 row 에 저장될 메모 (선택). 예: '경북 청송 사과 거래용'.",
+                    },
+                },
+                "required": ["target_user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_partner_registration_by_name",
+            "description": (
+                "이름이나 회사명으로 거래처 등록 요청을 보낸다. "
+                "사용자가 '행복농산을 거래처로 등록해줘', '김철수님 거래처 추가' 처럼 "
+                "UUID 가 아닌 이름/업체명만 말한 경우 사용한다. "
+                "내부적으로 사용자 검색을 거쳐 단일 매칭이면 즉시 신청, 다중 매칭이면 "
+                "needs_confirmation=true 응답으로 후보 리스트를 반환한다 — "
+                "이 경우 사용자에게 어느 분인지 확인받은 뒤 request_partner_registration 으로 "
+                "user_id 를 직접 지정해 다시 호출하라. "
+                "절대 보내지 말 것: needs_confirmation=true 인데 '등록했습니다' 라고 답변하면 거짓 보고가 된다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "신청자(현재 로그인 사용자)의 UUID. 서버에서 현재 user_id 로 강제 주입됨.",
+                    },
+                    "target_name_or_company": {
+                        "type": "string",
+                        "description": "거래처로 등록할 상대방의 이름 또는 회사명 (부분 일치 검색).",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "본인 row 에 저장될 메모 (선택).",
+                    },
+                },
+                "required": ["target_name_or_company"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_incoming_subscription_requests",
+            "description": (
+                "내게 들어온 PENDING 정기배송 요청 목록을 조회한다. "
+                "'정기배송 요청 들어온거 있어?', '정기배송 신청 왔어?', '정기배송 요청 확인해줘' 같은 요청 시 호출."
+                "🚨 강력 경고: '거래처'라는 단어가 명확하게 있을 때만 이 도구를 사용하라. "
+                "단순히 '거래요청 들어온거 있어?'라고 물으면 이것은 주문(Order)을 묻는 것이므로 "
+                "이 도구가 아니라 절대적으로 'get_orders'를 호출해야 한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "현재 로그인 사용자 UUID"},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_incoming_partner_requests",
+            "description": (
+                "내게 들어온 PENDING_INCOMING 거래처 등록 요청 목록을 조회한다. "
+                "'들어온 거래처 요청 있어?', '거래처 신청 왔어?', '거래처 요청 확인해줘' 같은 요청 시 호출."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "현재 로그인 사용자 UUID"},
+                },
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "accept_partner_request",
+            "description": (
+                "들어온 거래처 등록 요청을 수락한다. "
+                "'거래처 요청 수락해줘', '○○ 거래처 수락', '승인해줘' 같은 요청 시 호출. "
+                "partner_id 를 모르면 get_incoming_partner_requests 로 먼저 조회하라."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "현재 로그인 사용자 UUID"},
+                    "partner_id": {"type": "string", "description": "수락할 partners 테이블 row UUID"},
+                },
+                "required": ["user_id", "partner_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reject_partner_request",
+            "description": (
+                "들어온 거래처 등록 요청을 거절한다. "
+                "'거래처 요청 거절해줘', '○○ 거래처 거절', '거절해줘' 같은 요청 시 호출. "
+                "partner_id 를 모르면 get_incoming_partner_requests 로 먼저 조회하라."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "현재 로그인 사용자 UUID"},
+                    "partner_id": {"type": "string", "description": "거절할 partners 테이블 row UUID"},
+                },
+                "required": ["user_id", "partner_id"],
+            },
+        },
+    },
+    # ─────────────────────────────────────────────
+    # 카운터오퍼 / 납품일 변경 — 채팅 카드 발송 도구
+    # (테스터 피드백 #2: '13만원에 협상해줘' 같은 자연어를 채팅 카드로 자동 변환)
+    # ─────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_counter_offer",
+            "description": (
+                "구매자 또는 판매자가 채팅방에서 가격 제시 카드를 발송한다. "
+                "사용자가 '1300000원으로 협상해줘', '13만원에 어때요', '가격 좀 깎아주세요', "
+                "'좀 더 싸게 안 돼?', '단가 협상하고 싶어', '가격 제시할게' 같이 가격 협상을 시도하면 "
+                "평문 채팅 메시지(send_chat_message)가 아니라 반드시 이 도구로 호출하라. "
+                "발송 즉시 상대방 채팅창에 수락/거절 버튼이 있는 PENDING 카드가 노출된다. "
+                "주문 상태가 QUOTE_REQUESTED 또는 NEGOTIATING 일 때만 가능 — 그 외 상태에서는 거절됨. "
+                "이전 PENDING 카운터오퍼는 자동으로 SUPERSEDED 처리되므로 안전하게 새로 제시 가능."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "제시자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": (
+                            "대상 주문 UUID. 모르면 get_orders 또는 get_chat_rooms 로 먼저 찾아라."
+                        ),
+                    },
+                    "proposed_total_amount": {
+                        "type": "integer",
+                        "description": (
+                            "제시 총 금액 (KRW 정수, 양수). '13만원' → 130000, "
+                            "'1.3백만원' → 1300000 처럼 숫자로 정확히 변환해 전달하라."
+                        ),
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "협상 메모/근거 (선택). 예: '대량 구매 할인 요청'.",
+                    },
+                },
+                "required": ["order_id", "proposed_total_amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "accept_counter_offer",
+            "description": (
+                "상대방이 제시한 PENDING 가격 카드를 수락한다. "
+                "사용자가 채팅방의 가격 제시 카드를 보고 '수락해줘', 'OK', '좋아요', "
+                "'그 가격으로 진행', '됐어', '오케이' 같은 자연어로 지시하면 호출하라. "
+                "수락 즉시: (1) orders.total_amount 가 제시 금액으로 갱신, "
+                "(2) order_items 가 협상 항목으로 교체, "
+                "(3) 채팅방의 PENDING 카드 상태가 ACCEPTED 로 자동 동기화되어 수락/거절 버튼이 사라진다. "
+                "본인이 제시한 카운터오퍼는 수락 불가 (상대방만). "
+                "어떤 offer 를 수락할지 모르면 list_negotiation_history 또는 채팅 메시지 metadata 의 "
+                "offer_id 를 확인하라."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "수락자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "대상 주문 UUID.",
+                    },
+                    "offer_id": {
+                        "type": "string",
+                        "description": (
+                            "수락할 카운터오퍼 UUID (negotiation_history.id). "
+                            "보통 채팅방의 PENDING 카드 metadata.offer_id 에서 얻는다."
+                        ),
+                    },
+                },
+                "required": ["order_id", "offer_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reject_counter_offer",
+            "description": (
+                "상대방이 제시한 PENDING 가격 카드를 거절한다. "
+                "사용자가 '거절해줘', '안 돼', '그 가격은 어렵습니다', '거절', "
+                "'그 가격은 못 받아' 같은 자연어로 지시하면 호출하라. "
+                "거절 즉시 채팅방의 PENDING 카드 상태가 REJECTED 로 자동 동기화되어 "
+                "수락/거절 버튼이 사라지고 거절 시스템 메시지가 발송된다. "
+                "본인이 제시한 카운터오퍼는 거절 불가 (상대방만)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "거절자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "대상 주문 UUID.",
+                    },
+                    "offer_id": {
+                        "type": "string",
+                        "description": (
+                            "거절할 카운터오퍼 UUID (negotiation_history.id). "
+                            "보통 채팅방의 PENDING 카드 metadata.offer_id 에서 얻는다."
+                        ),
+                    },
+                },
+                "required": ["order_id", "offer_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_delivery_date_change",
+            "description": (
+                "납품일 변경 요청 카드를 채팅방에 발송한다. "
+                "사용자가 '납품일 5월 10일로 바꿔줘', '배송일을 다음 주 월요일로', "
+                "'납기 변경 요청', '납품 날짜 좀 미뤄줘', '내일 받을 수 있게 변경' 같이 "
+                "납품/배송 날짜 변경을 요청하면 평문 채팅 메시지가 아니라 반드시 이 도구로 호출하라. "
+                "발송 즉시 상대방 채팅창에 수락/거절 버튼이 있는 PENDING 카드가 노출된다. "
+                "주문 상태가 QUOTE_REQUESTED, NEGOTIATING, CONFIRMED 일 때만 가능 — "
+                "PREPARING 이상은 출하 준비 중이므로 차단된다. "
+                "proposed_delivery_date 는 KST 기준 오늘 이상이어야 함 (과거 날짜 거부)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "요청자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "대상 주문 UUID.",
+                    },
+                    "proposed_delivery_date": {
+                        "type": "string",
+                        "description": (
+                            "변경 희망일 (ISO YYYY-MM-DD). 사용자가 '5월 10일' 처럼 말하면 "
+                            "현재 연도 기준으로 정확한 날짜로 변환해 전달하라. KST 기준 오늘 이상이어야 함."
+                        ),
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "변경 사유/메모 (선택). 예: '운송 지연으로 하루 연기'.",
+                    },
+                },
+                "required": ["order_id", "proposed_delivery_date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "accept_delivery_date_change",
+            "description": (
+                "상대방이 제시한 PENDING 납품일 변경 카드를 수락한다. "
+                "사용자가 채팅방의 납품일 변경 카드를 보고 '수락해줘', 'OK', '좋아요', "
+                "'그 날짜로 진행', '날짜 변경 동의' 같은 자연어로 지시하면 호출하라. "
+                "수락 즉시: (1) orders.delivery_date 가 새 날짜로 갱신, "
+                "(2) 양 당사자 캘린더가 새 납품일로 자동 이동(옛 일정 row 는 soft-delete), "
+                "(3) 채팅방 PENDING 카드 상태가 ACCEPTED 로 자동 동기화되어 수락/거절 버튼이 사라진다. "
+                "본인이 제시한 변경 요청은 수락 불가 (상대방만)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "수락자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "대상 주문 UUID.",
+                    },
+                    "change_id": {
+                        "type": "string",
+                        "description": (
+                            "수락할 납품일 변경 요청 UUID (delivery_date_change_history.id). "
+                            "보통 채팅방의 PENDING 카드 metadata.change_id 에서 얻는다."
+                        ),
+                    },
+                },
+                "required": ["order_id", "change_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reject_delivery_date_change",
+            "description": (
+                "상대방이 제시한 PENDING 납품일 변경 카드를 거절한다. "
+                "사용자가 '거절해줘', '안 돼', '그 날짜는 어려워요', '날짜 변경 거부' 같은 "
+                "자연어로 지시하면 호출하라. 거절 즉시 채팅방 PENDING 카드 상태가 REJECTED 로 "
+                "자동 동기화되어 수락/거절 버튼이 사라지고 거절 시스템 메시지가 발송된다. "
+                "본인이 제시한 변경 요청은 거절 불가 (상대방만)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "거절자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "대상 주문 UUID.",
+                    },
+                    "change_id": {
+                        "type": "string",
+                        "description": (
+                            "거절할 납품일 변경 요청 UUID (delivery_date_change_history.id). "
+                            "보통 채팅방의 PENDING 카드 metadata.change_id 에서 얻는다."
+                        ),
+                    },
+                },
+                "required": ["order_id", "change_id"],
+            },
+        },
+    },
+    # ─────────────────────────────────────────────
+    # 정기배송(Subscription) — V1.6 양방향 승인 모델
+    # ─────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "create_subscription_request",
+            "description": (
+                "정기배송 요청을 상대방에게 보낸다 (status=PENDING, 상대 수락 시 ACTIVE). "
+                "사용자가 '정기배송 요청해줘', '○○를 정기배송으로 받고 싶어', "
+                "'매주 ○요일에 ○○ 받기', '○○ 매주 정기배송 등록', '격주로 받고 싶어' 같은 "
+                "자연어 요청 시 호출. frequency / start_date / items 가 부족하면 "
+                "needs_clarification=true 가 반환되며 절대 등록되지 않으니 사용자에게 다시 물어라. "
+                "상대방 user_id 모르면 get_user_profile 로 먼저 조회. "
+                "역할은 SELLER↔BUYER 만 허용됨."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "현재 로그인 사용자 UUID. 서버에서 강제 주입.",
+                    },
+                    "target_user_id": {
+                        "type": "string",
+                        "description": "정기배송 상대방 UUID (SELLER↔BUYER). 모르면 get_user_profile 로 먼저 조회.",
+                    },
+                    "frequency": {
+                        "type": "string",
+                        "description": "배송 주기. WEEKLY / BIWEEKLY / MONTHLY. 한국어 '매주'/'격주'/'매월' 도 허용.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "첫 배송 시작 날짜 (YYYY-MM-DD).",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "종료 날짜 (선택, YYYY-MM-DD). 없으면 무기한.",
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": (
+                            "정기배송 품목 리스트. 최소 1개 필요. "
+                            "각 항목은 product_id (UUID) 또는 product_name (자동 검색) 중 하나는 필수. "
+                            "unit_price 미지정 시 상품의 price_per_unit 자동 적용, unit 도 상품 unit 자동 적용."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "product_id": {"type": "string", "description": "상품 UUID (권장)."},
+                                "product_name": {"type": "string", "description": "상품명 (UUID 모를 때 자동 검색)."},
+                                "quantity": {"type": "integer", "description": "회당 수량 (양수)."},
+                                "unit_price": {"type": "integer", "description": "단가(원, 선택)."},
+                                "unit": {"type": "string", "description": "단위 (kg/box/piece 등; 선택)."},
+                            },
+                            "required": ["quantity"],
+                        },
+                    },
+                    "delivery_address": {"type": "string", "description": "납품 주소 (선택)."},
+                    "notes": {"type": "string", "description": "메모 (선택)."},
+                },
+                "required": ["target_user_id", "frequency", "start_date", "items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "accept_subscription_request",
+            "description": (
+                "받은 정기배송 요청을 수락한다 (PENDING → ACTIVE). "
+                "사용자가 받은 정기배송 요청 알림에 '수락해줘', '진행해', 'OK', '좋아요 그렇게 해요' "
+                "같이 답할 때 호출. 본인이 만든 요청은 수락 불가 (상대방만 가능). "
+                "수락 즉시 양 당사자 캘린더에 다음 배송 일정이 자동 등록됨."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "수락자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "subscription_id": {
+                        "type": "string",
+                        "description": "수락할 정기배송 UUID. 정기배송 목록 또는 알림 metadata 에서 얻음.",
+                    },
+                },
+                "required": ["subscription_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reject_subscription_request",
+            "description": (
+                "받은 정기배송 요청을 거절한다 (PENDING → REJECTED). "
+                "사용자가 '거절해줘', '안 돼', '그 조건은 어려워요', '거절' 같이 답할 때 호출. "
+                "본인이 만든 요청은 거절 불가 (상대방만)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "거절자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+                    },
+                    "subscription_id": {
+                        "type": "string",
+                        "description": "거절할 정기배송 UUID.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "거절 사유 (선택). 응답 메시지에 포함됨.",
+                    },
+                },
+                "required": ["subscription_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_subscription_from_order",
+            "description": (
+                "기존 주문의 품목을 그대로 정기배송으로 전환 신청한다 (PENDING). "
+                "사용자가 '이 주문을 정기배송으로 전환', '망고 2kg 주문 정기배송으로 바꿔줘', "
+                "'방금 그 주문 매주 받게 해줘' 같이 말할 때 호출. "
+                "주문의 order_items 가 그대로 subscription_items 로 복제되며 "
+                "상대방이 수락하면 자동 활성화된다. 주문 당사자(buyer/seller)만 호출 가능."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "현재 로그인 사용자 UUID. 서버에서 강제 주입.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "정기배송으로 전환할 주문 UUID.",
+                    },
+                    "frequency": {
+                        "type": "string",
+                        "description": "배송 주기. WEEKLY / BIWEEKLY / MONTHLY. 한국어 '매주'/'격주'/'매월' 도 허용.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "첫 배송 시작 날짜 (YYYY-MM-DD).",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "종료 날짜 (선택, YYYY-MM-DD).",
+                    },
+                },
+                "required": ["order_id", "frequency", "start_date"],
+            },
+        },
+    },
 ]
 
 
@@ -700,18 +1235,23 @@ def _build_router_system() -> str:
 - 다음 달: {next_year}년 {next_month}월
 
 [분류 기준]
-- INVENTORY: 상품, 재고, 품목, 거래처 연결, 채팅방 개설 관련 모든 요청
+- INVENTORY: 상품, 재고, 품목, 거래처 연결/등록, 채팅방 개설 관련 모든 요청
   예시: "사과 있어?", "사과 사고싶어", "딸기 구매하고 싶어", "어떤 과일 파는지 보여줘",
         "재고 확인해줘", "상품 등록", "상품 수정/삭제", "판매자 찾아줘", "공급처 찾아줘",
-        "채팅방 파줘", "채팅 연결해줘", "거래처 연결해줘", "그 농원이랑 얘기하고 싶어"
+        "채팅방 파줘", "채팅 연결해줘", "거래처 연결해줘", "그 농원이랑 얘기하고 싶어",
+        "○○를 거래처로 등록해줘", "거래처 신청 보내줘", "○○ 거래처 추가해줘"
   → 특정 품목을 사거나 찾거나 확인하려는 의도가 조금이라도 있으면 무조건 INVENTORY
   → "채팅", "연결", "거래처", "얘기해보고 싶어" 키워드가 있으면 GENERAL이 아닌 INVENTORY로 분류
+  → "거래처 등록", "거래처 신청", "거래처 추가" 키워드가 있으면 무조건 INVENTORY로 분류한다.
   → "단가 바꿔줘", "가격 수정해줘", "kg당 얼마로 바꿔줘", "상품명 바꿔줘", "상품 내려줘"는 주문이 아니라 상품 관리이므로 반드시 INVENTORY로 분류한다.
   → "방금 올린 감자 단가 2700원으로 바꿔줘"는 INVENTORY다. ORDER가 아니다.
-- ORDER: 주문, 견적, 발주, 납품, 출고, 배송 상태 변경 관련 요청
-  예시: "주문 넣어줘", "발주 확인해줘", "주문 취소",
+- ORDER: 주문, 견적, 발주, 납품일 변경, 가격 협상, 출고, 배송 상태 변경, 정기배송 관련 요청
+  예시: "주문 넣어줘", "발주 확인해줘", "주문 취소", "거래요청 들어온거 있어?",
         "출고 준비 완료됐어", "배송 보냈어", "배송 시작했어",
-        "출하 완료", "배송 중으로 바꿔줘", "주문 완료 처리해줘"
+        "출하 완료", "배송 중으로 바꿔줘", "주문 완료 처리해줘",
+        "납품일 바꿔줘", "○월 ○일로 납품일 변경해줘", "가격 협상해줘", "○○만원에 어때요",
+        "정기배송 요청해줘", "매주 사과 보내줘", "정기배송으로 전환해줘", "이 주문 정기배송으로"
+  → "정기배송", "납품일 변경", "가격 협상", "카운터오퍼" 키워드가 있으면 무조건 ORDER로 분류한다.
   → 주문의 상태를 바꾸는 말이면 CALENDAR가 아니라 반드시 ORDER로 분류한다.
   → "출고 준비", "배송 보냄", "배송 시작", "출하 완료", "납품 완료"는 일정 생성이 아니라 주문 상태 변경이다.
 - CALENDAR: 캘린더/일정 관련 요청. 두 가지 subtype 으로 세분.
@@ -751,6 +1291,7 @@ def _build_router_system() -> str:
   - REASON → 다음 달: target_year={next_year}, target_month={next_month}
 - "내일", "이번 주", "이번 달" 등 이번 달 안의 시점은 모두 이번 달 ({today.year}, {today.month}).
 - "다음 달" 표현은 다음 달 ({next_year}, {next_month}).
+- (거래 vs 거래처 명확한 구분): 사용자가 "거래요청 들어온거 있어?", "새로운 거래"처럼 '거래처'라는 단어 없이 '거래'라고만 말한 경우, 이는 새로운 주문/견적을 의미하므로 무조건 ORDER 부서로 분류하세요. INVENTORY(거래처 등록/요청)로 분류하지 마세요.
 
 [응답 형식]
 INVENTORY:
@@ -975,6 +1516,7 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 1. 사람다운 대화: "[상품명] - [수량] - [상태]" 같은 딱딱한 템플릿을 버리세요. "대표님, 요청하신 사과 재고는 현재 50박스 남아있습니다."처럼 부드러운 한국어 문장으로 대화하세요.
 2. 눈치와 센스: 사용자가 짧거나 모호하게 말해도 의도를 파악하세요. 질문의 핵심을 파악해 선제적으로 DB를 조회하고, 필요한 도구(Tool)를 적극 활용해 답변하세요.
 3. 유연한 문제 해결: 재고가 부족하거나 문제가 생겼을 때 단순히 "안 됩니다"라고 끊지 마세요.
+4. 도구 호출 시 사전 안내 문장 금지: "잠시만 기다려 주세요", "확인해 드릴게요", "처리하겠습니다" 같은 문장을 도구 호출 전에 생성하지 마세요. 도구 결과를 받은 뒤 결과를 바탕으로 한 번에 응답하세요.
    - 정상 상황: {case1_action}
    - 문제 상황: {case2_action}
 4. 상품 및 거래처 관리:
@@ -1016,6 +1558,35 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 - 사용자가 "둘 다", "전부 보내줘" 라고 답하면 각 후보 room_id 마다 send_chat_message 를 한 번씩 반복 호출해서 모두 발송합니다.
 - 후보가 0개로 나오고 도구가 일반 채팅방으로 fallback 발송에 성공했다면 "주문 연결 채팅방을 못 찾아서 일반 대화방으로 보냈습니다"처럼 자연스럽게 안내하세요. 아예 발송에 실패했다는 결과(success: false 이고 needs_confirmation 도 false)면 사용자에게 어느 거래처·어느 주문·어느 품목 채팅방인지 더 구체적으로 물어보세요.
 - 어느 경우에도 후보 정보(상품명·수량·상태·마지막 메시지 시점)는 사람이 알아듣기 쉬운 한국어 문장으로 풀어서 전달하고, 표나 별표 같은 마크다운 강조는 쓰지 마세요.
+
+[자연어 → 카드 도구 자동 호출 핵심 매핑]
+사용자가 자연스럽게 발화한 협상·납품일·거래처 등록·정기배송 요청은 일반 채팅 메시지(send_chat_message)로 보내지 말고 아래 전용 도구를 사용해 카드 형태로 발송한다. 카드는 상대방이 [수락]/[거절] 버튼으로 응답할 수 있어 합의 흐름이 명확해진다.
+- 가격 협상: "○○원으로 협상해줘", "○○만원에 어때요", "가격 조정해줘", "단가 깎아달라고 해줘" → submit_counter_offer(user_id, order_id, proposed_total_amount, notes?)
+- 카운터오퍼 응답: 채팅방 PENDING 카운터오퍼 카드 보고 사용자가 "수락해줘"/"OK"/"좋아요" → accept_counter_offer(user_id, order_id, offer_id), "거절해줘"/"안 돼"/"이 가격은 못 받아" → reject_counter_offer(user_id, order_id, offer_id)
+- 납품일 변경: "5월 20일로 납품일 바꿔줘", "○월 ○일에 받고 싶어", "납품일 변경 요청 보내줘" → submit_delivery_date_change(user_id, order_id, proposed_delivery_date='YYYY-MM-DD', notes?). 허용 상태: QUOTE_REQUESTED, NEGOTIATING, CONFIRMED (PREPARING 이상만 차단). 상태를 직접 판단하지 말고 반드시 도구를 호출하라 — 서버가 검증한다. order_id 모르면 get_orders(user_id, role) 로 먼저 조회해 품목명이 일치하는 주문의 id 를 찾아라. "주문 ID를 알려주세요"라고 사용자에게 묻지 마라.
+- 납품일 응답: PENDING 납품일 변경 카드 보고 "수락해줘"/"OK" → accept_delivery_date_change(user_id, order_id, change_id), "거절해줘"/"그 날짜는 어려워" → reject_delivery_date_change(user_id, order_id, change_id)
+- 거래처 등록: "○○를 거래처로 등록해줘", "○○ 추가해줘", "거래처 신청 보내줘" → 상대방 UUID 정확히 알면 request_partner_registration(user_id, target_user_id, note?), 이름/회사명만 알면 request_partner_registration_by_name(user_id, target_name_or_company, note?)
+- 거래처 요청 조회: "들어온 거래처 요청 있어?", "거래처 신청 왔어?" → get_incoming_partner_requests(user_id). 결과 안내 시 반드시 partner_id 값을 응답에 포함.
+- 거래처 요청 수락: "거래처 요청 수락해줘", "승인해줘", "그 요청 수락해줘" → partner_id 를 직전 대화에서 찾고, 없으면 get_incoming_partner_requests 먼저 호출해 ID 확보 후 즉시 accept_partner_request(user_id, partner_id). 절대 사용자에게 ID 를 물어보지 마라.
+- 거래처 요청 거절: "거절해줘" → 마찬가지로 ID 확보 후 reject_partner_request(user_id, partner_id).
+- 정기배송 신청: "정기배송으로 받고 싶어", "매주 ○요일 ○○ 보내줘", "정기배송 요청해줘" → 반드시 품목명·수량을 먼저 확인하라. 품목/수량이 명시되지 않으면 "어떤 품목을 몇 kg(또는 몇 박스) 보내드릴까요?"라고 되물어라. 품목·수량·주기·시작일이 모두 확보된 뒤에만 create_subscription_request(user_id, target_user_id, frequency, start_date, items=[{{product_name, quantity, unit}}]) 호출. items 는 절대 임의로 채우지 마라.
+- "이 주문 정기배송으로 전환" → create_subscription_from_order(user_id, order_id, frequency, start_date)
+- 정기배송 요청 조회: "정기배송 요청 들어온거 있어?", "정기배송 신청 왔어?" → get_incoming_subscription_requests(user_id). 결과를 안내할 때 subscription_id, 품목명(product_name), 수량, 주기, 시작일을 모두 자연어로 풀어서 안내하라.
+- 정기배송 수락: "수락해줘", "그거 수락해줘" → subscription_id 를 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 를 먼저 호출해 ID 를 확보한 뒤 즉시 accept_subscription_request(user_id, subscription_id) 호출. 절대 사용자에게 ID 를 물어보지 마라.
+- 정기배송 거절: "거절해줘" → 마찬가지로 subscription_id 를 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 를 먼저 호출해 ID 를 확보한 뒤 reject_subscription_request(user_id, subscription_id, reason?) 호출. 절대 사용자에게 ID 를 물어보지 마라.
+- 정기배송 수정 요청: "1kg로 바꿔줘", "수량 바꿀 수 있어?", "조건 수정하고 싶어" 등 → 정기배송 직접 수정 기능은 없으므로 "현재 요청을 거절한 뒤 새 조건으로 다시 요청을 보내야 합니다. 원하시면 바로 거절하고 새 요청 안내해 드릴게요."라고 자연스럽게 안내하라. ID 를 묻지 말고 직전 대화의 subscription_id 를 사용하라.
+
+[자연어 → 카드 도구 안전장치 (매우 중요)]
+- 정보 부족 시 호출 금지: 사용자가 "협상해줘"라고만 했고 가격을 안 알려줬으면 도구 호출 X, "어떤 가격으로 제시할까요?"처럼 되묻기. "납품일 바꿔줘"만 했고 날짜를 안 알려줬어도 마찬가지로 되묻기. "정기배송 해줘"만 했으면 주기(매주/격주/매월)와 시작일을 묻기.
+- 가격·날짜·주기·품목이 명확히 나오면 카드 발송은 즉시 호출 (이중 confirmation 은 UX 나쁨). "1,300,000원으로 협상해줘" 같은 명확한 발화는 한 번에 submit_counter_offer 호출.
+- 직전 대화 컨텍스트 활용: 방금 create_order 결과로 받은 order_id 가 있으면 그 값을 그대로 카드 도구에 넘긴다. "주문 ID가 필요합니다"라고 되묻지 말 것.
+- 카드는 즉시 발송돼 상대방 화면에 노출되므로 도구 호출 후에는 "1,300,000원으로 카운터오퍼를 보냈습니다. 상대방이 수락/거절하면 알려드릴게요"처럼 발송 사실 + 후속 흐름 안내.
+- 도구 오류 해석 금지: 도구가 success:false 를 반환해도 "주문이 없어서"라고 말하지 마라. 오류 내용을 보고 사용자에게 정확히 안내하라. 예: submit_counter_offer 가 "QUOTE_REQUESTED 또는 NEGOTIATING 상태에서만 가능" 오류 반환 → "해당 주문은 이미 확정(CONFIRMED) 상태라 가격 협상이 불가합니다. 협상은 견적 요청 또는 협상 중 상태에서만 가능합니다."처럼 안내.
+
+[재고 검색 vs 대체 거래처 추천 분리 원칙 (환각 방지)]
+- 1차 검색은 사용자가 명시한 품목명만 사용해서 정확 검색을 한다. 예: "참치 찾아줘" → find_sellers_by_product 또는 check_stock 으로 product_name='참치' 만 조회. 1차 결과 0건이거나 모두 OUT_OF_STOCK 인 경우라도 절대로 LLM 임의로 새우/연어/다른 품목을 끼워 넣지 말 것 (환각 = 신뢰 파탄).
+- 결과 0건 또는 전부 품절이면 사용자에게 그 사실을 명시적으로 안내하고("참치 판매자가 검색되지 않았습니다") "다른 품목이나 비슷한 카테고리로 대체 거래처를 찾아볼까요?"라고 묻는다.
+- 사용자가 명시 동의("응", "찾아줘", "그래") 한 뒤에만 find_alternative_partners 를 호출한다. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에서 동시에 호출해 다른 품목을 추천하는 행위는 금지.
 
 [주의사항]
 - (중요) 너는 주문, 재고, 상품 관리뿐만 아니라 캘린더(일정)까지 모두 통합 관리하는 만능 비서입니다. 사용자가 대화 중 자연스럽게 캘린더 일정을 묻거나 수정을 요청하면 "할 수 없다"고 피하지 말고, 적극적으로 캘린더 도구를 호출하여 조회 및 등록(수정/삭제)을 처리하세요.
@@ -1093,8 +1664,46 @@ BUYER_ROLE_APPENDIX = """
 - 구매자는 상품 등록/수정/삭제, 판매자 재고 수정, 출고/배송 처리 권한이 없다.
 
 [🚨 구매자 주문/견적 생성 규칙]
-사용자가 "주문해줘", "발주 넣어줘", "견적 요청해줘"라고 명확히 말하면 create_order를 실행한다.
-단, 사용자가 수량만 말한 경우에는 바로 주문하지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인한다.
+구매자가 "○○ 주문해줘", "○○ 발주 넣어줘"처럼 명확한 주문 의도를 표현하면 즉시 create_order 를 호출한다.
+백엔드는 더 이상 가격 일치만으로 자동 확정하지 않는다. 모든 신규 주문은 QUOTE_REQUESTED 견적 상태로 시작해 판매자 검토를 기다리며, 가격이 시세보다 낮을 때만 자동으로 NEGOTIATING + 카운터오퍼 카드 흐름으로 분기된다.
+LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대로 신뢰한다.
+
+발화 패턴별 처리:
+1) 납품일 + 수량이 모두 명시된 경우 ("망고 2kg 5월 20일에 받게 주문해줘", "사과 5박스 6월 3일에 받을 수 있게 발주"):
+   먼저 check_stock 또는 find_sellers_by_product 로 해당 상품을 조회해 price_per_unit 을 확보한다.
+   그 값을 그대로 unit_price 로 채우고 delivery_date 는 사용자가 말한 날짜를 'YYYY-MM-DD' 형식으로 정규화해서 create_order 를 호출한다.
+   백엔드가 가격 일치로 판단하면 QUOTE_REQUESTED 로 시작해 판매자 수락 대기, 가격이 낮으면 NEGOTIATING + 자동 카운터오퍼로 전환된다.
+
+2) 가격까지 명시된 경우 ("13만원에 망고 2kg 5/20일 받기로 주문해줘", "박스당 38000원에 사과 5박스 6월 3일 납품으로 발주"):
+   사용자가 말한 가격을 그대로 unit_price 로, 날짜를 그대로 delivery_date 로 넣어 create_order 호출.
+   - 단가가 시세 이상이면 QUOTE_REQUESTED 로 시작해 판매자 검토 대기.
+   - 단가가 낮으면 NEGOTIATING + 자동 카운터오퍼 카드(PENDING) 발송. 채팅방에 카드가 노출된다.
+   "단가가 낮은데 보낼까요?"처럼 되묻지 말고 그대로 호출한다.
+
+3) 납품일이 빠진 경우 ("망고 2kg 주문해줘", "사과 한 박스 발주해줘"):
+   create_order 호출 금지. 먼저 사용자에게 "납품일은 언제로 할까요? (예: 5월 20일)" 라고 자연체로 묻는다.
+   사용자가 정확한 날짜를 답하기 전까지는 어떤 경우에도 create_order 를 부르지 마라. "오늘", "내일", "다음 주" 같은 모호한 표현을 LLM 임의로 날짜로 바꿔치지 마라.
+
+4) 협상 명시 ("그 가격은 좀 깎아줘", "할인 받고 싶어", "협상해줘"):
+   create_order 가 아니라 submit_counter_offer 를 사용한다. 이미 PENDING/NEGOTIATING 상태의 주문이 있을 때만 가능. 가격이 함께 언급된 새 주문이면 납품일까지 받아낸 뒤 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.
+
+5) 수량만 있고 주문 의도가 모호한 경우 ("망고 2kg"):
+   바로 create_order 를 부르지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인하고, 주문이 맞다면 납품일도 함께 받아낸다.
+
+[🚨 단가 / 납품일 필수 확보]
+create_order 호출 시 unit_price 와 delivery_date 둘 다 비어있으면 안 된다.
+- unit_price 가 없으면 반드시 check_stock 또는 find_sellers_by_product 로 price_per_unit 을 확보해 채운다. "단가를 모르겠어요" 답변 금지.
+- delivery_date 가 없으면 사용자에게 정확한 날짜를 받기 전까지 호출하지 마라. 예: "납품일은 언제로 할까요? (예: 5월 20일)". 'YYYY-MM-DD' 형식으로 정규화해 전달.
+
+[🚨 주문 생성 결과 응답 표현]
+create_order 결과의 status 값에 따라 응답을 다르게 작성한다. 별표/표/헤더 사용 금지, 자연체 한국어로.
+- status="QUOTE_REQUESTED" (정상 신규 견적): "○○ ○단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일. 판매자가 수락하면 알려드릴게요." 형식. 절대 "주문이 확정됐습니다"라고 말하지 마라 — 판매자 수락 전에는 확정이 아니다.
+- status="NEGOTIATING" (negotiating=true, 가격 협상 시작): "○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 채팅방에 카드를 발송했고, 판매자가 수락/거절하면 알려드릴게요." 형식.
+- 그 외 상태가 돌아오면 그대로 "주문이 접수됐고 판매자 확인을 기다리고 있습니다." 형식으로 안내.
+
+[🚨 납품일 변경]
+주문 후 사용자가 "납품일 ○월 ○일로 바꿔줘"라고 하면 submit_delivery_date_change 를 호출한다.
+다만 해당 주문이 아직 QUOTE_REQUESTED 단계라면 판매자가 검토 중이므로, 카드 발송 직후 "판매자가 견적을 검토하는 중이라 변경 요청도 함께 전달했습니다. 답변 오면 알려드릴게요" 정도로 자연스럽게 덧붙여라.
 
 [🚨 주문 생성 후 채팅방 연결 규칙]
 create_order 실행 직후 사용자가 "채팅방 열어줘", "판매자랑 얘기할래", "채팅 연결해줘"라고 말하면 일반 채팅방을 열지 말고, 직전 create_order 결과의 order_id를 open_chat_room에 반드시 전달한다.
@@ -1190,11 +1799,16 @@ def _render_agent_system(
     명시적 str.replace 로 {company_name} / {user_name} / {user_id} 만 치환하고 나머지 중괄호는
     원문 그대로 LLM 에 전달한다 — 의미 손상 없음.
     """
+    from datetime import timedelta
+    today = datetime.now()
+    today_str = f"{today.year}년 {today.month}월 {today.day}일 (오늘)"
+    tomorrow_str = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     return (
         template
         .replace("{company_name}", company_name)
         .replace("{user_name}", user_name)
         .replace("{user_id}", user_id)
+        + f"\n\n[현재 날짜]\n오늘: {today_str}\n내일: {tomorrow_str}\n날짜 관련 요청(내일, 다음 주, 이번 달 말 등)은 반드시 이 기준으로 YYYY-MM-DD 형식으로 변환하라."
     )
 
 
@@ -1321,7 +1935,6 @@ async def orchestrator_node(state: AgentState) -> dict:
     response = await client.chat.completions.create(
         model=model,
         messages=current_messages,
-        tools=TOOLS + TOOLS_CALENDAR,
         response_format={"type": "json_object"},
     )
 
@@ -1431,6 +2044,20 @@ async def inventory_order_node(state: AgentState) -> dict:
             user_id=user_id,
         )
 
+    # 현재 채팅방/주문 컨텍스트 주입
+    _order_id = state.get("order_id")
+    _room_id = state.get("room_id")
+    if _order_id:
+        agent_system += (
+            f"\n\n[현재 채팅방 컨텍스트]\n"
+            f"- 현재 선택된 주문 ID: {_order_id}\n"
+            f"- 협상(submit_counter_offer), 납품일 변경(submit_delivery_date_change) 요청 시 "
+            f"이 order_id를 우선 사용하라. get_orders 조회 없이 바로 이 ID로 도구를 호출해도 된다.\n"
+            f"- 단, 사용자가 명시적으로 다른 주문을 언급하면 그 주문을 사용한다."
+        )
+    if _room_id:
+        agent_system += f"\n- 현재 채팅방 ID: {_room_id}"
+
     # inventory_order_node 전용 메시지 구성
     # state["history"] 는 라우터 시스템 프롬프트·라우터 JSON 으로 오염되지 않은 깨끗한
     # user/assistant 대화 히스토리이므로 그대로 주입한다.
@@ -1451,7 +2078,9 @@ async def inventory_order_node(state: AgentState) -> dict:
                 model=model,
                 messages=agent_messages,
                 tools=TOOLS,
-                tool_choice="auto",
+                # 첫 round는 반드시 도구를 호출하도록 강제 (사전 안내 텍스트만 내고 stop 방지)
+                # 두 번째 round 이상은 도구 결과를 받고 자연어로 응답할 수 있도록 auto
+                tool_choice="required" if round_idx == 0 and not all_tool_results else "auto",
             )
 
             choice = response.choices[0]
@@ -1898,6 +2527,44 @@ async def chat_node(state: AgentState) -> dict:
         "- 사용자가 '1번', '[특정 상품명]'처럼 답하면 해당 후보의 room_id 를 직접 지정해 send_chat_message 를 다시 호출하세요. message 본문은 직전 결과의 message_preview 를 그대로 사용합니다.\n"
         "- 사용자가 '둘 다 보내', '전부' 라고 하면 각 후보 room_id 마다 send_chat_message 를 한 번씩 반복 호출해 모두 발송합니다.\n"
         "- 후보가 0개로 나오고 도구가 일반 채팅방으로 fallback 발송에 성공했다면 '주문 연결 채팅방을 찾지 못해 일반 대화방으로 보냈습니다'처럼 자연스럽게 안내하세요. 발송 자체가 실패했다면 어느 거래처의 어느 주문/품목 채팅방인지 사용자에게 더 구체적으로 물어보세요.\n"
+        "\n"
+        "[자연어 협상/납품일 → 카드 도구 매핑 (매우 중요)]\n"
+        "- 사용자가 가격 협상이나 납품일 변경을 요청하면 일반 send_chat_message 로 보내지 말고 전용 카드 도구를 호출합니다. 카드는 채팅방에 PENDING 상태로 노출돼 상대방이 [수락]/[거절] 버튼을 누를 수 있어 합의 흐름이 명확해집니다.\n"
+        "- 가격 제시: '1,300,000원으로 협상해줘', '130만원에 어때요', '단가 깎아줘'처럼 사용자가 가격을 명확히 말하면 submit_counter_offer(user_id, order_id, proposed_total_amount, notes?) 호출. order_id 는 직전 create_order 결과나 get_orders 조회로 확보.\n"
+        "- 가격이 빠진 '협상해줘'만 들어오면 도구 호출 X, '어떤 가격으로 제시할까요?'라고 되묻기.\n"
+        "- 카운터오퍼 응답: PENDING 카운터오퍼 카드가 있는 채팅방에서 사용자가 '수락해줘'/'OK'/'좋아요' → accept_counter_offer(user_id, order_id, offer_id). '거절해줘'/'안 돼' → reject_counter_offer(user_id, order_id, offer_id). offer_id 는 get_chat_messages 또는 카드 데이터에서 확보.\n"
+        "- 납품일 변경: '5월 20일에 받고 싶어', '5/20일로 납품일 변경 요청 보내줘' → submit_delivery_date_change(user_id, order_id, proposed_delivery_date='YYYY-MM-DD', notes?). 날짜가 빠지면 되묻기.\n"
+        "- 납품일 응답: PENDING 납품일 변경 카드에 '수락해줘' → accept_delivery_date_change(user_id, order_id, change_id), '거절해줘' → reject_delivery_date_change(user_id, order_id, change_id).\n"
+        "- 카드 발송 후에는 '130만원으로 카운터오퍼 카드를 발송했습니다. 상대방이 수락/거절하면 알려드릴게요'처럼 발송 사실과 후속 흐름을 자연체로 안내. 별표/표/헤더 금지.\n"
+        "\n"
+        "[거래처 등록 / 정기배송 자연어 매핑]\n"
+        "- 거래처 등록 발화: '○○를 거래처로 등록해줘', '○○ 추가해줘', '거래처 신청 보내줘'.\n"
+        "  - 상대방 UUID 가 정확히 알려진 경우만 request_partner_registration(user_id, target_user_id, note?) 호출.\n"
+        "  - 이름/회사명만 알면 request_partner_registration_by_name(user_id, target_name_or_company, note?) 사용. 다중 매칭이 candidates 배열로 돌아오면 send_chat_message 의 needs_confirmation 흐름과 동일하게 후보를 자연어로 풀어서 사용자에게 어느 사람·어느 회사인지 골라달라고 되묻기.\n"
+        "- 정기배송 신청: '○○를 정기배송으로 받고 싶어', '매주 ○요일 ○○ 보내줘', '정기배송 요청해줘'.\n"
+        "  - 필수 정보: frequency(WEEKLY/BIWEEKLY/MONTHLY), start_date(YYYY-MM-DD), items(품목 리스트).\n"
+        "  - 정보가 부족하면 도구 호출 X, '주기를 어떻게 할까요? 매주/격주/매월?', '시작일은 언제로 할까요?'처럼 자연체로 되묻기.\n"
+        "  - 모두 갖춰지면 create_subscription_request(user_id, target_user_id, frequency, start_date, items, ...) 호출.\n"
+        "  - '이 주문을 정기배송으로 전환'처럼 기존 주문 기반이면 create_subscription_from_order(user_id, order_id, frequency, start_date) 사용.\n"
+        "- 정기배송 수락/거절: subscription_id 는 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 호출해 확보. 절대 사용자에게 ID 물어보지 말 것.\n"
+        "- 정기배송 수정 요청('수량 바꿔줘', '조건 바꾸고 싶어' 등): 직접 수정 불가. '현재 요청을 거절하고 새 조건으로 다시 요청을 보내야 합니다. 원하시면 바로 진행해 드릴게요.'라고 자연스럽게 안내하라.\n"
+        "\n"
+        "[재고 검색 vs 대체 거래처 분리 (환각 방지)]\n"
+        "- 사용자가 '참치 찾아줘'라고 하면 find_sellers_by_product 또는 check_stock 으로 product_name='참치'만 정확 검색. 결과 0건이라도 새우/연어 같은 다른 품목을 추천하는 행위는 절대 금지.\n"
+        "- 결과 0건이거나 전부 OUT_OF_STOCK 이면 그 사실을 그대로 안내하고 '다른 품목이나 비슷한 카테고리로 대체 거래처를 찾아볼까요?'라고 사용자 동의를 구한 뒤에만 find_alternative_partners 호출.\n"
+        "\n"
+        "[구매자 주문/견적 생성 가이드]\n"
+        "- 구매자가 '○○ 주문해줘', '○○ 발주 넣어줘'처럼 명확한 주문 의도를 표현하면 즉시 create_order 를 호출한다. 단, 백엔드는 더 이상 가격 일치만으로 자동 확정하지 않는다. 모든 신규 주문은 QUOTE_REQUESTED 견적 상태로 시작해 판매자 검토를 기다리며, 가격이 시세보다 낮을 때만 NEGOTIATING + 카운터오퍼 카드 흐름으로 자동 분기된다. LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대로 신뢰한다.\n"
+        "- 납품일 + 수량 명시 발화 ('망고 2kg 5월 20일에 받게 주문해줘'): check_stock 또는 find_sellers_by_product 로 price_per_unit 을 확보해 unit_price 에 채우고, 사용자가 말한 날짜를 'YYYY-MM-DD' 로 정규화해 delivery_date 에 넣은 뒤 create_order 호출. 가격 일치면 QUOTE_REQUESTED, 낮으면 NEGOTIATING.\n"
+        "- 가격까지 명시 발화 ('13만원에 망고 2kg 5/20일 받기로 주문해줘'): 명시된 가격을 그대로 unit_price 로, 날짜를 그대로 delivery_date 로 넣어 create_order 호출. '단가가 낮은데 보낼까요?' 되묻기 금지.\n"
+        "- 납품일 빠진 발화 ('망고 2kg 주문해줘'): create_order 호출 금지. 먼저 사용자에게 '납품일은 언제로 할까요? (예: 5월 20일)' 라고 자연체로 되묻고, 정확한 날짜를 받기 전까지는 어떤 경우에도 호출하지 마라. '오늘', '내일' 같은 모호한 표현을 LLM 임의로 날짜로 바꿔치지 마라.\n"
+        "- 협상 명시 발화 ('그 가격 좀 깎아줘', '할인 받고 싶어', '협상해줘'): create_order 가 아니라 submit_counter_offer 사용. PENDING/NEGOTIATING 주문이 이미 있을 때만 가능. 가격이 함께 언급된 새 주문이면 납품일까지 받아낸 뒤 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.\n"
+        "- 단가/납품일 필수 확보: create_order 호출 시 unit_price, delivery_date 둘 다 비어있으면 안 된다. unit_price 없으면 조회 도구로 확보, delivery_date 없으면 사용자에게 받아내기 전까지 호출 금지. '단가를 모르겠어요' 답변 금지.\n"
+        "- 결과 응답 표현 (별표/표/헤더 금지, 자연체 한국어, 절대 '주문이 확정됐습니다'라고 말하지 말 것 — 판매자 수락 전에는 확정이 아니다):\n"
+        "  - status=QUOTE_REQUESTED (정상 신규 견적): '○○ ○단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일. 판매자가 수락하면 알려드릴게요.' 형식.\n"
+        "  - status=NEGOTIATING (negotiating=true, 가격 협상 시작): '○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 채팅방에 카드를 발송했고, 판매자가 수락/거절하면 알려드릴게요.' 형식.\n"
+        "  - 그 외 상태: '주문이 접수됐고 판매자 확인을 기다리고 있습니다.' 형식.\n"
+        "- 납품일 변경: 주문 후 사용자가 '납품일 ○월 ○일로 바꿔줘' 라고 하면 submit_delivery_date_change 를 호출. 해당 주문이 아직 QUOTE_REQUESTED 단계면 판매자 검토 중이므로 '판매자가 견적을 검토하는 중이라 변경 요청도 함께 전달했습니다' 정도로 자연스럽게 덧붙여라.\n"
     )
 
     agent_messages = [
@@ -1975,8 +2642,22 @@ async def validator_node(state: AgentState) -> dict:
     last_result = tool_results[-1] if tool_results else {}
     result_data = last_result.get("result", {})
 
-    # success: false인 경우 실패로 판단
+    # 비즈니스 에러(이미 처리됨, 정보 부족 등)는 실패가 아니라 AI가 자연어로 안내하면 되는 정상 케이스
+    EXPECTED_ERRORS = {
+        "already_partner", "already_exists", "self_subscription_not_allowed",
+        "needs_clarification", "partner_not_found", "missing_room_or_partner",
+        "invalid_user_id", "self_chat_not_allowed",
+        "invalid_order_id", "order_not_found", "not_participant",
+    }
     if isinstance(result_data, dict) and result_data.get("success") is False:
+        error_code = result_data.get("error", "")
+        http_code = result_data.get("code", 0)
+        # HTTP 400 비즈니스 오류 (상태 불일치 등)는 AI가 자연어로 설명할 수 있는 정상 케이스
+        if (error_code in EXPECTED_ERRORS
+                or http_code == 400
+                or result_data.get("needs_clarification")
+                or result_data.get("needs_confirmation")):
+            return {"validation_status": "PASSED"}
         if tool_round < 2:
             return {"validation_status": "RETRY"}
         else:
@@ -1995,7 +2676,7 @@ async def response_node(state: AgentState) -> dict:
     intent = state.get("intent", "")
 
     status_change_keywords = [
-        "확정", "주문확정", "수락",
+        "확정", "주문확정",
         "출고", "배송 보냈", "배송 시작",
         "배송중", "배송 중",
         "납품 완료", "배송 완료 처리", "완료 처리"
@@ -2059,12 +2740,7 @@ async def response_node(state: AgentState) -> dict:
             # 1) 재고 부족 → 무조건 LLM 통과 (타협안 생성)
             if _is_stock_shortage(last):
                 pass  # 아래 LLM 요약으로 진행
-            # 2) 명확한 실패 메시지 → LLM 우회, 텍스트 그대로 반환
-            #    단, llm_retry=True 인 경우는 LLM이 읽고 재시도해야 하므로 우회하지 않음
-            elif last.get("success") is False and not last.get("llm_retry"):
-                err_text = last.get("error") or last.get("message")
-                if isinstance(err_text, str) and err_text.strip():
-                    return {"final_response": err_text}
+            # 2) 실패 결과 → LLM이 자연어로 안내하도록 통과 (에러 코드 raw 반환 금지)
                 # 명확한 텍스트 없으면 LLM 통과
             # 3) success=True 정상 결과 → LLM 통과 (자연어 생성)
             #    기존 last.get("message") 단락회로는 제거 — 자연어 응답이 더 적절
@@ -2226,6 +2902,8 @@ class AgentOrchestrator:
         role: str,
         user_info: dict,
         history: list = [],
+        order_id: Optional[str] = None,
+        room_id: Optional[str] = None,
     ) -> dict:
         """
         오케스트레이터 메인 실행 메서드.
@@ -2236,6 +2914,8 @@ class AgentOrchestrator:
             role: 사용자 역할 (SELLER 또는 BUYER)
             user_info: 사용자 정보 dict (name, company_name 포함)
             history: 이전 대화 메시지 목록
+            order_id: 현재 채팅방에 연결된 주문 ID (협상/납품일 도구 기본값)
+            room_id: 현재 채팅방 ID
 
         Returns:
             {
@@ -2276,6 +2956,8 @@ class AgentOrchestrator:
             "tool_round": 0,
             "validation_status": "",
             "manual_review": False,
+            "order_id": order_id,
+            "room_id": room_id,
         }
 
         # LangGraph 실행

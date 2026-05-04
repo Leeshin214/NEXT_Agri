@@ -25,10 +25,19 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const queryClient = useQueryClient();
-  const { user, loginExpiresAt, setSession, logout } = useAuthStore();
+  const { user, loginExpiresAt, isHydrated, setSession, logout } =
+    useAuthStore();
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
+    // persist 하이드레이션이 완료되기 전엔 store 의 user/loginExpiresAt 이
+    // 항상 초기값(null)으로 보이므로 그 시점에 bootstrap 을 돌리면 불필요한
+    // /users/me 폴백 호출 + Supabase 세션 재확인을 거치게 된다. 더 큰 문제는
+    // 채팅처럼 user.id 즉시 비교가 필요한 자식 페이지가 user=null 상태로
+    // 첫 렌더되어 첫 메시지가 "상대방"으로 잘못 표시되는 버그가 생긴다는 점.
+    // hydration 끝날 때까지 가드의 isReady 도 false 로 유지한다.
+    if (!isHydrated) return;
+
     const supabase = createClient();
     let unsubscribe: (() => void) | null = null;
 
@@ -56,7 +65,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
 
       // 3) store에 user 없으면 프로필 조회
       let resolvedUser: User | null = user;
-      if (!resolvedUser) {
+      if (!resolvedUser || !resolvedUser.id) {
         try {
           const result = await api.get<SuccessResponse<User>>('/users/me');
           resolvedUser = result.data;
@@ -73,7 +82,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
           } else {
             // 메타데이터 폴백
             resolvedUser = {
-              id: '',
+              id: session.user.id,
               supabase_uid: session.user.id,
               email: session.user.email ?? '',
               name: (session.user.user_metadata?.name as string) ?? '',
@@ -132,11 +141,14 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     return () => {
       if (unsubscribe) unsubscribe();
     };
+    // pathname 또는 isHydrated 변화 시 재실행 — hydration 완료 직후
+    // bootstrap 이 1회 트리거되도록 isHydrated 를 deps 에 포함.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pathname]);
+  }, [pathname, isHydrated]);
 
   // 만료 검증을 라우팅 변경 시에도 실행 (페이지 이동 시 재확인)
   useEffect(() => {
+    if (!isHydrated) return; // 하이드레이션 전 loginExpiresAt 은 신뢰할 수 없음
     if (loginExpiresAt && loginExpiresAt < Date.now()) {
       const supabase = createClient();
       supabase.auth.signOut().finally(() => {
@@ -146,7 +158,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pathname]);
+  }, [pathname, isHydrated]);
 
   if (!isReady) {
     return (

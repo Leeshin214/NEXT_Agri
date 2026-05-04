@@ -45,12 +45,20 @@ async def create_room(
     data: ChatRoomCreate,
     current_user: dict = Depends(get_current_user),
 ):
-    """채팅방 생성 (또는 기존 채팅방 반환)"""
+    """채팅방 생성 (또는 기존 채팅방 반환).
+
+    - inquiry_product_id 가 전달되고 새 채팅방이 만들어지는 경우(같은 buyer-seller(-order) 의
+      기존 방이 없는 경우), 백엔드가 자동으로 시스템 메시지 1건을 발송하고 그 메시지의
+      metadata 에 {kind: 'product_inquiry', inquiry_product_id} 를 저장한다.
+      프론트는 채팅방 진입 시 메시지 목록에서 이 metadata 를 찾아 상품 미니카드를 렌더할 수 있다.
+    - 기존 방을 그대로 반환하는 경우엔 메시지 자동 발송 X — 호출처가 별도로 처리.
+    """
     room = await chat_service.get_or_create_room(
         user_id=current_user["id"],
         role=current_user["role"],
         partner_user_id=data.partner_user_id,
         order_id=data.order_id,
+        inquiry_product_id=data.inquiry_product_id,
     )
     return {"data": room}
 

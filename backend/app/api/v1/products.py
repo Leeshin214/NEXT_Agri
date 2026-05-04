@@ -5,7 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.dependencies import get_current_user, require_seller
 from app.schemas.common import SuccessResponse
-from app.schemas.product import ProductCreate, ProductResponse, ProductUpdate
+from app.schemas.product import (
+    ProductCreate,
+    ProductDetailResponse,
+    ProductResponse,
+    ProductUpdate,
+)
 from app.services.product_service import product_service
 
 router = APIRouter(prefix="/products", tags=["products"])
@@ -46,8 +51,48 @@ async def get_product(
     product_id: UUID,
     current_user: dict = Depends(get_current_user),
 ):
-    """상품 상세 조회"""
+    """상품 상세 조회 (단순 응답 — 호환성 유지).
+
+    상세 페이지에서 추가 컨텍스트(판매자 join, 거래 이력, 같은 판매자의 다른 상품)가
+    필요하면 GET /products/{id}/detail 사용. 이 엔드포인트는 ProductResponse 스키마만 보장.
+    """
     product = await product_service.get_product(product_id)
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
+        )
+    return {"data": product}
+
+
+@router.get(
+    "/{product_id}/detail",
+    response_model=SuccessResponse[ProductDetailResponse],
+)
+async def get_product_detail(
+    product_id: UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    """상품 상세 페이지 전용 — 판매자 정보 + 거래 관계 + 같은 판매자 다른 상품을 한 번에 반환 (B.1, 2026-05-04).
+
+    응답 (ProductDetailResponse):
+      - ProductResponse 의 모든 필드
+      - seller_name / seller_company: users 테이블 조인
+      - partner_relationship_status: 현재 사용자 ↔ 판매자 partners.status
+        (BUYER 만 채워짐. SELLER 본인 조회 시 None.)
+        값: 'ACTIVE' | 'PENDING_OUTGOING' | 'PENDING_INCOMING' | 'INACTIVE' | None
+      - previous_order_count: BUYER 와 이 판매자 사이 주문 총 건수 (CANCELLED/soft-deleted 제외)
+      - completed_order_count: 그 중 status='COMPLETED' 만
+      - other_seller_products: 같은 판매자의 다른 상품 (최대 4개, OUT_OF_STOCK 후순위)
+
+    가드:
+      - 상품이 없거나 soft-deleted → 404
+      - 상품의 판매자가 soft-deleted 면 SELLER 본인 외엔 404 (구매자에게 노출 차단)
+    """
+    product = await product_service.get_product_detail(
+        product_id=product_id,
+        current_user_id=current_user["id"],
+        current_user_role=current_user["role"],
+    )
     if not product:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"

@@ -30,7 +30,8 @@ frontend/
 │           ├── dashboard/page.tsx
 │           ├── calendar/page.tsx
 │           ├── partners/page.tsx
-│           ├── browse/page.tsx
+│           ├── browse/page.tsx                  ← 상품 카드 클릭 → /buyer/browse/[productId] 라우팅
+│           ├── browse/[productId]/page.tsx     ← 상품 상세 페이지 (B.1, 2026-05-04)
 │           ├── orders/page.tsx
 │           └── chat/page.tsx
 ├── components/
@@ -372,7 +373,7 @@ content: [
 ### 판매자
 - [ ] dashboard — SummaryCard 4개, 최근 주문 테이블, 이번 주 출하 일정
 - [ ] calendar — 월간 달력, 이벤트 타입별 색상, 날짜 클릭 상세 패널
-- [x] partners — 거래처 테이블 (서버 사이드 필터), 즐겨찾기 토글, AddPartnerModal, 빠른 액션(채팅) — 주문 작성은 V1 숨김 (전용 새 페이지 미존재)
+- [x] partners — 거래처 테이블 (서버 사이드 필터), 즐겨찾기 토글, AddPartnerModal, 빠른 액션(채팅 / 정기배송 신청 — ACTIVE 만) — 주문 작성은 V1 숨김 (전용 새 페이지 미존재)
 - [x] members — 회원 검색 카드, 프로필 모달, 채팅 생성, 거래처 추가 버튼
 - [ ] products — 상품 목록, 상태 필터, 등록 모달 (React Hook Form)
 - [x] orders — 탭(견적/진행/완료), 상세 패널, 상태 변경 + 협상가 제시/수락/거절 + 취소
@@ -381,7 +382,7 @@ content: [
 ### 구매자
 - [ ] dashboard — SummaryCard 4개, 진행 주문 현황, 납품 예정
 - [ ] calendar — 판매자와 동일 패턴
-- [x] partners — 판매자와 동일 패턴 + 빠른 액션 "주문 작성" → /buyer/browse?seller_id=...
+- [x] partners — 판매자와 동일 패턴 + 빠른 액션 "주문 작성" → /buyer/browse?seller_id=... + 정기배송 신청(ACTIVE 만)
 - [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat) + 거래처 추가 버튼
 - [x] browse — 상품 카드 그리드, 카테고리/가격 필터, 견적 요청 버튼, ?seller_id= 쿼리로 판매자 필터
 - [x] orders — 견적 생성/수정/취소 모달 + 협상가 제시/수락/거절 + 상세 슬라이드
@@ -1018,6 +1019,89 @@ const filtered = data?.data ?? [];  // 서버가 필터링한 결과 그대로 �
 - 클라이언트 `products.filter()` useMemo 제거 — 페이지네이션 시 전체 데이터 없어도 서버가 정확히 필터링
 - `'' || undefined` 패턴 필수: 빈 문자열을 그대로 보내면 백엔드가 빈 값으로 필터링함
 
+#### ProductFormModal — 등록/수정 단일 컴포넌트 (검증됨, 2026-05-04)
+
+판매자 상품 페이지(`/seller/products`)는 상품 등록/수정 모달을 단일 컴포넌트 `components/products/ProductFormModal.tsx` 가 `mode: 'create' | 'edit'` prop 으로 양쪽을 모두 처리한다. 폼 필드가 거의 동일(11/12 필드 공통, status 만 edit 전용)하여 별도 컴포넌트로 나누면 중복이 큼.
+
+**핵심 패턴**:
+
+```typescript
+interface ProductFormModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  mode: 'create' | 'edit';
+  product?: Product | null;  // edit 모드 prefill 용
+}
+
+const isEdit = mode === 'edit';
+const createProduct = useCreateProduct();
+const updateProduct = useUpdateProduct();
+const isPending = isEdit ? updateProduct.isPending : createProduct.isPending;
+```
+
+**함정 — input defaultValue 캐시 무효화**:
+- React 의 `defaultValue` 는 mount 시점 값으로 한 번만 설정됨. 같은 모달이 여러 상품에 재사용되면 첫 prefill 이 캐시되어 후속 product 가 반영되지 않음.
+- 해결: `<form key={isEdit ? \`edit-${product?.id}\` : 'create'}>` — key 가 바뀌면 form 트리 전체 remount → input 들이 새 defaultValue 로 초기화.
+
+**상태 필드 분기**:
+- 백엔드 `ProductCreate` 에는 `status` 필드 없음 (등록 시 항상 'NORMAL' 시작), `ProductUpdate` 만 `status` 포함.
+- create 모드: status select 자체를 렌더하지 않음 (`{isEdit && <select name="status" .../>}`).
+
+**페이지 사용**:
+```typescript
+const [showCreateModal, setShowCreateModal] = useState(false);
+const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+
+// 두 모달을 한 페이지에 동시 마운트 — isOpen 으로 제어. editingProduct truthy 시에만 edit 모달 활성.
+<ProductFormModal mode="create" isOpen={showCreateModal} onClose={() => setShowCreateModal(false)} />
+<ProductFormModal
+  mode="edit"
+  isOpen={!!editingProduct}
+  product={editingProduct}
+  onClose={() => setEditingProduct(null)}
+/>
+```
+
+`useCreateProduct` / `useUpdateProduct` 가 onSuccess 에서 `['products']` 캐시 invalidate 하므로 모달 닫은 직후 목록 자동 갱신. 별도 refetch 호출 불필요.
+
+#### DataTable 행 액션 컬럼 — 아이콘 버튼 패턴 (검증됨, 2026-05-04)
+
+판매자 상품 테이블에 "수정/삭제" 행 단위 액션을 추가할 때, 별도 행 클릭 핸들러를 쓰지 않고 마지막 컬럼에 아이콘 버튼 두 개를 넣는다. 행 클릭은 향후 상품 상세 페이지 진입에 남겨둔다 (즉, `<DataTable onRowClick={...}>` 미설정).
+
+```typescript
+{
+  key: 'actions',
+  header: '관리',
+  className: 'w-32',
+  render: (item) => (
+    <div className="flex items-center gap-1">
+      <button
+        onClick={(e) => { e.stopPropagation(); setEditingProduct(item); }}
+        title="상품 수정"
+        aria-label="상품 수정"
+        className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-500 hover:border-primary-300 hover:bg-primary-50 hover:text-primary-700"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </button>
+      <button
+        onClick={(e) => { e.stopPropagation(); handleDelete(item); }}
+        disabled={deleteProduct.isPending}
+        title="상품 삭제"
+        aria-label="상품 삭제"
+        className="inline-flex items-center justify-center rounded-lg border border-gray-200 bg-white p-1.5 text-gray-400 hover:border-red-300 hover:bg-red-50 hover:text-red-600 disabled:opacity-50"
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  ),
+}
+```
+
+- 색 규약: 수정 = primary hover, 삭제 = red hover. 파트너 페이지(`/seller/partners`) 와 동일.
+- 아이콘 크기: `h-3.5 w-3.5` (DataTable 행 높이 `py-3` 와 어울림).
+- `e.stopPropagation()` 필수 — 향후 onRowClick 추가 시 충돌 방지.
+- 삭제는 `confirm()` 로 한 번 더 확인 후 `deleteProduct.mutateAsync(item.id)`.
+
 #### useOrders status_in 다중값 + 탭별 서버 필터링 (검증됨, 2026-04-27)
 
 주문/견적 페이지(`seller/orders`, `buyer/orders`)는 탭마다 백엔드를 다시 호출해 해당 상태만 받는다.
@@ -1092,6 +1176,35 @@ const { data } = usePartners();
 ```
 
 **주의 — React Query 캐시 분리**: queryKey 가 `['partners', filters]` 라서 `usePartners({ include_last_trade: true })` 와 `usePartners()` 는 별도 캐시 슬롯을 차지한다. 거래처 페이지(last_trade 포함)와 다른 페이지(last_trade 없음)가 같은 사용자 세션에서 두 번 fetch 되는 trade-off 가 발생하지만, 다른 페이지에서 불필요한 집계 비용을 피하는 설계 의도와 일치한다.
+
+#### 거래처 행 빠른 액션 — 정기배송 신청 진입점 (검증됨, 2026-05-04, 테스터 피드백 #6)
+
+거래처 목록 페이지에서 `PartnerDetailModal` 을 열지 않고도 정기배송 신청 모달을 직접 호출하는 빠른 액션 버튼. 발견성 ↑.
+
+- **노출 조건**: `item.status === 'ACTIVE'` 만 — `PENDING_*` / `INACTIVE` 거래처는 버튼 자체 미노출.
+- **상태 모델**: `useState<Partner | null>(subscriptionPartner)` 한 개로 모달 가시성과 prefill 대상 partner 를 동시에 관리.
+- **prefill 방식**: `SubscriptionFormModal` 은 별도의 prefill prop 이 없어도 `partner` prop 만으로 `seller_id` / `buyer_id` / `partner_id` 자동 매핑 (myRole 기준 분기). 추가 prop 신설 불필요.
+- **버튼 패턴** (양쪽 페이지 actions 컬럼 동일):
+
+```tsx
+{item.status === 'ACTIVE' && (
+  <button
+    onClick={(e) => {
+      e.stopPropagation();          // 행 onClick (PartnerDetailModal 열기) 차단 필수
+      setSubscriptionPartner(item);
+    }}
+    title="정기배송 신청"
+    className="inline-flex items-center gap-1 rounded-lg border border-primary-600 bg-white px-2.5 py-1 text-xs font-medium text-primary-700 hover:bg-primary-50"
+  >
+    <Repeat className="h-3.5 w-3.5" />
+    <span className="hidden sm:inline">정기배송</span>
+  </button>
+)}
+```
+
+- **모바일 대응**: 라벨 텍스트는 `hidden sm:inline` 으로 작은 화면(≤640px)에서 아이콘만 노출. actions 컨테이너는 `flex flex-wrap items-center justify-end gap-1` 로 폭이 부족할 때 줄바꿈. (기존 `채팅` / `주문 작성` 버튼도 같은 정책으로 통일했음)
+- **모달 렌더 위치**: 페이지 최하단 `PartnerDetailModal` 옆에 conditional 렌더 (`subscriptionPartner && <SubscriptionFormModal .../>`).
+- **아이콘 선택**: `Repeat` (lucide). 정기성/반복 의미가 가장 자연스러움. `RefreshCw` 는 새로고침과 혼동, `CalendarRange` 는 일정 의미가 강함.
 
 #### lib/api.ts 배열 query param 직렬화 (검증됨, 2026-04-27)
 
@@ -1453,6 +1566,62 @@ useEffect(() => {
 **Props**: `initialSellerId?`, `initialSellerName?` (라벨 즉시 표시용), `initialItem?: { product_id; quantity?; unit_price? }` 로 상품 카드 → 견적 모달 prefill 흐름 지원.
 
 상품 select는 그대로 `useProducts({ seller_id: sellerId, limit: 200 })` 사용. seller_id 단수 컬럼이므로 다른 SELLER 상품 섞기 자연 차단.
+
+##### 납품일 필수화 (검증됨, 2026-05-04)
+
+백엔드 `OrderCreate.delivery_date` 가 V2 부터 Required(`date`) 로 변경됨 — 빈 값 제출 시 422. 프론트도 동일하게 강제한다.
+
+`types/order.ts`:
+```typescript
+export interface OrderCreate {
+  seller_id: string;
+  /** YYYY-MM-DD — 백엔드 V2 부터 필수. 빈 값 제출 시 422. */
+  delivery_date: string;        // ← Optional 제거
+  delivery_address?: string;
+  notes?: string;
+  items: OrderItemInput[];
+}
+```
+
+`CreateOrderModal.tsx` — 기존 controlled state + manual validation 패턴 유지 (react-hook-form/zod 미도입). 핵심 4가지:
+
+```tsx
+// 1. 라벨에 빨간 별표 + 안내문
+<label>납품 희망일 <span className="text-red-500">*</span></label>
+<input
+  type="date"
+  value={deliveryDate}
+  onChange={(e) => setDeliveryDate(e.target.value)}
+  min={minDeliveryDate}     // 2. 최소 = 오늘 + 1일
+  required                  // 3. HTML5 native validation
+  aria-required="true"
+/>
+<p className="mt-1 text-xs text-gray-400">
+  판매자가 일정을 확인할 수 있도록 납품일을 반드시 선택해 주세요.
+</p>
+
+// 4. handleSubmit 진입부에서 sellerId 검증 직후 가드
+if (!deliveryDate) {
+  setError('납품 희망일을 선택해 주세요.');
+  return;
+}
+
+// mutateAsync 호출 시 `delivery_date: deliveryDate || undefined` 가 아니라 `delivery_date: deliveryDate` (필수 string)
+```
+
+`minDeliveryDate` 는 `useMemo` 로 KST 기준 YYYY-MM-DD 문자열 한 번만 계산 (timezone-safe — `new Date().toISOString()` 는 UTC 라 1일 어긋날 수 있음):
+```typescript
+const minDeliveryDate = useMemo(() => {
+  const t = new Date();
+  t.setDate(t.getDate() + 1);
+  const y = t.getFullYear();
+  const m = String(t.getMonth() + 1).padStart(2, '0');
+  const d = String(t.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}, []);
+```
+
+**주의**: `OrderUpdate.delivery_date` 는 여전히 Optional 이므로 `EditOrderModal` 은 손대지 않는다 (백엔드 schemas/order.py 의 `OrderUpdate` 도 Optional 유지).
 
 #### browse 페이지 — 문의(채팅) + 견적 요청(모달) 분리 (검증됨)
 

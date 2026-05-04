@@ -99,6 +99,8 @@ async def agent_chat(
             "company_name": current_user.get("company_name", "미설정"),
         },
         history=history,
+        order_id=request.order_id,
+        room_id=request.room_id,
     )
 
     # 대화 기록 저장 (위에서 만든 supabase 클라이언트 재사용)

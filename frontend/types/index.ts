@@ -1,5 +1,15 @@
 export type { User, UserRole, UserPublicProfile } from './user';
-export type { Product, ProductCategory, ProductStatus, ProductUnit, ProductCreate, ProductUpdate } from './product';
+export type {
+  Product,
+  ProductCategory,
+  ProductStatus,
+  ProductUnit,
+  ProductCreate,
+  ProductUpdate,
+  ProductMinimal,
+  ProductDetailResponse,
+  PartnerRelationshipStatus,
+} from './product';
 export type {
   Order,
   OrderItem,

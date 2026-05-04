@@ -111,7 +111,7 @@ export const config = { matcher: [] };
 
 ---
 
-## Zustand Auth Store (탭별 격리 + 만료시각)
+## Zustand Auth Store (탭별 격리 + 만료시각 + 하이드레이션 플래그 3중 안전장치)
 
 ```typescript
 // frontend/store/authStore.ts
@@ -119,17 +119,46 @@ export const LOGIN_DURATION_MS = 2 * 24 * 60 * 60 * 1000; // 정확히 2일
 
 interface AuthState {
   user: User | null;
-  loginExpiresAt: number | null;          // ← 신규: 만료 epoch ms
+  loginExpiresAt: number | null;          // 만료 epoch ms
   isLoading: boolean;
+  isHydrated: boolean;                    // ← persist rehydration 완료 플래그
   setUser: (user: User | null) => void;
-  setSession: (user: User, expiresAt: number) => void;  // ← 신규: 로그인 시 호출
+  setSession: (user: User, expiresAt: number) => void;  // 로그인 시 호출
   setLoading: (loading: boolean) => void;
+  setHydrated: (hydrated: boolean) => void;
   logout: () => void;                     // user + loginExpiresAt 모두 null로
 }
 
 // persist name을 tabId suffix로 분리 → 탭마다 독립된 store
 const persistName = `agriflow-auth-store-${getTabId()}`;
 // partialize: user + loginExpiresAt 둘 다 persist 대상
+persist(..., {
+  name: persistName,
+  storage: createJSONStorage(() => window.localStorage),
+  partialize: (s) => ({ user: s.user, loginExpiresAt: s.loginExpiresAt }),
+  // ⚠️ persist 데이터가 localStorage에 이미 있을 때만 호출됨 (첫 로그인엔 호출 X)
+  onRehydrateStorage: () => () => {
+    useAuthStore.setState({ isHydrated: true });
+  },
+});
+
+// ─── 모듈 레벨 hydration 가드 (3중 안전장치) — 첫 로그인 무한 로딩 방지 ───
+if (typeof window !== 'undefined') {
+  if (useAuthStore.persist.hasHydrated()) {
+    useAuthStore.setState({ isHydrated: true });
+  } else {
+    useAuthStore.persist.onFinishHydration(() => {
+      useAuthStore.setState({ isHydrated: true });
+    });
+    // 마지막 안전망: 빈 localStorage(첫 로그인) 케이스 등에서
+    // onRehydrateStorage/onFinishHydration 둘 다 호출 안 될 때 200ms 후 강제 true
+    setTimeout(() => {
+      if (!useAuthStore.getState().isHydrated) {
+        useAuthStore.setState({ isHydrated: true });
+      }
+    }, 200);
+  }
+}
 ```
 
 `getTabId()` 는 `sessionStorage['agriflow-tab-id']` 에 UUID 저장. Supabase 클라이언트와 동일한 키를 공유하여 탭 단위 격리.
@@ -371,6 +400,8 @@ Supabase 자체 토큰 만료(보통 1시간)는 자동 갱신되어 사실상 �
 - 루트 `/` → `app/page.tsx` 도 `'use client'` 로 변경하여 store 기반 분기
 
 ### 주의사항 & 함정
+
+- **persist `onRehydrateStorage` 는 빈 localStorage 에서 호출 안 됨 (확정 함정, 2026-05-04)**: Zustand persist 의 `onRehydrateStorage` 콜백은 localStorage 에 persist 데이터가 존재할 때만 호출된다. 첫 로그인처럼 storage 가 비어 있으면 콜백이 영원히 호출되지 않아 `isHydrated` 가 `false` 로 고정되고, AuthGuard 의 `if (!isHydrated) return` 에서 영원히 막혀 "불러오는 중..." 화면이 무한 로딩된다. 해결: 모듈 레벨에서 `useAuthStore.persist.hasHydrated()` 체크 + `onFinishHydration` 등록 + 200ms `setTimeout` fallback 의 3중 안전장치를 추가한다 (위 store 코드 참고). 이 보강을 빼면 새로운 사용자/계정 추가 시 즉시 무한 로딩으로 막힌다.
 
 - **로그인 직후 setUser 즉시 호출 필수 (함정)**: `login/page.tsx`에서 로그인 성공 후 `router.push()`만 하면 안 된다. redirect 후 `useAuth` 훅이 TopBar에서 비동기로 프로필을 가져오는 동안 Zustand persist에서 복원된 stale 데이터나 null이 사용된다. 특히 채팅 페이지에서 `msg.sender_id === user?.id` 비교 시 `user.id`가 `''`이면 모든 메시지가 상대방 메시지로 보이는 버그가 발생한다. 반드시 로그인 시 `select('*')`로 전체 프로필을 가져와 `useAuthStore.getState().setUser(profile)`로 즉시 저장한다.
   ```typescript

@@ -8,6 +8,8 @@ from pydantic import BaseModel
 class AIChatRequest(BaseModel):
     prompt: str
     prompt_type: Optional[str] = None
+    order_id: Optional[str] = None
+    room_id: Optional[str] = None
 
 
 class AISummarizeChatRequest(BaseModel):

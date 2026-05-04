@@ -39,8 +39,15 @@ class OrderItemResponse(BaseModel):
 
 
 class OrderCreate(BaseModel):
+    """주문/견적 생성 입력.
+
+    - delivery_date 는 V2 흐름에서 필수 (2026-05-04). 판매자가 일정을 검토할 수 있도록
+      모든 주문은 납품일을 명시한 상태로 시작한다. UI 모달, AI 도구, 합의 자동 흐름 모두
+      이 필드를 반드시 채워야 한다.
+    """
+
     seller_id: UUID
-    delivery_date: Optional[date] = None
+    delivery_date: date
     delivery_address: Optional[str] = None
     notes: Optional[str] = None
     items: list[OrderItemCreate]

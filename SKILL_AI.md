@@ -487,14 +487,28 @@ class AgentState(TypedDict):
 - 다른 노드(inventory_order/calendar_data/calendar_reason)는 모두 `state["history"]` 를 직접 사용 → 오염된 messages 를 다시 필터링할 필요 없음
 - `AgentOrchestrator.run()` 에서 `clean_history` 를 한 번만 만들어 `history` / `messages` 양쪽에 주입
 
-#### TOOL_FUNCTION_MAP 전체 목록 (18개)
+#### TOOL_FUNCTION_MAP 전체 목록 (36개, 2026-05-04 갱신)
 ```
+# 상품/재고
 get_products, check_stock, update_stock, create_product, delete_product, update_product,
-get_orders, get_order_detail, update_order_status, create_order, delete_order,
-find_sellers_by_product, find_buyers_by_product,
-open_chat_room, get_calendar_events, create_calendar_event,
-find_alternative_partners, get_user_profile
+# 주문
+get_orders, get_order_detail, update_order_status, update_order, create_order, delete_order,
+# 거래처/검색
+find_sellers_by_product, find_buyers_by_product, find_alternative_partners, get_user_profile,
+# 채팅
+open_chat_room, get_chat_rooms, get_chat_messages, send_chat_message,
+# 캘린더
+get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event,
+# 거래처 등록 (양방향 PENDING)
+request_partner_registration, request_partner_registration_by_name,
+# 카운터오퍼 / 납품일 변경 (2026-05-04 신규)
+submit_counter_offer, accept_counter_offer, reject_counter_offer,
+submit_delivery_date_change, accept_delivery_date_change, reject_delivery_date_change,
+# 정기배송 V1.6 양방향 승인 모델 (2026-05-04 신규, 테스터 피드백 #6)
+create_subscription_request, accept_subscription_request, reject_subscription_request,
+create_subscription_from_order,
 ```
+- TOOLS 리스트 (orchestrator.py inventory_order_node 노출용) 도 동일하게 30개 (carbon copy 가 아님 — `analyze_chat_consensus` / `_resolve_chat_room_candidates` / `_do_send_chat_message` 등 내부 헬퍼 6종은 제외).
 
 #### 시스템 프롬프트 고도화 패턴 (Phase 2)
 - 12가지 CASE 안내를 AGENT_SELLER_SYSTEM / AGENT_BUYER_SYSTEM에 명시 → LLM이 도구 선택 실수 감소
@@ -567,3 +581,40 @@ find_alternative_partners, get_user_profile
 - `analyze_chat_consensus` (chat_ws.py 안에서 호출) — 합의/거절 감지 시 **자동으로** 주문 INSERT + 캘린더 등록 + 시스템 메시지 broadcast.
 - `negotiation_detection_service` (chat.py 라우터에서 호출) — 단순 협상 의도 감지 + metadata 저장 + 본인에게만 알림 → **사용자 [등록] 클릭 시에만** propose_counter_offer 호출.
 - 두 흐름은 동시 동작 가능 (한 메시지가 협상 의도 + 합의 양쪽 트리거 가능). consensus 가 먼저 자동 주문을 만들어도 draft_negotiation 은 별도 metadata 키라 충돌 없음.
+
+#### Phase B 시스템 프롬프트 보강 (2026-05-04)
+- 새 도구 12개(submit/accept/reject_counter_offer, submit/accept/reject_delivery_date_change, request_partner_registration, request_partner_registration_by_name, create/accept/reject_subscription_request, create_subscription_from_order)에 대한 자연어 트리거 가이드 5종을 시스템 프롬프트에 분산 추가:
+  - `AGENT_BASE_SYSTEM` — [채팅 메시지 발송 확인 가이드] 직후·[주의사항] 직전에 (1) 자연어 → 카드 도구 자동 호출 핵심 매핑, (2) 자연어 → 카드 도구 안전장치, (3) 재고 검색 vs 대체 거래처 분리 원칙(환각 방지) 3개 섹션. SELLER/BUYER 합성본에 자동 반영.
+  - `chat_node` 시스템 프롬프트 — [needs_confirmation 응답 가이드] 직후에 (1) 자연어 협상/납품일 → 카드 도구 매핑, (2) 거래처 등록 / 정기배송 자연어 매핑, (3) 재고 vs 대체 분리 3개 섹션 직접 명시(chat intent 라우팅 시 가장 자주 호출되는 노드라 BASE 와 별도로 보강).
+- 핵심 안전장치: 가격/날짜/주기 같은 필수 정보가 발화에서 빠지면 도구 호출 X → 되묻기. 정보가 명확히 있으면 이중 confirmation 없이 즉시 호출(UX). 카드는 즉시 발송되어 채팅방에 PENDING 으로 노출되므로 도구 호출 직후 "○○으로 카드를 보냈습니다. 상대방이 수락/거절하면 알려드릴게요" 형식의 후속 흐름 안내 강조.
+- 환각 방지: "참치 찾아줘" → product_name='참치'만 정확 검색. 0건이라도 새우/연어 같은 다른 품목 추천 절대 금지. 사용자 명시 동의 후에만 find_alternative_partners 호출. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에 동시 호출 금지.
+- 도구 시그니처는 실제 함수 정의 그대로 매핑 (notes/proposed_total_amount/proposed_delivery_date/offer_id/change_id 등 실제 키 사용). placeholder 추가 없음 → KeyError 위험 0. AST OK, SELLER/BUYER 합성본 모두 _render_agent_system 통과 확인 완료.
+
+#### 구매자 주문/견적 생성 가이드 (2026-05-04 갱신 — auto_confirm 제거, delivery_date 필수화)
+- 백엔드(`order_service.create_order`)가 다음과 같이 바뀌었다:
+  - **delivery_date 필수화** — `OrderCreate` 스키마 / `agent_tools.create_order` / orchestrator `TOOLS` schema 의 required 모두 강제. 빠지면 422.
+  - **가격 일치 시 CONFIRMED 자동 진입 제거** — 모든 신규 주문은 `QUOTE_REQUESTED` 견적 상태로 시작해 판매자 검토를 기다린다. (이전엔 `unit_price >= price_per_unit` 일 때 즉시 CONFIRMED + 재고 차감 했지만, 이제는 판매자가 명시적으로 수락해야 확정.)
+  - **가격 협상 분기는 유지** — `unit_price < price_per_unit` 일 때만 자동 카운터오퍼 → NEGOTIATING + PENDING 카드.
+- 시스템 프롬프트가 옛 흐름 ("가격 일치 → CONFIRMED 자동")을 전제로 작성돼 있어 사용자에게 "주문이 확정됐습니다"라고 거짓 답변하던 문제 → 두 위치를 새 흐름에 맞게 교체.
+- 적용 위치 (orchestrator.py):
+  - `BUYER_ROLE_APPENDIX` 의 `[🚨 구매자 주문/견적 생성 규칙]` (라인 1572 근방) — 기존 `[🚨 구매자 주문/견적 생성 규칙 — 자동 확정 / 협상 분기]` + `[🚨 단가 자동 조회 강제]` + `[🚨 주문 생성 결과 응답 표현]` 3개 섹션을 합쳐서 `[🚨 구매자 주문/견적 생성 규칙]` + `[🚨 단가 / 납품일 필수 확보]` + `[🚨 주문 생성 결과 응답 표현]` + `[🚨 납품일 변경]` 4개 섹션으로 재구성.
+  - `chat_node` 시스템 프롬프트의 `[구매자 자동 주문 확정 / 협상 분기 가이드]` (라인 2427 근방) — `[구매자 주문/견적 생성 가이드]` 로 교체.
+- 핵심 발화 패턴 (5종):
+  1. **납품일 + 수량 명시** ("망고 2kg 5월 20일에 받게 주문해줘") → `check_stock`/`find_sellers_by_product` 로 `price_per_unit` 조회 → `unit_price` 채우고 날짜를 'YYYY-MM-DD' 정규화 → `create_order` → QUOTE_REQUESTED.
+  2. **가격까지 명시** ("13만원에 망고 2kg 5/20일 받기로 주문해줘") → 명시 가격 + 날짜 그대로 → 일치/이상이면 QUOTE_REQUESTED, 낮으면 NEGOTIATING + 카운터오퍼.
+  3. **납품일 빠짐** ("망고 2kg 주문해줘") → `create_order` 호출 금지. "납품일은 언제로 할까요? (예: 5월 20일)" 라고 자연체로 되묻고 사용자 답변 받기 전까지는 대기. "오늘"/"내일" 같은 모호한 표현을 LLM 임의로 날짜로 바꿔치기 금지.
+  4. **협상 명시** ("깎아줘", "할인 받고 싶어") → `submit_counter_offer` (이미 PENDING/NEGOTIATING 주문 있을 때). 가격 함께 언급된 새 주문이면 납품일 받아낸 뒤 그 가격으로 `create_order`.
+  5. **수량만 + 의도 모호** ("망고 2kg") → 의도 확인 + 납품일 확보.
+- 필수 확보 강제: `unit_price` 와 `delivery_date` 둘 다 비어있으면 안 됨. 단가는 조회 도구로 확보, 납품일은 사용자에게 받아낼 때까지 호출 금지.
+- 응답 표현 가이드 (별표/표/헤더 금지, 자연체, **"주문이 확정됐습니다" 절대 금지**):
+  - QUOTE_REQUESTED (정상 신규 견적): "○○ ○단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일. 판매자가 수락하면 알려드릴게요."
+  - NEGOTIATING (가격 협상 시작): "○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 채팅방에 카드를 발송했고, 판매자가 수락/거절하면 알려드릴게요."
+  - 그 외: "주문이 접수됐고 판매자 확인을 기다리고 있습니다."
+- 납품일 변경 (`submit_delivery_date_change`): QUOTE_REQUESTED 단계면 "판매자가 견적을 검토하는 중이라 변경 요청도 함께 전달했습니다" 같이 자연스럽게 안내.
+- placeholder 추가 없음. AST OK, render 후 잔여 placeholder 0개, BUYER 합성본에 새 가이드 9개 marker 모두 포함, SELLER 합성본 누출 0건, 옛 표현 4종("자동 확정 / 협상 분기", "auto_confirmed=true", "재고를 자동 차감한다", "[🚨 단가 자동 조회 강제]") 모두 제거 확인 완료.
+- 주의: SELLER 합성본에는 의도적으로 추가하지 않음 — 판매자는 `create_order` 권한 없음. SELLER 의 주문 확정은 `update_order_status(new_status="CONFIRMED")` 흐름.
+
+#### 검증된 패턴: "수치를 먼저 제시하는 응답 형식이 더 효과적" (2026-05-04 추가)
+- 응답 표현 예시를 가이드에 박을 때 "○○ N단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일." 처럼 수치 (수량·가격·날짜) 를 먼저 풀어서 제시하는 형식이, "주문 견적이 발송됐고 가격은 ₩○○이고 납품일은 ○월 ○일입니다" 처럼 산문체로 풀어쓰는 형식보다 LLM 모방률이 높음.
+- 이유: GPT-4o-mini 는 가이드의 마지막 예시 문장을 그대로 따라가는 경향이 있어, **명사 + 수치 + 핵심 정보를 마침표로 끊어 나열**하는 패턴이 채팅창에서 가독성도 좋고 LLM 도 잘 재현함.
+- 반대로 부정형 ("절대 X 라고 말하지 마라") 은 한 번 더 강조 — `[응답 표현]` 섹션 본문 + 헤더 옆 강조 + 가이드 맨 마지막 문장 3중으로 박아야 LLM 이 무의식적으로 옛 표현으로 돌아가는 걸 막을 수 있음 (이번 작업에서 "주문이 확정됐습니다 절대 금지"를 3곳에 분산 명시).
