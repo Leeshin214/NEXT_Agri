@@ -542,6 +542,8 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 
 - **PostgREST `eq("metadata->>key", value)` 캐시/지연 함정 (2026-04-27 검증)**: PostgREST 의 JSONB path 추출 필터 `eq("metadata->>offer_id", "...")` 는 INSERT/UPDATE 직후 같은 supabase 클라이언트 인스턴스에서 호출하면 빈 결과를 반환할 수 있다 (replication / 내부 캐시 영향). E2E 검증에서는 같은 트랜잭션 직후 검증보다는 `message_type` 등 정적 컬럼으로 가져온 뒤 client-side 에서 `metadata.offer_id` 비교하는 것이 안정적. 운영 코드 자체는 RPC 함수가 직접 SQL UPDATE 를 수행하므로 문제 없음 — 검증/조회 측에서만 주의.
 
+- **터미널 주문 상태(COMPLETED/CANCELLED) → calendar_events 정리 — `TERMINAL_ORDER_STATUSES` (2026-05-04)**: `order_service._sync_calendar_events_for_order_sync` 의 정리 분기는 원래 `status == CANCELLED OR deleted_at` 만 검사해서, 주문이 COMPLETED 로 전이된 뒤에도 calendar_events 가 살아있어 캘린더 UI 에 "완료된 주문" 이 진행 중인 것처럼 계속 표시되는 버그가 있었다. 사용자 정의 정상 동작 = 진행 중(QUOTE_REQUESTED/NEGOTIATING/CONFIRMED/PREPARING/SHIPPING) 또는 정기배송 활성 주문만 캘린더에 표시. 해결: 모듈 상수 `ORDER_STATUS_COMPLETED = "COMPLETED"` + `TERMINAL_ORDER_STATUSES = frozenset({COMPLETED, CANCELLED})` 추가하고, sync 함수의 첫 분기를 `if order.get("status") in TERMINAL_ORDER_STATUSES or order.get("deleted_at"):` 로 변경. `update_status` 가 COMPLETED 로 전이될 때마다 마지막에 `_sync_calendar_events_for_order(updated_order)` 가 호출되므로 새 조건이 자동으로 active 행을 soft-delete. 코드만 수정 — 기존 COMPLETED 주문에 대한 cleanup 백필은 별도 PR/운영 스크립트로 분리.
+
 - **calendar_events `(order_id, user_id, event_date)` partial unique index — 한 주문×한 user 당 active 1개 보장 (2026-04-27 중복 누적 버그 수정)**: order-linked 캘린더 일정에 UNIQUE 제약이 없어 race condition 또는 과거 backfill 폭주 시기에 같은 (order_id, user_id, event_date) active row 가 수십 개 누적되는 정합성 버그가 발생. `order_service._sync_calendar_events_for_order_sync` 가 일부 정리 로직을 갖고 있었지만 race 에 취약했고, 납기일 변경 시 옛 event_date 의 row 가 잔존하는 케이스도 있었다. DB 차원 보장이 필요.
 
   ```sql

@@ -60,6 +60,13 @@ TRANSITION_ROLE_GUARD: dict[tuple[str, str], set[str]] = {
 }
 
 ORDER_STATUS_CANCELLED = "CANCELLED"
+ORDER_STATUS_COMPLETED = "COMPLETED"
+# 주문 종료 상태(터미널) — 캘린더에서 정리되어야 하는 상태 집합.
+# COMPLETED/CANCELLED 둘 다 더 이상 "진행 중"이 아니므로 캘린더 일정에서 제외.
+TERMINAL_ORDER_STATUSES: frozenset[str] = frozenset({
+    ORDER_STATUS_COMPLETED,
+    ORDER_STATUS_CANCELLED,
+})
 ORDER_STATUS_LABELS: dict[str, str] = {
     "QUOTE_REQUESTED": "견적 요청",
     "NEGOTIATING": "협상 중",
@@ -225,7 +232,8 @@ class OrderService:
         """주문 상태/데이터를 양 당사자의 order-linked calendar_events에 반영한다.
 
         견고화 (2026-04-27 — 중복 누적 버그 수정):
-        - CANCELLED 또는 soft-deleted 주문: 활성 calendar_events 전부 soft-delete
+        - 터미널 상태(COMPLETED/CANCELLED) 또는 soft-deleted 주문:
+          활성 calendar_events 전부 soft-delete (2026-05-04 — COMPLETED 누락 보강)
         - 그 외 상태: buyer/seller 각각 정확히 1개의 active row (target_event_date 기준)
           만 남기고, 같은 user 의 다른 active row 는 모두 soft-delete
             * 같은 event_date 의 중복 row 정리 (race condition 잔재)
@@ -240,7 +248,7 @@ class OrderService:
             return
         order_id_str = str(order_id)
 
-        if order.get("status") == ORDER_STATUS_CANCELLED or order.get("deleted_at"):
+        if order.get("status") in TERMINAL_ORDER_STATUSES or order.get("deleted_at"):
             self._soft_delete_calendar_events_for_order_sync(order_id_str)
             return
 
