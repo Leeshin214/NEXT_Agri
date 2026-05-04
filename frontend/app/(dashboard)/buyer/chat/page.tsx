@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
-import { Send, Sparkles, ArrowLeft, AlertTriangle, X } from 'lucide-react';
+import { Sparkles, ArrowLeft, AlertTriangle, X } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import Modal from '@/components/common/Modal';
 import MessageBubble from '@/components/chat/MessageBubble';
@@ -10,25 +10,28 @@ import OrderContextBanner from '@/components/chat/OrderContextBanner';
 import PriceOfferPopover from '@/components/chat/PriceOfferPopover';
 import DeliveryDatePopover from '@/components/chat/DeliveryDatePopover';
 import ChatHeaderStatusControl from '@/components/chat/ChatHeaderStatusControl';
+import ChatRoomList from '@/components/chat/ChatRoomList';
+import MessageInput from '@/components/chat/MessageInput';
 import {
   useChatRooms,
   useMessagesWithWebSocket,
   useMarkAsRead,
   useSummarizeChat,
   useCreateChatRoom,
+  useDismissNegotiationDraft,
 } from '@/hooks/useChat';
 import { useOrder } from '@/hooks/useOrders';
 import { useAuthStore } from '@/store/authStore';
 import { cn } from '@/lib/utils';
 import { isSystemMessageContent } from '@/constants/chat';
-import type { AlternativePartner } from '@/types';
+import type { AlternativePartner, NegotiationDraft } from '@/types';
+import type { PriceOfferPrefill } from '@/components/chat/PriceOfferPopover';
 
 export default function BuyerChatPage() {
   const router = useRouter();
   const { user } = useAuthStore();
   const searchParams = useSearchParams();
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
-  const [message, setMessage] = useState('');
   const [showSummary, setShowSummary] = useState(false);
   const [summary, setSummary] = useState('');
   // 모바일에서 채팅방 선택 시 메시지 뷰로 전환하는 상태
@@ -52,6 +55,9 @@ export default function BuyerChatPage() {
   const markAsRead = useMarkAsRead();
   const summarize = useSummarizeChat();
   const createChatRoom = useCreateChatRoom();
+  // US-2 협상 의도 감지 — [무시] PATCH + [등록] 시 PriceOfferPopover prefill
+  const dismissDraft = useDismissNegotiationDraft(selectedRoomId);
+  const [draftPrefill, setDraftPrefill] = useState<PriceOfferPrefill | null>(null);
 
   const rooms = roomsData?.data ?? [];
   const messages = messageQuery.data?.data ?? [];
@@ -86,10 +92,38 @@ export default function BuyerChatPage() {
     setMobileView('list');
   };
 
-  const handleSend = () => {
-    if (!message.trim() || !selectedRoomId) return;
-    wsSendMessage(message);
-    setMessage('');
+  const handleSend = (content: string) => {
+    if (!selectedRoomId) return;
+    wsSendMessage(content);
+  };
+
+  // US-2 — 협상 감지 카드 [등록]: PriceOfferPopover 를 prefill 한 채로 연다.
+  // total = quantity * unit_price 로 계산해서 amount 에 prefill (둘 다 있을 때만).
+  // notes 에는 감지된 자연어 요약을 채워 사용자가 그대로 제출하거나 수정 가능.
+  const handleAcceptDraft = (draft: NegotiationDraft) => {
+    const total =
+      typeof draft.quantity === 'number' &&
+      typeof draft.unit_price === 'number' &&
+      draft.quantity > 0 &&
+      draft.unit_price > 0
+        ? draft.quantity * draft.unit_price
+        : undefined;
+    const noteParts: string[] = [];
+    if (draft.product_name) noteParts.push(draft.product_name);
+    if (typeof draft.quantity === 'number' && draft.quantity > 0) {
+      noteParts.push(`${draft.quantity}${draft.unit ?? ''}`);
+    }
+    if (typeof draft.unit_price === 'number' && draft.unit_price > 0) {
+      noteParts.push(`단가 ${draft.unit_price.toLocaleString('ko-KR')}원`);
+    }
+    setDraftPrefill({
+      amount: total,
+      notes: noteParts.length > 0 ? noteParts.join(' / ') : undefined,
+    });
+  };
+
+  const handleDismissDraft = (messageId: string) => {
+    dismissDraft.mutate(messageId);
   };
 
   const handleSummarize = async () => {
@@ -130,56 +164,23 @@ export default function BuyerChatPage() {
       <PageHeader title="채팅" description="공급처와 실시간으로 대화하세요" />
 
       <div className="flex h-[calc(100vh-200px)] rounded-xl bg-white shadow-sm overflow-hidden">
-        {/* 채팅방 목록 — 모바일: mobileView==='list'일 때만 표시, md 이상: 항상 표시 */}
+        {/* 채팅방 목록 — 거래처별 그룹핑 (모바일: mobileView==='list'일 때만 표시, md 이상: 항상 표시) */}
         <div
           className={cn(
-            'border-r border-gray-200 overflow-y-auto',
+            'border-r border-gray-200',
             'w-full md:w-72 md:flex-shrink-0',
             mobileView === 'list' ? 'flex flex-col' : 'hidden md:flex md:flex-col'
           )}
         >
-          {roomsLoading ? (
-            <div className="flex items-center justify-center p-8">
-              <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary-600 border-t-transparent" />
-            </div>
-          ) : roomsError ? (
-            <div className="p-4 text-sm text-red-500">
-              채팅방을 불러오지 못했습니다.
-              <button onClick={() => refetchRooms()} className="ml-2 text-primary-600 underline">
-                다시 시도
-              </button>
-            </div>
-          ) : rooms.length === 0 ? (
-            <p className="p-4 text-sm text-gray-400">채팅방이 없습니다.</p>
-          ) : (
-            rooms.map((room) => (
-              <button
-                key={room.id}
-                onClick={() => handleRoomSelect(room.id)}
-                className={cn(
-                  'w-full border-b border-gray-100 p-4 text-left hover:bg-gray-50',
-                  selectedRoomId === room.id && 'bg-primary-50'
-                )}
-              >
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-medium text-gray-900">
-                    {room.partner_name || '상대방'}
-                  </p>
-                  {room.unread_count > 0 && (
-                    <span className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-primary-600 px-1.5 text-[10px] font-bold text-white">
-                      {room.unread_count}
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-gray-500">{room.partner_company}</p>
-                {room.last_message && (
-                  <p className="mt-1 truncate text-xs text-gray-400">
-                    {room.last_message}
-                  </p>
-                )}
-              </button>
-            ))
-          )}
+          <ChatRoomList
+            rooms={rooms}
+            myRole="BUYER"
+            selectedRoomId={selectedRoomId}
+            onSelectRoom={handleRoomSelect}
+            isLoading={roomsLoading}
+            error={roomsError}
+            onRetry={refetchRooms}
+          />
         </div>
 
         {/* 메시지 영역 — 모바일: mobileView==='messages'일 때만 표시, md 이상: 항상 표시 */}
@@ -343,48 +344,38 @@ export default function BuyerChatPage() {
                       key={msg.id}
                       message={msg}
                       currentUserId={user?.id}
+                      onAcceptNegotiationDraft={handleAcceptDraft}
+                      onDismissNegotiationDraft={handleDismissDraft}
+                      isDismissingNegotiationDraft={dismissDraft.isPending}
                     />
                   );
                 })}
                 <div ref={messagesEndRef} />
               </div>
 
-              {/* 입력창 */}
-              <div className="border-t border-gray-200 p-4">
-                <div className="flex gap-2">
-                  <PriceOfferPopover
-                    roomId={selectedRoomId}
-                    orderId={linkedOrderId}
-                    currentTotal={linkedOrderTotal}
-                  />
-                  <DeliveryDatePopover
-                    roomId={selectedRoomId}
-                    orderId={linkedOrderId}
-                    orderStatus={linkedOrderStatus}
-                    currentDeliveryDate={linkedOrderDeliveryDate}
-                  />
-                  <input
-                    value={message}
-                    onChange={(e) => setMessage(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.nativeEvent.isComposing) return;
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        handleSend();
-                      }
-                    }}
-                    placeholder="메시지를 입력하세요..."
-                    className="flex-1 rounded-lg border border-gray-300 px-4 py-2 text-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500"
-                  />
-                  <button
-                    onClick={handleSend}
-                    disabled={!message.trim() || !isConnected}
-                    className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary-600 text-white hover:bg-primary-700 disabled:opacity-50"
-                  >
-                    <Send className="h-4 w-4" />
-                  </button>
-                </div>
-              </div>
+              {/* 입력창 — `/초안 [지시]` 슬래시 명령으로 AI 답장 초안 생성 가능 */}
+              <MessageInput
+                roomId={selectedRoomId}
+                isConnected={isConnected}
+                onSend={handleSend}
+                leadingActions={
+                  <>
+                    <PriceOfferPopover
+                      roomId={selectedRoomId}
+                      orderId={linkedOrderId}
+                      currentTotal={linkedOrderTotal}
+                      prefill={draftPrefill}
+                      onPrefillConsumed={() => setDraftPrefill(null)}
+                    />
+                    <DeliveryDatePopover
+                      roomId={selectedRoomId}
+                      orderId={linkedOrderId}
+                      orderStatus={linkedOrderStatus}
+                      currentDeliveryDate={linkedOrderDeliveryDate}
+                    />
+                  </>
+                }
+              />
             </>
           )}
         </div>

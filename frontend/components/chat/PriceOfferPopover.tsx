@@ -5,12 +5,29 @@ import { DollarSign, X } from 'lucide-react';
 import { useSubmitCounterOfferViaChat } from '@/hooks/useChat';
 import { cn } from '@/lib/utils';
 
+/**
+ * 외부(예: NegotiationDraftCard [등록]) 에서 prefill 한 채로 팝오버를 여는 데 쓰는 입력값.
+ * 부모가 매번 새 객체를 만들면 useEffect 가 재실행되며 입력값이 덮어써진다 → 부모는
+ * 안정 참조(useState 또는 useMemo) 로 전달해야 한다.
+ */
+export interface PriceOfferPrefill {
+  amount?: number;
+  notes?: string;
+}
+
 interface PriceOfferPopoverProps {
   roomId: string | null;
   /** 채팅방에 연결된 주문 id. 없으면 버튼 비활성화 */
   orderId: string | null;
   /** 현재 주문 합계 — placeholder 표시용 (선택) */
   currentTotal?: number | null;
+  /**
+   * 외부에서 팝오버를 열면서 입력값을 prefill 할 때 사용. 부모가 객체를 갱신할 때마다
+   * 팝오버가 열리고 입력값이 채워진다. null 로 보내면 외부 prefill 영향 없음.
+   */
+  prefill?: PriceOfferPrefill | null;
+  /** prefill 적용 후 부모에게 알려주는 콜백 (선택) — 부모가 prefill 을 null 로 reset 하는 용도 */
+  onPrefillConsumed?: () => void;
 }
 
 /**
@@ -20,16 +37,22 @@ interface PriceOfferPopoverProps {
  * - room.order_id 가 없으면 버튼 비활성화 + tooltip 안내
  * - 제출 → useSubmitCounterOfferViaChat(roomId).mutate(...)
  * - 성공 시 팝오버 자동 닫기, 입력값 초기화
+ * - prefill prop 이 들어오면 자동으로 팝오버 열고 입력값 채움 (US-2 협상 의도 감지 [등록])
  */
 export default function PriceOfferPopover({
   roomId,
   orderId,
   currentTotal,
+  prefill,
+  onPrefillConsumed,
 }: PriceOfferPopoverProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [amount, setAmount] = useState('');
   const [notes, setNotes] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // 자체 클릭으로 열렸는지(true) prefill 로 자동으로 열렸는지(false) 구분 — 자동 열림은
+  // 다음 isOpen 사이드이펙트에서 입력값을 빈 값으로 reset 하지 않도록 함.
+  const openedByPrefillRef = useRef(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
 
   const submitMutation = useSubmitCounterOfferViaChat(roomId);
@@ -40,6 +63,22 @@ export default function PriceOfferPopover({
     : !orderId
     ? '이 채팅방에 연결된 주문이 없습니다'
     : '가격 제시';
+
+  // 외부 prefill 도착 → 팝오버 자동 열기 + 값 채우기 (disabled 면 무시)
+  useEffect(() => {
+    if (!prefill) return;
+    if (disabled) return;
+    openedByPrefillRef.current = true;
+    setAmount(
+      typeof prefill.amount === 'number' && prefill.amount > 0
+        ? String(prefill.amount)
+        : ''
+    );
+    setNotes(prefill.notes ?? '');
+    setError(null);
+    setIsOpen(true);
+    onPrefillConsumed?.();
+  }, [prefill, disabled, onPrefillConsumed]);
 
   // 외부 클릭 시 팝오버 닫기
   useEffect(() => {
@@ -56,13 +95,17 @@ export default function PriceOfferPopover({
     return () => document.removeEventListener('mousedown', handleClick);
   }, [isOpen]);
 
-  // 팝오버 열릴 때마다 입력값 초기화
+  // 팝오버 열릴 때마다 입력값 초기화 (단, prefill 로 열린 경우는 보존)
   useEffect(() => {
-    if (isOpen) {
-      setAmount('');
-      setNotes('');
-      setError(null);
+    if (!isOpen) return;
+    if (openedByPrefillRef.current) {
+      // 한 번만 prefill 보존 — 이후 사용자가 닫고 다시 열면 일반 초기화 동작
+      openedByPrefillRef.current = false;
+      return;
     }
+    setAmount('');
+    setNotes('');
+    setError(null);
   }, [isOpen]);
 
   const handleSubmit = async (e: React.FormEvent) => {

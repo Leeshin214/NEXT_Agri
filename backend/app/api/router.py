@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.ai_assistant import router as ai_router
+from app.api.v1.buyer_inventory import router as buyer_inventory_router
 from app.api.v1.calendar import router as calendar_router
 from app.api.v1.chat import router as chat_router
 from app.api.v1.notifications import router as notifications_router
@@ -21,3 +22,4 @@ api_router.include_router(chat_router)
 api_router.include_router(ai_router)
 api_router.include_router(subscriptions_router)
 api_router.include_router(notifications_router)
+api_router.include_router(buyer_inventory_router)

@@ -2,19 +2,27 @@ import asyncio
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
 from app.dependencies import get_current_user
 from app.schemas.chat import (
+    ChatDraftRequest,
+    ChatDraftResponse,
     ChatRoomCreate,
     ChatRoomResponse,
     MessageCreate,
     MessageResponse,
+    NegotiationDraftDismissResponse,
 )
 from app.schemas.common import SuccessResponse
 from app.schemas.order import CounterOfferCreate, CounterOfferResponse
 from app.core.supabase import get_supabase_client
 from app.services.chat_service import chat_service
+from app.services.draft_service import generate_chat_draft
+from app.services.negotiation_detection_service import (
+    dismiss_draft_negotiation,
+    process_message_for_negotiation,
+)
 from app.services.order_service import order_service
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -72,15 +80,61 @@ async def list_messages(
 async def send_message(
     room_id: UUID,
     data: MessageCreate,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
 ):
-    """메시지 전송"""
+    """메시지 전송 + 협상 의도 감지 백그라운드 실행 (US-2, 2026-05-04).
+
+    응답 자체는 메시지 INSERT 결과만 즉시 반환하고,
+    협상 의도 감지는 BackgroundTasks 로 비동기 실행되어 응답 시간에 영향 주지 않는다.
+    감지 결과는 messages.metadata['draft_negotiation'] 에 저장되고
+    발신자 본인에게만 WS `negotiation_draft_detected` 이벤트로 푸시된다.
+    """
     message = await chat_service.send_message(
         room_id=room_id,
         sender_id=current_user["id"],
         content=data.content,
     )
+
+    # 협상 의도 감지 — 비동기 (실패는 서비스 내부에서 흡수)
+    background_tasks.add_task(
+        process_message_for_negotiation,
+        message_id=message["id"],
+        room_id=room_id,
+        sender_id=current_user["id"],
+        content=data.content,
+    )
+
     return {"data": message}
+
+
+@router.patch(
+    "/messages/{message_id}/dismiss-draft-negotiation",
+    response_model=SuccessResponse[NegotiationDraftDismissResponse],
+)
+async def dismiss_message_draft_negotiation(
+    message_id: UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    """발신자 본인이 협상 초안 카드 [무시] 클릭 시 호출.
+
+    metadata.draft_negotiation.dismissed_at 을 NOW() 로 채운다 (멱등).
+
+    가드 (서비스 레이어):
+      - 메시지 존재 검증 → 없으면 404
+      - sender_id == current_user.id 검증 → 다르면 403
+      - draft_negotiation 자체 없으면 404
+    """
+    draft = await dismiss_draft_negotiation(
+        message_id=message_id,
+        user_id=current_user["id"],
+    )
+    return {
+        "data": {
+            "message_id": message_id,
+            "draft_negotiation": draft,
+        }
+    }
 
 
 @router.post("/rooms/{room_id}/read", status_code=204)
@@ -180,3 +234,26 @@ async def submit_counter_offer_via_chat(
         user=current_user,
     )
     return {"data": offer}
+
+
+@router.post(
+    "/draft",
+    response_model=SuccessResponse[ChatDraftResponse],
+)
+async def create_chat_draft(
+    payload: ChatDraftRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """채팅방 컨텍스트 기반 답장 초안 생성 (US-1, 2026-05-03).
+
+    - 입력창 `/초안 ...` 슬래시 명령에서 호출
+    - 메시지 DB 저장 안 함, 초안 텍스트만 반환
+    - 채팅방 참여자(seller/buyer)만 호출 가능 (draft_service 에서 검증)
+    - 컨텍스트: 연결된 주문 상세, 최근 20개 메시지, 상대방 정보
+    """
+    draft_text = await generate_chat_draft(
+        user_id=current_user["id"],
+        room_id=payload.room_id,
+        instruction=payload.instruction,
+    )
+    return {"data": {"draft": draft_text}}

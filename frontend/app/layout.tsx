@@ -3,7 +3,7 @@ import QueryProvider from '@/components/providers/QueryProvider';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'AgriFlow - 농산물 유통 B2B 플랫폼',
+  title: 'fresh link - 농산물 유통 B2B 플랫폼',
   description: '농산물 유통업 판매자와 구매자를 연결하는 B2B 업무 웹플랫폼',
 };
 

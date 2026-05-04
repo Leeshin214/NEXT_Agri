@@ -83,7 +83,7 @@ export default function Sidebar({ menus, currentPath, role }: SidebarProps) {
         <div className="flex h-16 items-center justify-center border-b border-gray-200 px-4">
           {expanded && (
             <Link href={role === 'SELLER' ? '/seller/dashboard' : '/buyer/dashboard'}>
-              <span className="text-xl font-bold text-primary-700">AgriFlow</span>
+              <span className="text-xl font-bold text-primary-700">fresh link</span>
             </Link>
           )}
         </div>

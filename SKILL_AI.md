@@ -14,9 +14,10 @@ OpenAI API 를 활용한 AI 업무 도우미 기능을 구현한다.
 |------|-----------|------|
 | 일반 대화 | POST /ai/chat | 프롬프트 자유 입력, 스트리밍 응답 |
 | 채팅 요약 | POST /ai/summarize-chat | 채팅 내용 요약 |
-| 메시지 초안 | POST /ai/draft-message | 상황에 맞는 메시지 초안 작성 |
+| 채팅 답장 초안 | POST /chat/draft | 채팅방 컨텍스트 기반 답장 본문 초안 (메시지 DB 저장 X). `services/draft_service.generate_chat_draft` |
 | 재고 분석 | POST /ai/inventory-alert | 재고 현황 분석 및 경고 |
 | 채팅 합의 감지 | agent_tools.analyze_chat_consensus | 채팅 메시지 → 합의/협상/거절/일반 분류, 합의 시 주문·캘린더 자동 생성 (AgenticPay) |
+| 채팅 협상 의도 감지 | services.negotiation_detection_service | 평문 메시지 → 품목/수량/단가 추출. confidence>=0.7 만 metadata.draft_negotiation 저장 + 발신자 본인에게만 WS push. **자동 등록 X** (사용자 [등록] 클릭 필수). |
 | 메인 오케스트레이터 | POST /ai/agent/chat | tool_use 기반 — DB 조회/수정 도구 자체 선택 |
 
 ---
@@ -431,6 +432,20 @@ export default function AIChatPanel() {
 
 ### 검증된 프롬프트 패턴
 
+#### 채팅창 가독성 — 마크다운 강조 절대 금지 (2026-05-03 추가)
+- AgriFlow AI 응답은 `frontend/components/chat/MessageBubble.tsx` 에서 **마크다운 렌더러 없이 순수 텍스트로** 표시됨 → `**굵게**` / `*기울임*` 같은 표기가 별표 그대로 노출되어 사용자 가독성을 해친다.
+- GPT-4o-mini 는 한국어 응답에서 디폴트로 마크다운 강조를 매우 자주 쓰므로, **시스템 프롬프트에 명시적으로 금지하지 않으면 무조건 별표가 들어간다.**
+- 적용한 위치 (orchestrator.py):
+  - `AGENT_BASE_SYSTEM` [핵심 대화 원칙] 7번 — SELLER/BUYER 양쪽 + response_node 까지 한 곳에서 커버 (가장 강력)
+  - `calendar_data_node` system_prompt — `(가독성)` 항목으로 한 줄 추가
+  - `calendar_reason_node` system_prompt — 추천 일정 자연어화 시점에서 한 줄 추가
+  - `response_node` 의 user 프롬프트 — tool 결과 요약 시 `JSON/코드 블록 금지` 옆에 마크다운 강조 금지도 같이 명시
+- 핵심 문구 패턴: "응답은 마크다운이 렌더링되지 않는 채팅창에 그대로 노출됩니다. `**굵게**`, `*기울임*` 같은 마크다운 강조와 표(`|`), 코드 블록(```), 헤더(`#`)는 절대 사용하지 마세요." → "왜 안 되는지(별표가 글자로 보임)" 함께 설명하면 LLM 준수율이 더 높음.
+- 표·코드블록·헤더도 같은 이유로 함께 금지 (한 번에 묶어서 끝).
+- 이모지는 사용자가 명시적으로 요청하지 않는 한 본문 사용 금지를 명시.
+- 이 가이드는 한 번 BASE 에 박아두면 SELLER 합성본·BUYER 합성본·response_node 요약까지 자동 적용된다 (`AGENT_SELLER_SYSTEM`/`AGENT_BUYER_SYSTEM` 가 BASE 를 합성하기 때문).
+- 주의: `inventory_order_node` 의 `final_text.replace("**", "")` 같은 후처리는 부분적으로만 동작 (오타 변수명 `fianl_text` 도 잔존) → 프롬프트 차원에서 막는 것이 정확함.
+
 #### TEA 방식 오케스트레이터 (orchestrator.py 실제 구조)
 ```
 orchestrator_node (tools 없음, response_format=json_object)
@@ -487,6 +502,21 @@ find_alternative_partners, get_user_profile
 - 권한 원칙(주문/상품 소유자 검증), 상품명 모호성 처리(조회 vs 삭제/수정 분기), 일정 중복 확인, 대체 거래처 추천 원칙을 프롬프트 섹션으로 분리 명시
 - CASE-4: create_order 성공 시 create_calendar_event 즉시 자동 연쇄 호출 → 납품일 캘린더 자동 등록
 
+#### send_chat_message needs_confirmation 응답 가이드 (2026-05-04 추가)
+- 도구가 후보 채팅방 2개 이상 매칭 시 `success: false, needs_confirmation: true, candidates: [...], message_preview: ...` 형태로 반환되며 메시지는 발송되지 않음. LLM이 이 결과를 받았을 때 "보냈습니다"라고 잘못 답변하지 않도록 두 곳에 가이드 박음:
+  - `AGENT_BASE_SYSTEM` 의 [채팅 메시지 발송 확인 가이드] 섹션 (라인 1007 근방, [주의사항] 직전) — SELLER/BUYER 합성본 양쪽 + response_node 까지 자동 반영. candidates 풀어쓰기 형식 예시, "1번"/"둘 다" 후속 응답 처리 규칙, fallback 발송 안내까지 포함.
+  - `chat_node` 시스템 프롬프트의 [needs_confirmation 응답 가이드] 섹션 (라인 1884 근방, [채팅방 선택 규칙] 직후) — chat intent 라우팅 시 이 노드가 send_chat_message 를 가장 자주 호출하므로 직접 명시.
+- 핵심 원칙: needs_confirmation: true 면 "메시지 보냈습니다" 절대 금지 → 후보를 자연어로 풀어 "(1) 옥수수 50kg 협상중 / (2) 옥수수 80kg 배송중 / 어느 방으로 보낼까요?" 형식으로 사용자에게 되묻기. 후속 응답에서 room_id 직접 지정 + 직전 message_preview 그대로 전달해 재호출.
+- ⚠️ 단락회로 버그 수정 완료 (2026-05-03): `chat_node` 의 라인 1943~1949 가 LLM 자연어 응답을 정리한 `final_text` 를 사용하지 않고 하드코딩 "요청하신 메시지를 해당 채팅방에 전송했습니다." 만 반환해 needs_confirmation 안내·"어느 방으로 보낼까요?" 같은 되묻기·LLM 의 사정 설명 응답을 모두 묵살하던 버그였음. `content = (choice.message.content or "").strip()` → `final_text = content.replace("**", "").replace("- [", "[")` → `final_response: final_text or "요청을 처리하지 못했습니다. 다시 한 번 말씀해 주세요."` 로 교체. None 가드, 마크다운 정리, 빈 응답 fallback 동시 처리. 라인 1928 의 단일 즉시 발송 성공 단락회로 (`tool_calls 안 + '"success": true'`) 는 의도적으로 유지 (정상 동작).
+- 단락회로 설계 원칙: tool_calls 가 **없는** finish_reason=="stop" 분기에서는 절대 하드코딩 메시지를 반환하지 말 것. LLM 이 도구 없이 자연어로만 응답하는 케이스 = 사용자에게 추가 정보를 묻거나 사정을 설명하는 케이스이므로 그 응답을 그대로 살려야 한다. 하드코딩 단락회로는 **tool 결과가 명확히 success=true 인 경우에만** 허용.
+- 가독성 일관성: 별표/표/헤더 금지 원칙 그대로 유지. f-string placeholder 추가 없음 (일반 한국어 본문만 추가) → format KeyError 위험 0.
+
+#### find_alternative_partners 트리거 강화 (2026-05-03)
+- 도구 본문은 이미 구현돼 있었지만 시스템 프롬프트에 호출 트리거가 없어 LLM이 거의 호출하지 않던 문제. AGENT_BASE_SYSTEM 에 [대체 거래처 추천 가이드] 섹션 신설(트리거 3종 + 카테고리 자동 매핑 + 결과 풀어쓰기 원칙) → SELLER/BUYER 양쪽 합성본에 자동 반영.
+- BASE 안에 `{role_label_short}` placeholder 추가 → `_SELLER_ROLE_VARS`/`_BUYER_ROLE_VARS` 에 "SELLER"/"BUYER" 매핑 신설. role_label_short 가 누락되면 format KeyError 가 나므로 BASE 에 새 placeholder 를 넣을 때는 두 ROLE_VARS 모두 동시 업데이트 필수.
+- 역할별 미세 차이는 ROLE_APPENDIX 에서 분리: SELLER 는 "신규 구매자 발굴" 트리거(거래 끊긴 곳 대체), BUYER 는 "대체 공급처 추천" 트리거(평소 거래처 협상 결렬·납품일 충돌·재고 부족). 도구 시그니처 동일 — role 인자만 다르게.
+- BUYER 모드 case2 가 "재고 부족 무조건 수용"이라 자체 재고 부족 트리거는 약하므로, 평소 거래처와 협상 결렬·가격 안 맞음·납품일 충돌 같은 외부 컨텍스트를 트리거로 명시해야 실제 호출이 일어남.
+
 #### 새 tool 함수 패턴
 - `open_chat_room`: chat_rooms 테이블 직접 조회, 양방향 검색(자신의 role에 따라 seller_id/buyer_id 배치)
 - `get_calendar_events`: `calendar.monthrange(year, month)[1]`로 말일 계산, `.is_("deleted_at", None)` 패턴 준수
@@ -522,3 +552,18 @@ find_alternative_partners, get_user_profile
 - consensus 후속 처리(`_handle_consensus`) 내부도 각 단계별 try/except — product 미매칭 시 주문 스킵 후 시스템 메시지만 broadcast
 - rejected 후속 처리(`_handle_rejected`) — `_infer_category(product_name)` 헬퍼로 카테고리 추론, 매칭 실패 시 "VEGETABLE" 기본값
 - `last_analysis` 인메모리 dict는 서버 재시작 시 초기화 — 의도된 동작, 영속성 불필요
+
+#### negotiation_detection_service 구현 패턴 (US-2, 2026-05-04)
+- `analyze_chat_consensus` 와 다르게 **비동기 async 함수** + `get_openai_client()` 사용 — `BackgroundTasks` 가 동일 이벤트 루프에서 실행되므로 await 가능 (asyncio.to_thread 래핑 불필요).
+- POST `/chat/rooms/{room_id}/messages` 라우터에서 `BackgroundTasks.add_task(process_message_for_negotiation, ...)` 로 전달 → 응답 시간에 영향 X.
+- `response_format={"type": "json_object"}` + `temperature=0.0` + `max_tokens=200` → 토큰 절약 + 결정적 출력.
+- 시스템 프롬프트 핵심: "B2B 농산물 채팅에서 가격 협상 의도 감지", confidence 가이드 명시 (셋 다 명확하면 0.85+, 둘만 있으면 0.6 이하, 잡담 0.2 이하), few-shot 예시 (옥수수 50kg 7만원 → 0.9 / 안녕하세요 → 0.0) 포함.
+- `room_context` 에 (있으면) 연결 주문의 상품 후보를 채워넣어 LLM 추론 가이드. order_id 없으면 빈 리스트.
+- `_normalize_detection_result` 가 LLM 출력을 강제 정규화 — 음수/0/문자열 콤마 단가 등 모두 안전 처리. 의미 없는 감지(product_name + quantity + unit_price 모두 None)는 None 반환해 호출 측에서 즉시 skip.
+- WS push 는 `manager.send_private_message(sender_id, payload)` — 채팅방 broadcast 가 아니므로 상대방은 절대 못 봄. 동일 user 다중 탭 모두 받음.
+- 모든 예외는 try/except 로 흡수 — `process_message_for_negotiation` 외부에서 raise 가 발생해도 chat 흐름이 안 막히도록.
+
+#### detect vs consensus 분리 정책 (검증된 설계)
+- `analyze_chat_consensus` (chat_ws.py 안에서 호출) — 합의/거절 감지 시 **자동으로** 주문 INSERT + 캘린더 등록 + 시스템 메시지 broadcast.
+- `negotiation_detection_service` (chat.py 라우터에서 호출) — 단순 협상 의도 감지 + metadata 저장 + 본인에게만 알림 → **사용자 [등록] 클릭 시에만** propose_counter_offer 호출.
+- 두 흐름은 동시 동작 가능 (한 메시지가 협상 의도 + 합의 양쪽 트리거 가능). consensus 가 먼저 자동 주문을 만들어도 draft_negotiation 은 별도 metadata 키라 충돌 없음.

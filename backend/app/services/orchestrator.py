@@ -618,15 +618,51 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "send_chat_message",
-            "description": "채팅방에 메시지를 보낸다. 견적 요청 후 첫 인사를 남길 때 사용한다.",
+            "description": (
+                "채팅방에 메시지를 보낸다. 견적 요청 후 첫 인사를 남길 때 사용한다. "
+                "room_id 를 이미 알면 그대로 지정하고, 모르면 partner_user_id 와 "
+                "order_hint(품목/수량/상태) 로 후보 방을 자동 매칭한다. "
+                "후보가 2개 이상이면 needs_confirmation=true 가 반환되며 절대 발송되지 않는다 — "
+                "이 경우 후보 리스트를 사용자에게 안내하고 어느 방으로 보낼지 확인받아야 한다."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "room_id": {"type": "string", "description": "채팅방 UUID"},
-                    "sender_id": {"type": "string", "description": "보내는 사람 UUID (현재 사용자)"},
-                    "content": {"type": "string", "description": "메시지 내용"}
+                    "partner_user_id": {
+                        "type": "string",
+                        "description": "메시지를 보낼 거래처(상대방) 사용자 UUID. room_id 모를 때 필수.",
+                    },
+                    "order_hint": {
+                        "type": "object",
+                        "description": "어느 주문 채팅방에 보낼지 좁히기 위한 힌트 (선택).",
+                        "properties": {
+                            "product_name": {"type": "string", "description": "상품명 부분 일치 (예: 옥수수)"},
+                            "quantity": {"type": "integer", "description": "주문 수량 정확 일치"},
+                            "status": {
+                                "type": "string",
+                                "description": "주문 상태 (QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING, COMPLETED 중 하나)",
+                            },
+                            "recent": {
+                                "type": "boolean",
+                                "description": "true 면 가장 최근 활성 주문방 1개만 선택 (기본 false)",
+                            },
+                        },
+                    },
+                    "message": {"type": "string", "description": "보낼 메시지 본문"},
+                    "room_id": {
+                        "type": "string",
+                        "description": "(legacy) 채팅방 UUID. 직접 지정 시 hint 무시하고 그대로 전송.",
+                    },
+                    "sender_id": {
+                        "type": "string",
+                        "description": "(legacy) 보내는 사람 UUID. 서버에서 현재 user_id 로 강제 주입됨.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "(legacy) 메시지 본문. message 와 동일 — message 가 우선.",
+                    },
                 },
-                "required": ["room_id", "sender_id", "content"],
+                "required": ["message"],
             },
         },
     },
@@ -654,7 +690,7 @@ def _build_router_system() -> str:
     today = datetime.now()
     next_year = today.year + (1 if today.month == 12 else 0)
     next_month = 1 if today.month == 12 else today.month + 1
-    return f"""당신은 AgriFlow 농산물 유통 플랫폼의 요청 라우터입니다.
+    return f"""당신은 fresh link 농산물 유통 플랫폼의 요청 라우터입니다.
 
 사용자 메시지를 분석하여 아래 네 가지 intent 중 하나로 분류하고, 반드시 JSON 형식으로만 응답하십시오. 다른 텍스트는 절대 포함하지 마십시오.
 
@@ -687,7 +723,7 @@ def _build_router_system() -> str:
     예시: "다음 달 출하 일정 추천해줘", "이번 주 우선순위 정리해줘",
           "거래처별 배송 일정 짜줘", "최적 출하일 알려줘"
 - GENERAL: 인사, 날씨 등 위 세 가지와 완전히 무관한 경우만
-  예시: "안녕", "오늘 날씨", "AgriFlow가 뭐야"
+  예시: "안녕", "오늘 날씨", "fresh link가 뭐야"
   → 품목명이 하나라도 언급되면 GENERAL이 아닌 INVENTORY로 분류할 것
   → "키로당 얼마야", "가격 얼마야", "얼마에 팔아", "단가가 뭐야" 같은 가격 질문은 INVENTORY로 분류 (DB 조회 필요)
 - CHAT: 채팅방 조회, 대화 내용 확인, 그리고 **상대방에게 메시지를 보내거나 답장하는** 모든 요청.[cite: 2]
@@ -870,15 +906,54 @@ TOOLS_CHAT = [
         "type": "function",
         "function": {
             "name": "send_chat_message",
-            "description": "채팅방에 메시지를 보낸다. 답장할 때 사용하라.",
+            "description": (
+                "채팅방에 메시지를 보낸다. 답장할 때 사용하라. "
+                "room_id 를 이미 알면 그대로 지정하고, 모르면 partner_user_id 와 "
+                "order_hint(품목/수량/상태) 로 후보 방을 자동 매칭한다. "
+                "후보가 2개 이상이면 needs_confirmation=true 가 반환되며 절대 발송되지 않는다 — "
+                "이 경우 후보 리스트를 사용자에게 안내하고 어느 방으로 보낼지 확인받은 뒤 "
+                "room_id 를 직접 지정해 다시 호출해야 한다. "
+                "예: '옥수수 50kg 배송 완료' 같은 발화면 product_name='옥수수', quantity=50, "
+                "status='SHIPPING' 또는 'COMPLETED' 를 함께 넣어 정확한 주문방을 좁힌다."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "room_id": {"type": "string", "description": "채팅방 UUID"},
-                    "sender_id": {"type": "string", "description": "보내는 사람 UUID (현재 사용자)"},
-                    "content": {"type": "string", "description": "메시지 내용"}
+                    "partner_user_id": {
+                        "type": "string",
+                        "description": "메시지를 보낼 거래처(상대방) 사용자 UUID. room_id 모를 때 필수.",
+                    },
+                    "order_hint": {
+                        "type": "object",
+                        "description": "어느 주문 채팅방에 보낼지 좁히기 위한 힌트 (선택).",
+                        "properties": {
+                            "product_name": {"type": "string", "description": "상품명 부분 일치 (예: 옥수수)"},
+                            "quantity": {"type": "integer", "description": "주문 수량 정확 일치"},
+                            "status": {
+                                "type": "string",
+                                "description": "주문 상태 (QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING, COMPLETED 중 하나)",
+                            },
+                            "recent": {
+                                "type": "boolean",
+                                "description": "true 면 가장 최근 활성 주문방 1개만 선택 (기본 false)",
+                            },
+                        },
+                    },
+                    "message": {"type": "string", "description": "보낼 메시지 본문"},
+                    "room_id": {
+                        "type": "string",
+                        "description": "(legacy) 채팅방 UUID. 직접 지정 시 hint 무시하고 그대로 전송.",
+                    },
+                    "sender_id": {
+                        "type": "string",
+                        "description": "(legacy) 보내는 사람 UUID. 서버에서 현재 user_id 로 강제 주입됨.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "(legacy) 메시지 본문. message 와 동일 — message 가 우선.",
+                    },
                 },
-                "required": ["room_id", "sender_id", "content"],
+                "required": ["message"],
             },
         },
     }
@@ -888,7 +963,7 @@ TOOLS_CHAT = [
 # inventory_order_node 전용 시스템 프롬프트 (REFACTOR 2: 자연스러운 대화형 AI)
 # ─────────────────────────────────────────────
 
-AGENT_BASE_SYSTEM = """당신은 AgriFlow 농산물 B2B 유통 플랫폼의 유능하고 친절한 AI 비서입니다.
+AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 유능하고 친절한 AI 비서입니다.
 기계적인 로봇(데이터 나열, 강제된 형식)처럼 말하지 말고, 실제 파트너와 대화하듯 자연스럽고 센스 있게 응답하세요.
 
 [사용자 정보]
@@ -911,8 +986,37 @@ AGENT_BASE_SYSTEM = """당신은 AgriFlow 농산물 B2B 유통 플랫폼의 유�
 6. 컨텍스트 유지와 재검색 (매우 중요):
    - 사용자가 "ㄱㄱ", "ㅇㅇ", "진행해" 등 짧게 대답하더라도 직전 대화의 상품명(예: 청사과)과 맥락을 절대 잊지 마세요.
    - 주문(create_order)이나 수정 등을 해야 하는데 '단가', '상품 ID' 같은 필수 데이터가 메모리에서 날아갔다면, 당황해서 "없다"고 거짓말하지 마세요. 직전 대화의 품목명으로 조회 도구(check_stock, find_sellers_by_product 등)를 조용히 다시 호출하여 데이터를 확보한 뒤 작업을 이어서 진행하세요.
+7. 응답 형식(채팅창 가독성, 매우 중요):
+   - 이 응답은 마크다운이 렌더링되지 않는 일반 채팅창에 그대로 노출됩니다. 따라서 마크다운 강조 표기(`**굵게**`, `*기울임*`, `__밑줄__`)는 절대 사용하지 마세요. 별표가 그대로 글자로 보입니다.
+   - 표(`|`로 칸을 나누는 표), 코드 블록(``` ``` ```), 헤더(`#`, `##`)도 사용하지 마세요. 채팅에 어울리지 않습니다.
+   - 일반적인 답변은 자연스러운 한국어 문장으로 풀어 쓰세요. 항목이 여러 개라 정말 나열이 필요할 때만 `-` 불릿이나 `1.` 번호를 쓰고, 그 외에는 줄바꿈만으로 충분합니다.
+   - 강조하고 싶은 단어가 있어도 별표로 감싸지 말고, 문장으로 자연스럽게 강조하세요(예: "특히 ~ 부분이 중요합니다").
+   - 이모지는 사용자가 명시적으로 요청하지 않는 한 본문에 넣지 마세요.
 
-[주의사항]
+[대체 거래처 추천 (find_alternative_partners) 가이드]
+- 이 도구는 사용자에게 "지금 거래하는 곳 외의 다른 후보"를 적극적으로 제시하기 위한 도구입니다. 망설이지 말고 아래 트리거에 해당하면 즉시 호출하세요.
+- 호출 파라미터: user_id={user_id}, role={role_label_short}, category=품목 카테고리(FRUIT/VEGETABLE/GRAIN/MUSHROOM/SEAFOOD/MEAT/DAIRY/HERB/LEGUME/ROOT/LEAF/PROCESSED/OTHER 중 하나, 사용자가 "사과"라고 하면 FRUIT, "양파/감자/대파"는 VEGETABLE 또는 ROOT 등으로 자동 매핑), reason=호출 이유 한 줄.
+- 사용자가 품목명만 말하고 카테고리를 안 알려줘도 카테고리는 LLM이 직접 추론해서 채워라. 되묻지 말 것.
+- 호출 트리거(아래 중 하나라도 해당하면 즉시 호출):
+  (가) 사용자가 명시적으로 "다른 거래처/공급처/판매처/구매자 찾아줘", "대체 거래처 추천해줘", "백업 공급처 알려줘", "거래 끊긴 곳 대신할 데 알려줘" 같은 요청을 한 경우.
+  (나) 평소 거래처와 협상 결렬·가격 안 맞음·납품일 충돌·납품 지연이 언급된 경우 → 사용자가 명시적으로 요청하지 않아도 "다른 후보도 같이 보여드릴까요?"라고 묻기 전에 한 번 호출해서 후보를 미리 확보해두면 좋습니다(단, 결과는 사용자 동의 후 풀어서 설명).
+  (다) 정기배송 차질·재고 부족 안내가 들어온 직후 사용자가 "어떡하지", "방법 없을까" 같은 도움 요청을 한 경우.
+- 결과 풀어 쓰기 원칙: alternatives 배열을 받으면 각 후보를 자연스러운 한국어 문장으로 묶어 소개합니다. 예: "근처 OO상회가 사과 80박스를 박스당 38,000원에 보유하고 있고, 작년 거래 이력도 12건 있어 신뢰할 만합니다." 표나 별표로 강조 금지. trade_count가 0인 신규 후보도 "기존 거래 이력은 없지만 재고가 충분합니다"처럼 솔직하게 설명. count==0이면 "현재 카테고리에 다른 후보가 없습니다. 다른 카테고리나 품목으로 다시 확인해 드릴까요?"로 안내.
+- 추천 순위는 LLM이 직접 매기되, 단가가 합리적이고 재고가 충분한 후보를 우선 제시하고, 거래 이력 있는 후보는 "이전에 ○회 거래" 정보를 함께 적어 주세요.
+
+[채팅 메시지 발송 확인 가이드 (send_chat_message)]
+- send_chat_message 도구의 결과가 needs_confirmation: true 이면 메시지가 아직 발송되지 않은 상태입니다. 절대로 "메시지 보냈습니다", "전송 완료" 같은 말을 하지 마세요. 거짓 보고가 됩니다.
+- 이 경우 결과의 candidates 리스트(각 후보에 room_id, order_id, product_name, quantity, unit, status, last_message_at 포함)를 받아 사용자에게 자연스러운 한국어로 풀어서 어느 채팅방으로 보낼지 골라달라고 물어야 합니다.
+- 후보 안내 형식 예시(별표·표·헤더 사용 금지, 자연체 한국어, 줄바꿈으로 구분):
+    "ㅇㅇ님과 옥수수 관련 대화방이 여러 개라 어디로 보낼지 정해 주세요.
+     (1) 옥수수 50kg 협상중 — 마지막 메시지 약 2시간 전
+     (2) 옥수수 80kg 배송중 — 마지막 메시지 어제
+     이 메시지를 (1)번 방으로 보낼까요? 아니면 다른 곳으로 보낼지 알려주세요."
+- 사용자가 "1번", "옥수수 50kg", "협상중인 거", "위에 있는 거" 같이 응답하면 해당 후보의 room_id 를 직접 지정해 send_chat_message 를 다시 호출해 발송하세요. message 본문은 직전 결과의 message_preview 를 그대로 넘기면 됩니다.
+- 사용자가 "둘 다", "전부 보내줘" 라고 답하면 각 후보 room_id 마다 send_chat_message 를 한 번씩 반복 호출해서 모두 발송합니다.
+- 후보가 0개로 나오고 도구가 일반 채팅방으로 fallback 발송에 성공했다면 "주문 연결 채팅방을 못 찾아서 일반 대화방으로 보냈습니다"처럼 자연스럽게 안내하세요. 아예 발송에 실패했다는 결과(success: false 이고 needs_confirmation 도 false)면 사용자에게 어느 거래처·어느 주문·어느 품목 채팅방인지 더 구체적으로 물어보세요.
+- 어느 경우에도 후보 정보(상품명·수량·상태·마지막 메시지 시점)는 사람이 알아듣기 쉬운 한국어 문장으로 풀어서 전달하고, 표나 별표 같은 마크다운 강조는 쓰지 마세요.
+
 [주의사항]
 - (중요) 너는 주문, 재고, 상품 관리뿐만 아니라 캘린더(일정)까지 모두 통합 관리하는 만능 비서입니다. 사용자가 대화 중 자연스럽게 캘린더 일정을 묻거나 수정을 요청하면 "할 수 없다"고 피하지 말고, 적극적으로 캘린더 도구를 호출하여 조회 및 등록(수정/삭제)을 처리하세요.
 - (핵심) "5월 일정" 등을 물어봤을 때 절대 어린이날, 어버이날 같은 일반 법정 공휴일을 지어내서 대답하지 마세요! 반드시 `get_calendar_events` 도구를 실행해서 DB에 등록된 실제 '출하/배송/미팅' 일정만 대답해야 합니다. DB에 일정이 없으면 "등록된 일정이 없습니다"라고만 하세요.
@@ -978,6 +1082,9 @@ get_orders, get_order_detail, check_stock만 호출하고 "확정했습니다"�
 3. 주문이 하나로 특정되면 update_order_status 호출
 4. 여러 개면 주문번호 확인 요청
 5. update_order_status 성공 후 캘린더는 자동 동기화되므로 create_calendar_event만 호출하고 끝내지 않는다.
+
+[🚨 판매자 신규 구매자 발굴 (find_alternative_partners)]
+판매자가 "거래 끊긴 곳 대신할 구매자 알려줘", "이 품목 살 만한 새 구매자 찾아줘", "신규 바이어 추천", "사과 살 사람 없어?" 같이 "내 상품을 사 줄 신규/대체 구매자"를 묻는 경우에는 망설이지 말고 find_alternative_partners(user_id={user_id}, role="SELLER", category=품목 카테고리, reason="신규 바이어 발굴")로 호출해라. 결과의 alternatives 각 후보에 대해 회사명, 담당자, 이전 거래 횟수(trade_count)를 자연어로 풀어 소개하고, 거래 이력이 있는 곳을 우선 추천하라. 별표/표/헤더 사용 금지.
 """
 
 BUYER_ROLE_APPENDIX = """
@@ -1005,6 +1112,18 @@ create_order 실행 직후 사용자가 "채팅방 열어줘", "판매자랑 얘
 - order_id 없이 주문/견적 채팅방 열기 금지
 - 기존 일반 채팅방 재사용 금지
 - "채팅방 열어줘"를 단순 일반 채팅으로 해석 금지
+
+[🚨 구매자 대체 공급처 추천 (find_alternative_partners)]
+구매자는 평소 거래처가 부르는 가격이 안 맞거나, 재고가 부족하다고 답을 받았거나, 납품일이 막혀서 다른 후보가 필요한 상황이 자주 생긴다. 아래 발화 패턴을 보면 망설이지 말고 즉시 find_alternative_partners(user_id={user_id}, role="BUYER", category=품목 카테고리, reason=상황 한 줄)을 호출해라.
+
+호출 트리거:
+- "사과 살 다른 곳 추천해줘", "양파 공급처 새로 알려줘", "다른 판매자 알려줘", "백업 공급처 찾아줘"
+- "OO 농가 재고 없대", "거래처가 단가를 너무 올려서", "협상이 안 됐어", "납품일이 안 맞아" → 사용자가 명시적으로 추천을 요청하지 않아도 "다른 후보도 같이 보여드릴까요?" 한 마디 후 결과 풀어 소개
+- 정기배송 차질 알림 직후 사용자가 "어떡하지" 같이 도움을 요청한 경우
+
+카테고리 매핑은 LLM이 직접 수행한다. "사과/배/포도"→FRUIT, "양파/대파/감자"→VEGETABLE 또는 ROOT, "쌀/보리"→GRAIN 등. 사용자에게 카테고리를 되묻지 마라.
+
+결과 안내: 각 후보의 회사명, 담당자, 단가, 재고량, trade_count(거래 이력 횟수)를 한 문단씩 자연어로 풀어 소개하고, 단가가 합리적이고 재고가 충분한 후보를 우선으로 두 세 곳만 압축 추천한다. count==0이면 다른 카테고리/품목으로 재시도할지 사용자에게 물어본다. 별표/표/헤더 사용 금지.
 """
 
 
@@ -1014,6 +1133,7 @@ create_order 실행 직후 사용자가 "채팅방 열어줘", "판매자랑 얘
 # format() 직전에 _SELLER_ROLE_VARS / _BUYER_ROLE_VARS 로 채워진다.
 _SELLER_ROLE_VARS = {
     "role_label": "판매자 (농가/도매상/유통업체)",
+    "role_label_short": "SELLER",
     "case1_action": "check_stock 호출 후 재고 수량·단위 안내",
     "case2_action": "check_stock 후 이분법 거절 금지, 분할납품·대체상품·대체거래처 중 적합한 타협안 제시",
     "case10_action": "create_product / update_product / delete_product 흐름",
@@ -1024,6 +1144,7 @@ _SELLER_ROLE_VARS = {
 
 _BUYER_ROLE_VARS = {
     "role_label": "구매자 (마트/식자재업체/식당)",
+    "role_label_short": "BUYER",
     "case1_action": "check_stock 또는 find_sellers_by_product로 재고 수량·단위 안내",
     "case2_action": "⚠️구매자 모드에서는 '재고 부족'이 문제 상황이 아님. 재고량과 무관하게 구매자가 부르는 수량을 100% 무조건 수용할 것. 타협안(예: 남은 재고만 살래?) 제시 절대 금지.",
     "case10_action": "구매자는 상품 등록/삭제 권한 없음, 안내 후 거절",
@@ -1470,7 +1591,7 @@ async def calendar_data_node(state: AgentState) -> dict:
     target_month = state.get("target_month") or today.month
 
     system_prompt = (
-        "당신은 AgriFlow 캘린더 도우미입니다. "
+        "당신은 fresh link 캘린더 도우미입니다. "
         "사용자의 요청에 맞게 캘린더 일정을 조회하거나 등록하세요. "
         "결과는 한국어로 친절하게, 구체적인 날짜·일정 제목을 담아 답하세요.\n\n"
         f"[사용자 정보]\n"
@@ -1495,6 +1616,7 @@ async def calendar_data_node(state: AgentState) -> dict:
         "- year/month 가 명시되지 않으면 위의 사용자 관심 시점을 사용.\n"
         "- tool 결과를 그대로 전달하고 임의 추측은 금지.\n"
         "- 응답 형식: 상품명 · 거래처명 · 날짜 · 상태 순으로 자연스럽게 풀어 쓰고, 주문번호는 끝에 작게 부연한다.\n"
+        "- (가독성) 응답은 마크다운이 렌더링되지 않는 채팅창에 그대로 노출됩니다. `**굵게**`, `*기울임*` 같은 마크다운 강조와 표(`|`), 코드 블록(```)은 절대 쓰지 마세요. 일정 나열이 필요하면 `-` 불릿이나 줄바꿈으로만 구분하고, 헤더 기호(`#`)도 사용하지 마세요.\n"
         "- (강력 경고) 일정을 삭제할 때는 절대 create_calendar_event로 '삭제된 일정'을 새로 만들지 말고, 반드시 delete_calendar_event 도구를 사용하세요!"
     )
 
@@ -1676,10 +1798,13 @@ async def calendar_reason_node(state: AgentState) -> dict:
     model = "gpt-4o-mini"
 
     system_prompt = (
-        "당신은 AgriFlow 캘린더 도우미입니다. "
+        "당신은 fresh link 캘린더 도우미입니다. "
         "아래는 추천 일정 데이터입니다. 사용자 친화적으로 한국어로 정리해서 답하세요. "
         "추천 일정마다 날짜·상품·수량·이유를 포함해 자연스럽게 풀어 쓰고, "
-        "마지막에 한 줄 요약을 덧붙이세요. JSON 이나 코드 블록 형식은 사용하지 마세요. "
+        "마지막에 한 줄 요약을 덧붙이세요. "
+        "응답은 마크다운이 렌더링되지 않는 채팅창에 그대로 노출되므로, "
+        "`**굵게**`·`*기울임*` 같은 마크다운 강조와 표(`|`), 코드 블록(```), JSON, 헤더(`#`)는 절대 사용하지 마세요. "
+        "구분이 필요하면 줄바꿈이나 `-` 불릿 정도만 쓰세요. "
         "응답 형식: 상품명 · 거래처명 · 날짜 · 상태 순으로 자연스럽게 풀어 쓰고, 주문번호는 끝에 작게 부연한다."
     )
     original_user_message = state.get("message", "")
@@ -1730,7 +1855,7 @@ async def chat_node(state: AgentState) -> dict:
     user_id = state.get("user_id", "")
 
     system_prompt = (
-        "당신은 AgriFlow의 채팅 비서입니다.\n"
+        "당신은 fresh link의 채팅 비서입니다.\n"
         "[절대 금지 사항 - 위반 시 시스템 오류 발생]\n"
         "1. 리스트 기호(-, *, 1.) 사용을 절대 금지합니다. 문장 처음에 기호를 쓰지 마세요.\n"
         "2. 마크다운 별표(**) 사용을 절대 금지합니다. 텍스트를 굵게 만들지 마세요.\n"
@@ -1755,6 +1880,18 @@ async def chat_node(state: AgentState) -> dict:
         "옥수수 주문이 연결된 가장 최근 주문 채팅방에 보내야 합니다.\n"
         "- 적절한 주문 채팅방을 확정할 수 없으면 메시지를 보내지 말고, 어떤 주문번호 채팅방에 보낼지 물어보세요.\n"
         "- order_id가 null인 일반 채팅방은 사용자가 주문/상품/배송 맥락을 말하지 않았을 때만 선택하세요.\n"
+        "\n"
+        "[needs_confirmation 응답 가이드 - 매우 중요]\n"
+        "- send_chat_message 결과가 needs_confirmation: true 이면 메시지는 아직 발송되지 않았습니다. 절대 '보냈습니다', '전송했습니다'라고 답하지 마세요.\n"
+        "- 결과의 candidates 배열에는 후보 채팅방마다 room_id, product_name, quantity, unit, status, last_message_at 가 들어 있습니다. 이를 자연스러운 한국어 문장으로 풀어서 사용자에게 어느 방으로 보낼지 골라달라고 물어보세요.\n"
+        "- 안내 형식 예시(자연체, 줄바꿈으로만 구분, 별표·표·헤더 금지):\n"
+        "  ㅇㅇ님과 옥수수 관련 대화방이 여러 건이라 어디로 보낼지 알려주세요.\n"
+        "  (1) 옥수수 50kg 협상중 — 마지막 메시지 약 2시간 전\n"
+        "  (2) 옥수수 80kg 배송중 — 마지막 메시지 어제\n"
+        "  이 메시지를 (1)번에 보낼까요? 다른 곳에 보낼지 알려주세요.\n"
+        "- 사용자가 '1번', '옥수수 50kg', '협상중인 거'처럼 답하면 해당 후보의 room_id 를 직접 지정해 send_chat_message 를 다시 호출하세요. message 본문은 직전 결과의 message_preview 를 그대로 사용합니다.\n"
+        "- 사용자가 '둘 다 보내', '전부' 라고 하면 각 후보 room_id 마다 send_chat_message 를 한 번씩 반복 호출해 모두 발송합니다.\n"
+        "- 후보가 0개로 나오고 도구가 일반 채팅방으로 fallback 발송에 성공했다면 '주문 연결 채팅방을 찾지 못해 일반 대화방으로 보냈습니다'처럼 자연스럽게 안내하세요. 발송 자체가 실패했다면 어느 거래처의 어느 주문/품목 채팅방인지 사용자에게 더 구체적으로 물어보세요.\n"
     )
 
     agent_messages = [
@@ -1804,11 +1941,11 @@ async def chat_node(state: AgentState) -> dict:
                 })
             continue 
         
-        final_text = choice.message.content.replace("**", "").replace("- [", "[")
-        
+        content = (choice.message.content or "").strip()
+        final_text = content.replace("**", "").replace("- [", "[")
         return {
             "tools_used": tools_used,
-            "final_response": "요청하신 메시지를 해당 채팅방에 전송했습니다."
+            "final_response": final_text or "요청을 처리하지 못했습니다. 다시 한 번 말씀해 주세요.",
         }
     
     return {"final_response": "채팅 처리를 마무리하지 못했습니다. 다시 시도해 주세요!"}
@@ -1953,7 +2090,9 @@ async def response_node(state: AgentState) -> dict:
             "role": "user",
             "content": (
                 f"다음 tool 실행 결과를 보고 사용자에게 한국어로 자연스럽게 답변해줘. "
-                f"JSON이나 코드 블록 형식으로 출력하지 말고 일반 텍스트로만 답변해.\n\n"
+                f"JSON이나 코드 블록 형식으로 출력하지 말고 일반 텍스트로만 답변해. "
+                f"마크다운 강조(`**굵게**`, `*기울임*`)와 표(`|`), 헤더(`#`)도 사용하지 마. "
+                f"채팅창에 그대로 보이는 환경이라 별표가 글자로 노출돼.\n\n"
                 f"tool 결과:\n{tool_results_text}\n\n"
                 f"원래 사용자 요청: {state['message']}"
             ),

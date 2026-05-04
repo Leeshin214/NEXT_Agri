@@ -8,8 +8,9 @@ import {
 import { useAuthStore } from '@/store/authStore';
 import StatusBadge from '@/components/common/StatusBadge';
 import DeliveryDateChangeCard from '@/components/chat/DeliveryDateChangeCard';
+import NegotiationDraftCard from '@/components/chat/NegotiationDraftCard';
 import { cn } from '@/lib/utils';
-import type { Message, MessageMetadata } from '@/types';
+import type { Message, MessageMetadata, NegotiationDraft } from '@/types';
 
 interface MessageBubbleProps {
   message: Message;
@@ -24,6 +25,16 @@ interface MessageBubbleProps {
    * 무관하게 일관된 판별이 가능하다.
    */
   currentUserId?: string;
+  /**
+   * US-2 협상 의도 감지 카드 [등록] 클릭 핸들러.
+   * 본인 발신 TEXT 메시지에 metadata.draft_negotiation 이 있을 때만 카드가 렌더되며,
+   * 클릭 시 부모(채팅 페이지)가 PriceOfferPopover 를 prefill 한 채로 연다.
+   */
+  onAcceptNegotiationDraft?: (draft: NegotiationDraft) => void;
+  /** US-2 협상 의도 감지 카드 [무시] 클릭 핸들러 (PATCH dismiss API) */
+  onDismissNegotiationDraft?: (messageId: string) => void;
+  /** dismiss API 진행 중 표시용 (선택) */
+  isDismissingNegotiationDraft?: boolean;
 }
 
 const ROLE_LABEL: Record<'SELLER' | 'BUYER', string> = {
@@ -42,7 +53,13 @@ function formatAmount(amount: number | undefined | null): string {
  * 본인/상대 판별: currentUserId(prop) → useAuthStore.user.id 순으로 우선.
  * (metadata.from_role 만으로는 같은 역할 두 사용자를 구분하지 못함)
  */
-export default function MessageBubble({ message, currentUserId }: MessageBubbleProps) {
+export default function MessageBubble({
+  message,
+  currentUserId,
+  onAcceptNegotiationDraft,
+  onDismissNegotiationDraft,
+  isDismissingNegotiationDraft,
+}: MessageBubbleProps) {
   const { user } = useAuthStore();
   const effectiveUserId = currentUserId ?? user?.id;
   const isMine = !!effectiveUserId && message.sender_id === effectiveUserId;
@@ -96,8 +113,35 @@ export default function MessageBubble({ message, currentUserId }: MessageBubbleP
       );
 
     case 'TEXT':
-    default:
-      return <TextBubble content={message.content} isMine={isMine} />;
+    default: {
+      // US-2: 본인 발신 + draft_negotiation 존재 + 미dismiss 면 협상 감지 카드 렌더.
+      // 백엔드도 막지만 프론트도 isMine 가드 (상대 메시지엔 절대 표시 안 함).
+      const draft = metadata.draft_negotiation;
+      const showDraftCard =
+        isMine &&
+        !!draft &&
+        !draft.dismissed_at &&
+        !!onAcceptNegotiationDraft &&
+        !!onDismissNegotiationDraft;
+
+      return (
+        <div className="space-y-1">
+          <TextBubble content={message.content} isMine={isMine} />
+          {showDraftCard &&
+            draft &&
+            onAcceptNegotiationDraft &&
+            onDismissNegotiationDraft && (
+              <NegotiationDraftCard
+                messageId={message.id}
+                draft={draft}
+                onAccept={onAcceptNegotiationDraft}
+                onDismiss={onDismissNegotiationDraft}
+                isDismissing={isDismissingNegotiationDraft}
+              />
+            )}
+        </div>
+      );
+    }
   }
 }
 

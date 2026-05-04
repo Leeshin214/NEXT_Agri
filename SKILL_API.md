@@ -48,7 +48,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 
-app = FastAPI(title="AgriFlow API", version="1.0.0")
+app = FastAPI(title="fresh link API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -277,6 +277,52 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 #   - 본인이 제시한 PENDING 은 본인이 accept/reject 불가 (상대방만)
 #   - 신규 제시 시 같은 주문의 이전 PENDING 은 모두 SUPERSEDED 마킹
 #     + messages.metadata.status 도 동기화 (negotiation 패턴과 동일)
+```
+
+### chat.py (채팅 API)
+```python
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+# GET    /chat/rooms                              - 내 채팅방 목록
+# POST   /chat/rooms                              - 채팅방 생성 (or 기존 반환)
+# GET    /chat/rooms/{room_id}/messages           - 메시지 목록 (limit, before)
+# POST   /chat/rooms/{room_id}/messages           - 메시지 전송 (REST, 보통 WS 사용)
+# POST   /chat/rooms/{room_id}/read               - 읽음 처리
+# POST   /chat/rooms/{room_id}/counter-offer      - 채팅방 연결 주문에 협상가 제시
+#
+# AI 답장 초안 (US-1, 2026-05-03)
+# POST   /chat/draft
+#   Body: { room_id: UUID, instruction: str (1~500) }
+#   응답: { data: { draft: str } }
+#   특징:
+#     - 메시지 DB INSERT 없음 — 초안 텍스트만 반환 (사용자 검토 후 직접 발송)
+#     - 채팅방 참여자(seller/buyer) 검증 — 외부 호출 시 403
+#     - 컨텍스트: chat_room.order_id 의 주문 상세 + 최근 20개 메시지 + 상대방 정보
+#     - OpenAI gpt-4o-mini, temperature=0.5, max_tokens=400, 일반 응답 (스트리밍 X)
+#     - 실패 시 502 + type(e).__name__ (네트워크/환각 빈 텍스트 모두 통일)
+#   서비스 위치: app/services/draft_service.py (단일 함수 generate_chat_draft)
+#   chat_node 와 별도 — send_chat_message 도구 미사용으로 의도치 않은 발송 차단
+#
+# AI 협상 의도 감지 (US-2, 2026-05-04)
+# POST   /chat/rooms/{room_id}/messages — BackgroundTasks 로 detect 호출
+#   기존 동작 유지(메시지 INSERT 응답 즉시) + add_task(process_message_for_negotiation)
+#   감지 결과는 messages.metadata['draft_negotiation'] JSONB 에 저장,
+#   confidence>=0.7 일 때만 저장 + WS push.
+#
+# PATCH  /chat/messages/{message_id}/dismiss-draft-negotiation
+#   사용자가 [무시] 클릭 시 dismissed_at=NOW() 채움 (멱등).
+#   응답: { data: { message_id, draft_negotiation: {...} } }
+#   가드:
+#     - 메시지 미존재 → 404
+#     - sender_id != current_user → 403 (본인 메시지에만 dismiss 가능)
+#     - draft_negotiation 자체 없음 → 404
+#   주의: 5분 timeout 자동 dismiss 는 프론트가 시각적으로만 처리 (백엔드는 timeout 처리 X).
+#   서비스 위치: app/services/negotiation_detection_service.py
+#   - detect_negotiation_intent: OpenAI gpt-4o-mini, temperature=0,
+#       response_format=json_object, max_tokens=200
+#   - process_message_for_negotiation: 진입점 (BG task). 모든 예외 흡수 (chat 흐름 보호)
+#   - dismiss_draft_negotiation: 본인 검증 + dismissed_at 멱등 갱신
+#   ⚠️ 자동 등록 절대 X — 등록은 별도 사용자 [등록] 클릭으로 기존 propose_counter_offer 흐름.
 ```
 
 ### calendar.py (일정 API)
@@ -1133,3 +1179,10 @@ pytest-cov==6.0.0
   - 새 service 메서드 작성 시 파라미터명에 builtin 사용 금지 (`type` → `notification_type`/`event_type`/`message_type`, `id` → `resource_id`/`user_id`, `list` → `items`, `dict` → `payload`, `format` → `output_format`).
   - 기존 코드 리뷰 시: `def fn(..., type: str, ...)` 같은 시그니처를 grep 으로 발견하면 우선 수정 대상.
   - 로그 포맷 문자열 안의 `type=%s` 는 builtin 호출이 아니므로 문제 없음 — 시그니처 파라미터만 주의.
+
+- **브랜드명 표기 정책 — `fresh link` (2026-05-03 리네이밍)**: 서비스 브랜드명은 기존 `AgriFlow` 에서 `fresh link` 로 전환됨. 백엔드에서 사용자에게 노출되는 텍스트(OpenAPI title, AI 시스템 프롬프트의 자기소개·예시·답변 템플릿)는 모두 `fresh link` 로 통일. 표기 규칙:
+  - 기본: `fresh link` (소문자 + 띄어쓰기 한 칸)
+  - 문장 시작 등 대문자가 자연스러운 곳에서만: `Fresh link`
+  - **절대 바꾸지 말 것**: 코드 식별자(변수/함수/클래스/모듈/파일명), DB 테이블·컬럼명, 마이그레이션 파일명, 환경변수 키, import 경로, 패키지명, DB 이름(`DATABASE_URL` 의 `/agriflow`), Docker 서비스명 같은 **사용자 노출되지 않는 모든 식별자**. `.env` 의 DB 이름 변경은 운영 마이그레이션 비용 큼 → 보존.
+  - **검증된 변경 위치 (5개 파일, 9개 라인)**: `app/core/config.py:34` PROJECT_NAME, `app/services/schedule_agent.py:114,135` 출하/발주 일정 추천 AI 자기소개, `app/services/orchestrator.py:657` 라우터 시스템 프롬프트, `:690` GENERAL 분류 예시 발화, `:891` AGENT_BASE_SYSTEM, `:1479,1686` 캘린더 도우미 시스템 프롬프트, `:1743` 채팅 비서 시스템 프롬프트.
+  - **검증 절차**: 변경 후 `grep -rni "agriflow" backend/` → `.env` DB 이름 1건만 남으면 정상. 그 외 잔여가 있으면 코드 식별자가 맞는지 명시적으로 판단해야 한다.

@@ -100,7 +100,7 @@ export default function LoginPage() {
       <div className="w-full max-w-md">
         {/* 로고 */}
         <div className="mb-8 text-center">
-          <h1 className="text-3xl font-bold text-primary-700">AgriFlow</h1>
+          <h1 className="text-3xl font-bold text-primary-700">fresh link</h1>
           <p className="mt-2 text-gray-500">농산물 유통 B2B 플랫폼</p>
         </div>
 

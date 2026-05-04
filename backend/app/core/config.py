@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # App
     API_V1_PREFIX: str = "/api/v1"
-    PROJECT_NAME: str = "AgriFlow API"
+    PROJECT_NAME: str = "fresh link API"
     PORT: int = 8000
 
     model_config = {"env_file": ".env", "extra": "ignore"}

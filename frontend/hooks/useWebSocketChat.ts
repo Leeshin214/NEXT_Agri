@@ -2,10 +2,21 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createClient } from '@/lib/supabase/client';
-import type { AlternativePartner, MessageMetadata, MessageType } from '@/types';
+import type {
+  AlternativePartner,
+  MessageMetadata,
+  MessageType,
+  NegotiationDraft,
+} from '@/types';
 
 export interface WebSocketMessage {
-  type: 'message' | 'error' | 'system' | 'alternative_partners_suggestion';
+  type:
+    | 'message'
+    | 'error'
+    | 'system'
+    | 'alternative_partners_suggestion'
+    // 협상 의도 감지 (US-2) — 발신자 본인에게만 push (target_user_id == sender_id)
+    | 'negotiation_draft_detected';
   id?: string;
   room_id?: string;
   sender_id?: string;
@@ -22,6 +33,10 @@ export interface WebSocketMessage {
   // 백엔드 chat_ws.py _handle_rejected payload 매칭
   alternatives?: AlternativePartner[];
   category?: string;
+  // negotiation_draft_detected type 전용
+  message_id?: string;
+  target_user_id?: string;
+  draft?: NegotiationDraft;
 }
 
 const WS_BASE_URL =
@@ -122,6 +137,10 @@ export function useWebSocketChat(roomId: string | null): {
         setLastMessage(msg);
       } else if (msg.type === 'alternative_partners_suggestion') {
         // 대체 거래처 제안 — lastMessage로 전달해 채팅창에서 배너 표시
+        setLastMessage(msg);
+      } else if (msg.type === 'negotiation_draft_detected') {
+        // 협상 의도 감지 (US-2) — 발신자 본인에게만 도착. useChat 의 useEffect 가
+        // 해당 message_id 의 metadata.draft_negotiation 을 캐시에 채운다.
         setLastMessage(msg);
       } else if (msg.type === 'error') {
         const errMsg = msg.message ?? '알 수 없는 오류가 발생했습니다.';

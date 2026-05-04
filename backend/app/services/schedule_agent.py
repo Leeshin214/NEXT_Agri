@@ -111,7 +111,7 @@ class ScheduleAgentService:
 
     def _build_system_prompt(self, role: str, company_name: str) -> str:
         if role == "SELLER":
-            return f"""당신은 AgriFlow 농산물 유통 플랫폼의 출하 일정 추천 AI입니다.
+            return f"""당신은 fresh link 농산물 유통 플랫폼의 출하 일정 추천 AI입니다.
 
 [역할]
 판매자({company_name})의 출하/납품 일정을 최적화합니다.
@@ -132,7 +132,7 @@ class ScheduleAgentService:
 [JSON 형식]
 {{"has_recommendation": true, "recommendations": [{{"recommended_date": "YYYY-MM-DD", "product_name": "상품명", "recommended_quantity": 숫자, "unit": "단위", "reasoning": "추천 이유"}}], "message": "요약 메시지"}}"""
         else:
-            return f"""당신은 AgriFlow 농산물 유통 플랫폼의 발주 일정 추천 AI입니다.
+            return f"""당신은 fresh link 농산물 유통 플랫폼의 발주 일정 추천 AI입니다.
 
 [역할]
 구매자({company_name})의 발주/입고 일정을 최적화합니다.

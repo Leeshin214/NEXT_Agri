@@ -199,9 +199,12 @@ const handleSend = () => {
 ### useChat.ts 현재 export 목록
 - `useChatRooms` — 채팅방 목록 + Supabase Realtime 구독
 - `useMessages` — 메시지 목록 + Supabase Realtime 구독 (레거시, 직접 사용 안 함)
-- `useMessagesWithWebSocket` — 초기 로드(REST) + WS 실시간 송수신 통합 (채팅 페이지용)
+- `useMessagesWithWebSocket` — 초기 로드(REST) + WS 실시간 송수신 통합 (채팅 페이지용). `negotiation_draft_detected` 이벤트도 처리
 - `useSendMessage` — REST 전송 mutation (레거시, 직접 사용 안 함)
 - `useCreateChatRoom`, `useMarkAsRead`, `useSummarizeChat`
+- `useGenerateChatDraft` — `/초안 [지시]` 슬래시 명령용 AI 답장 초안
+- `useSubmitCounterOfferViaChat(roomId)` — 채팅창에서 협상가 제시
+- `useDismissNegotiationDraft(roomId)` — US-2 협상 의도 감지 카드 [무시] PATCH
 
 ---
 
@@ -507,6 +510,72 @@ const handleAlternativeClick = async (partner: AlternativePartner) => {
 
 기존에 있던 24h 5건 throttle (`rate_limited`) 은 dead code 였다 — 기존 방이 항상 `existing.data` 검색에서 잡히므로 동일 (seller, buyer) 페어가 24시간 내 5번씩 새 방을 만드는 시나리오 자체가 발생 불가. 제거함.
 
+### send_chat_message 거래처+주문 2단계 disambiguation (검증됨, 2026-05-03)
+
+AI 도우미가 "test4한테 옥수수 50kg 배송 완료라고 보내줘" 같은 발화를 받으면 어느 채팅방에 보내야 할지 모호했다 (test4 와 옥수수 40kg 주문방 + 옥수수 50kg 주문방이 동시에 있을 수 있음). `agent_tools.send_chat_message` 를 V1(legacy) / V2(신규) 두 시그니처를 모두 받는 구조로 확장:
+
+```python
+def send_chat_message(
+    room_id: str = "",          # V1: 직접 지정 시 그대로 발송
+    sender_id: str = "",        # 서버에서 _fix_id_params 가 user_id 로 강제 주입
+    content: str = "",          # legacy alias for message
+    partner_user_id: str = "",  # V2: 거래처 사용자 UUID
+    order_hint: Optional[dict] = None,  # {product_name?, quantity?, status?, recent?}
+    message: str = "",          # V2: 메시지 본문 (content 보다 우선)
+) -> dict
+```
+
+동작 흐름:
+1. `room_id` 가 유효 UUID → 즉시 발송 (V1 경로, 호환)
+2. `partner_user_id` + (선택) `order_hint` 로 후보 방 검색 (V2 경로)
+3. 후보 1개 → 즉시 발송 + `matched_room` 정보 반환
+4. 후보 ≥ 2개 → **발송 보류** + `{success: False, needs_confirmation: True, candidates: [...], message_preview}`
+5. 후보 0개 → `order_id IS NULL` 일반 채팅방 fallback. 그것도 없으면 `{success: False, error: "no_chat_room"}` (open_chat_room 으로 먼저 만들라는 안내)
+
+후보 검색 (`_resolve_chat_room_candidates`):
+- `chat_rooms` 에는 `deleted_at` 컬럼이 없다 — `deleted_at IS NULL` 필터 금지 (PostgREST `column does not exist` 에러)
+- 양방향 매칭: `or_("and(seller_id.eq.A,buyer_id.eq.B),and(seller_id.eq.B,buyer_id.eq.A)")` UUID 만 들어가므로 인용 불필요
+- orders 임베딩으로 status / order_items / products(name, unit) 조회
+- `orders.deleted_at IS NOT NULL` 또는 `status='CANCELLED'` 인 방은 주문 정보 무시 (일반방으로 격하)
+- order_hint 매칭: `product_name` ilike 부분일치, `quantity` 정확일치, `status` 정확일치(uppercase)
+- `recent=True` 시 `last_message_at DESC` 첫 1건만
+
+핵심 — `chat_node` 의 조기 종료 분기 (`if '"success": true' in result_content.lower(): return ...`) 와의 정합성:
+- 다중 매칭 시 **반드시 `success: False`** 로 반환해야 LLM 이 후보 리스트를 사용자에게 풀어 질문하도록 흐름이 이어진다. `success: True` 로 두면 chat_node 가 즉시 "메시지를 성공적으로 전송했습니다!" 로 잘못 답한다.
+
+`_fix_id_params` 정합성:
+- `partner_user_id` 는 user_id 강제 교정 루프(`("seller_id", "user_id", "buyer_id", "sender_id")`) 에 안 잡히므로 LLM 이 추론한 partner UUID 가 그대로 보존됨 (open_chat_room 과 동일 정책).
+- `room_id` 가 비유효 UUID 면 `tool_input.pop("room_id", None)` 로 제거되어 V2 경로로 자동 fallback — 새 default `room_id=""` 와 호환.
+
+도구 등록 (`orchestrator.py` `TOOLS_INVENTORY` + `TOOLS_CHAT` 두 군데):
+```json
+{
+  "name": "send_chat_message",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "partner_user_id": {"type": "string"},
+      "order_hint": {
+        "type": "object",
+        "properties": {
+          "product_name": {"type": "string"},
+          "quantity": {"type": "integer"},
+          "status": {"type": "string"},
+          "recent": {"type": "boolean"}
+        }
+      },
+      "message": {"type": "string"},
+      "room_id": {"type": "string", "description": "(legacy) ..."},
+      "sender_id": {"type": "string", "description": "(legacy) ..."},
+      "content": {"type": "string", "description": "(legacy) ..."}
+    },
+    "required": ["message"]
+  }
+}
+```
+
+`required` 가 `message` 단 1개로 줄어든 점이 핵심 — LLM 이 partner_user_id 만 알고 room_id 를 모를 때도 호출 가능. 단 partner_user_id 도 room_id 도 없으면 `error: "missing_room_or_partner"` 로 실패.
+
 ### 시스템 메시지 prefix 화이트리스트 패턴 (검증됨)
 
 `msg.content.startsWith('[') && msg.content.includes(']')` 같은 느슨한 매칭은 사용자가 보낸 "[중요]"
@@ -683,6 +752,61 @@ if (msgType && ORDER_RELATED_TYPES.includes(msgType)) {
 }
 ```
 
+#### 새 PENDING 카드 도착 시 낙관적 SUPERSEDED 마킹 (검증됨, 2026-05-03)
+
+`['messages', roomId]` 를 invalidate 만 해도 결국 refetch 가 정답을 가져오지만, **네트워크 RTT 동안**
+이전 PENDING 카드가 그대로 노출돼 본인이 방금 새로 제시한 카드 위쪽에 수락/거절 버튼이 잠깐 보이는
+문제가 있다 (issue.md #1: "새로고침하면 사라지는데 새로고침 전에도 안 뜨게 해달라"). 사용자 입장에서는
+"본인 제안인데 본인이 수락 버튼을 누를 수 있는 상태"가 되어 시스템적으로 모순되어 보인다.
+
+해결: `useMessagesWithWebSocket` 의 WS 수신 useEffect 에서 새 메시지를 캐시에 넣을 때, **같은 useEffect
+안의 `setQueryData` 안에서** 이전 동일 카드들 (`message_type` 일치 + `metadata.order_id` 일치 +
+`metadata.status === 'PENDING'`) 의 status 를 'SUPERSEDED' 로 미리 바꿔준다. invalidate refetch 는 그대로
+유지 — 백엔드 정식 status 값 (REPLACED/SUPERSEDED 등) 으로 최종 동기화 책임. 즉 **낙관적 갱신 + 서버
+권위 갱신** 이중 구조.
+
+대상 message_type:
+- `COUNTER_OFFER` — 새 협상가 제시 시 이전 PENDING 협상가 모두 SUPERSEDED
+- `DELIVERY_DATE_CHANGE` — 새 납품일 변경 요청 시 이전 PENDING 변경 요청 모두 SUPERSEDED
+
+```typescript
+const incomingType = incomingMessage.message_type;
+const incomingMeta = incomingMessage.metadata;
+const incomingOrderId = incomingMeta?.order_id;
+const incomingStatus = incomingMeta?.status;
+const supersedesPrevious =
+  !!incomingOrderId &&
+  incomingStatus === 'PENDING' &&
+  (incomingType === 'COUNTER_OFFER' || incomingType === 'DELIVERY_DATE_CHANGE');
+
+queryClient.setQueryData(['messages', roomId], (old) => {
+  if (!old) return { data: [incomingMessage] };
+  const exists = old.data.some((m) => m.id === incomingMessage.id);
+  const transformed = supersedesPrevious
+    ? old.data.map((m) => {
+        if (m.id === incomingMessage.id) return m;
+        if (m.message_type !== incomingType) return m;
+        const mMeta = m.metadata;
+        if (!mMeta || mMeta.order_id !== incomingOrderId) return m;
+        if (mMeta.status !== 'PENDING') return m;
+        return { ...m, metadata: { ...mMeta, status: 'SUPERSEDED' as const } };
+      })
+    : old.data;
+  if (exists) return { ...old, data: transformed };
+  return { ...old, data: [...transformed, incomingMessage] };
+});
+```
+
+주의: ACCEPTED/REJECTED 메시지(`OFFER_ACCEPTED`, `OFFER_REJECTED`, `DELIVERY_DATE_ACCEPTED`,
+`DELIVERY_DATE_REJECTED`)는 별도 status 마킹이 필요 없다 — 이쪽은 백엔드 mutation 의 onSuccess
+broad invalidate (`['messages']`) 가 충분히 빠르게 동작하고, 무엇보다 새 메시지 자체가 PENDING 이 아닌
+독립 카드(가운데 정렬)라 `supersedesPrevious` 조건에 안 걸린다. 즉 이 낙관적 갱신은 **새 PENDING
+제안이 도착해서 이전 PENDING 을 묻어버리는 케이스만** 다룬다.
+
+QueryClient 의 `staleTime: 60_000` (`components/providers/QueryProvider.tsx`) 도 invalidate 의 동작에는
+영향이 없다 (invalidateQueries 는 active query 의 staleTime 무관 refetch). 단지 refetch RTT 동안 잠깐의
+stale UI 가 노출될 뿐이고, 그 윈도우를 이 낙관적 마킹이 메운다.
+
 #### counter-offer mutation onSuccess 에서 broad messages invalidate (검증됨)
 
 `useSubmitCounterOffer` / `useAcceptCounterOffer` / `useRejectCounterOffer` (`useOrders.ts`) 의
@@ -755,6 +879,80 @@ DollarSign 아이콘 버튼 + 외부 클릭으로 닫히는 팝오버 입력 폼
 </div>
 ```
 
+##### prefill 패턴 (US-2 협상 의도 감지 [등록] — 검증됨, 2026-05-04)
+
+PriceOfferPopover 는 `prefill?: PriceOfferPrefill | null` + `onPrefillConsumed?: () => void` 두 prop 으로
+외부에서 팝오버를 열고 입력값을 미리 채울 수 있다. 부모(채팅 페이지)는 prefill 객체 reference 를 갱신할 때마다
+팝오버가 열리고 `amount` / `notes` 가 채워진다.
+
+```tsx
+// 채팅 페이지에서
+const [draftPrefill, setDraftPrefill] = useState<PriceOfferPrefill | null>(null);
+
+const handleAcceptDraft = (draft: NegotiationDraft) => {
+  const total =
+    draft.quantity && draft.unit_price && draft.quantity > 0 && draft.unit_price > 0
+      ? draft.quantity * draft.unit_price
+      : undefined;
+  setDraftPrefill({ amount: total, notes: '...요약...' });
+};
+
+<PriceOfferPopover
+  roomId={selectedRoomId}
+  orderId={linkedOrderId}
+  prefill={draftPrefill}
+  onPrefillConsumed={() => setDraftPrefill(null)}
+/>
+```
+
+내부 동작:
+- `prefill` 변경 + `disabled === false` 면 `setIsOpen(true)` 자동 트리거
+- `openedByPrefillRef` 로 한 번만 prefill 보존 — 사용자가 닫고 다시 열면 일반 초기화 동작 복귀
+- `disabled` (orderId/roomId 없음) 일 때는 prefill 무시 (버튼 자체 비활성)
+
+#### NegotiationDraftCard — 협상 의도 감지 카드 (US-2 — 검증됨, 2026-05-04)
+
+평문 메시지에서 가격 협상 의도(품목/수량/단가)가 감지되면 발신자 본인의 메시지 아래 회색 박스로 노출된다.
+**자동 등록 절대 X** — 사용자 [등록] 클릭 시 PriceOfferPopover prefill 흐름으로 분기.
+
+WS 이벤트:
+```jsonc
+{
+  "type": "negotiation_draft_detected",
+  "message_id": "uuid",
+  "room_id": "uuid",
+  "target_user_id": "uuid (= sender_id)",
+  "draft": { product_name, quantity, unit, unit_price, confidence, detected_at, dismissed_at }
+}
+```
+
+타입 (`types/chat.ts`):
+- `NegotiationDraft` — 백엔드 schemas/chat.py NegotiationDraft 와 1:1 매칭
+- `MessageMetadata.draft_negotiation?: NegotiationDraft` — TEXT 메시지에만 채워짐
+
+WS 수신 처리 (`useMessagesWithWebSocket`):
+```ts
+if (lastMessage.type === 'negotiation_draft_detected') {
+  // 본인에게 온 이벤트만 처리 (target_user_id === user.id 가드)
+  // 해당 message_id 의 messages 캐시에서 metadata.draft_negotiation 만 setQueryData 로 채움
+  // 메시지 자체가 캐시에 없으면 fallback 으로 invalidate
+  return;  // 일반 message 분기 진입 막기
+}
+```
+
+표시 가드 (`MessageBubble` TEXT case):
+- `isMine === true`
+- `metadata.draft_negotiation` 존재
+- `dismissed_at === null`
+- 5분 안 (`NegotiationDraftCard` 내부 `setTimeout` 으로 자동 hide — 백엔드는 timeout 안 함)
+
+[등록] / [무시]:
+- `[등록]` → `onAcceptNegotiationDraft(draft)` → 부모가 `setDraftPrefill` 호출 → PriceOfferPopover 자동 오픈
+- `[무시]` → `useDismissNegotiationDraft(roomId).mutate(messageId)` → PATCH `/chat/messages/{id}/dismiss-draft-negotiation`
+  → onSuccess 시 messages 캐시의 해당 메시지 metadata 만 낙관적 업데이트 (전체 invalidate X)
+
+새로고침 후 복원: 메시지 metadata.draft_negotiation 이 그대로 남아있으므로 5분 안 + dismissed null 이면 자동 재표시.
+
 #### 주문 상세 → 채팅 이동 흐름 (양 페이지)
 
 `buyer/orders` `seller/orders` 상세 슬라이드 액션 영역 첫 번째 버튼:
@@ -779,25 +977,130 @@ const handleOpenChat = async () => {
 
 `useChatRooms()`에서 `isLoading`, `error`, `refetch`를 함께 destructure해 로딩 스피너와 에러+재시도 버튼을 표시한다.
 
-```typescript
-const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: refetchRooms } = useChatRooms();
+현재(2026-05-03) 두 채팅 페이지(`seller/chat`, `buyer/chat`)는 인라인 리스트 대신 공통 컴포넌트
+`<ChatRoomList />` 를 사용한다 (아래 "채팅 리스트 거래처별 그룹핑" 섹션 참조). 위 destructure 한
+`isLoading` / `error` / `refetch` 는 그대로 props 로 흘려준다:
 
-// JSX
-{roomsLoading ? (
-  <div className="flex items-center justify-center p-8">
-    <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary-600 border-t-transparent" />
-  </div>
-) : roomsError ? (
-  <div className="p-4 text-sm text-red-500">
-    채팅방을 불러오지 못했습니다.
-    <button onClick={() => refetchRooms()} className="ml-2 text-primary-600 underline">다시 시도</button>
-  </div>
-) : rooms.length === 0 ? (
-  <p className="p-4 text-sm text-gray-400">채팅방이 없습니다.</p>
-) : (
-  rooms.map(...)
+```tsx
+const { data: roomsData, isLoading: roomsLoading, error: roomsError, refetch: refetchRooms } = useChatRooms();
+const rooms = roomsData?.data ?? [];
+
+<ChatRoomList
+  rooms={rooms}
+  myRole="SELLER"   // 또는 "BUYER"
+  selectedRoomId={selectedRoomId}
+  onSelectRoom={handleRoomSelect}
+  isLoading={roomsLoading}
+  error={roomsError}
+  onRetry={refetchRooms}
+/>
+```
+
+`<ChatRoomList />` 내부가 isLoading/error/empty/groups 분기를 모두 담당한다 — 페이지 쪽엔 분기 X.
+
+### 채팅 리스트 거래처별 그룹핑 (검증됨, 2026-05-03)
+
+같은 거래처와 N개의 주문방이 있을 때 채팅 리스트가 평면 N행으로 흩어지면 한 거래처의 전체 거래
+상황을 파악하기 어렵다. 거래처(파트너) 단위로 그룹 헤더 + 하위 주문방 카드 N개로 묶어 렌더한다.
+
+#### 컴포넌트 구조 (frontend/components/chat/)
+- `ChatRoomList.tsx` — 검색 인풋 + 미읽 필터 토글 + 그룹 목록. 양쪽 페이지에서 공통 사용
+- `ChatRoomGroup.tsx` — 거래처 단위 그룹 헤더 (펼침/접힘 토글, 펼침 기본값 true) + 하위 방
+- `ChatRoomItem.tsx` — 단일 방 카드. order_id 유무로 Package(주문 채팅) / MessageSquare(일반 대화) 아이콘 분기. nested=true 면 좌측 보더 + 들여쓰기
+
+#### 그룹핑 로직 (frontend/lib/chatGrouping.ts)
+순수 함수 `groupChatRoomsByPartner(rooms, myRole)` 가 백엔드 호출 없이 클라이언트에서 묶는다.
+**`useChatRooms()` 응답 (`ChatRoom[]`) 의 기존 필드만으로 충분** — 추가 fetch 불필요.
+
+```typescript
+export interface ChatRoomGroup {
+  partnerUserId: string;          // = myRole==='SELLER' ? buyer_id : seller_id
+  partnerName: string | null;     // 가장 최근 활동 방의 partner_name
+  partnerCompany: string | null;  // 가장 최근 활동 방의 partner_company
+  unreadTotal: number;            // 그룹 내 unread_count 합
+  lastActivityAt: string | null;  // MAX(last_message_at)
+  activeOrderCount: number;       // order_id 가 NULL 이 아닌 방 개수
+  rooms: ChatRoom[];              // 그룹 내 방 목록 (lastActivityAt DESC)
+}
+```
+
+정렬:
+- 그룹 자체: `lastActivityAt DESC` (null 인 그룹은 가장 뒤)
+- 그룹 내 방: `last_message_at` (없으면 `created_at`) DESC
+
+partner_user_id 결정 규칙 — 페이지에서 `myRole` prop 으로 전달:
+- seller 페이지: `myRole='SELLER'` → `room.buyer_id`
+- buyer 페이지: `myRole='BUYER'` → `room.seller_id`
+
+#### 검색 / 필터
+- 검색: 거래처 이름 / 회사명 부분일치 (`includes`, 소문자 정규화) → 매칭 그룹 전체 표시
+- 미읽 필터 토글: `unreadTotal > 0` 인 그룹만
+- 두 조건은 AND. `useMemo` 로 rooms / search / unreadOnly / myRole 의존성에 캐시
+
+#### 그룹 헤더 자동 펼침 (UX)
+사용자가 어떤 그룹을 접어둔 상태에서 다른 화면(주문 상세 → 채팅 이동)이 그 그룹의 방으로
+라우팅하면, 헤더 안에서 선택된 방이 안 보이는 함정이 생긴다. `ChatRoomGroup` 내부에서
+`group.rooms.some(r => r.id === selectedRoomId)` 면 강제 펼침으로 처리한다 (`isExpanded = expanded || containsSelected`). 사용자가 명시적으로 접어둔 상태값(`expanded`) 자체는 유지하되,
+선택된 방이 있을 동안만 임시로 펼쳐 보이는 패턴.
+
+#### "일반 대화 vs 주문 채팅" 시각 구분
+백엔드 데이터 모델은 그대로 두고 `room.order_id` 의 truthy 여부로 분기:
+- order_id 있음 → Package 아이콘 + "주문 채팅" 라벨 (text-primary-500)
+- order_id 없음 → MessageSquare 아이콘 + "일반 대화" 라벨 (text-gray-400)
+
+상품명/주문번호 같은 풀 데이터는 OrderContextBanner 가 메시지 영역에서 별도로 보여주므로
+리스트 카드는 가벼운 라벨만.
+
+#### 상대 시각 표시 헬퍼
+ChatRoomGroup 내부 `formatRelativeTime(iso)` — "방금 전 / N분 전 / N시간 전 / N일 전" / 7일 이상은 `M.D` 짧은 날짜.
+NegotiationHistory 의 동일 패턴과 시그니처 통일.
+
+#### 페이지 변경분
+seller/chat, buyer/chat 페이지의 인라인 리스트 ~50줄을 `<ChatRoomList />` 한 줄 호출로 치환.
+`useChatRooms` / `useMessagesWithWebSocket` / `useMarkAsRead` / `useSummarizeChat` 등 기존
+훅·로직은 모두 그대로 유지 — 메시지 영역 / 헤더 / OrderContextBanner / 빠른 액션 popover 변경 없음.
+
+### 거래처 상세 — 진행 중 채팅 카드 섹션 (US-3, 검증됨 2026-05-04)
+
+거래처 상세(`PartnerDetailModal`) 안에 그 거래처와의 채팅방을 카드 형태로 노출. 채팅 페이지로 가지 않고도 그 거래처와 어떤 주문이 협상 중인지 한눈에 보여주기 위한 진입점.
+
+#### 컴포넌트 (frontend/components/partners/PartnerChatRooms.tsx)
+- props: `partnerUserId: string`, `myRole: 'SELLER' | 'BUYER'`, `onNavigate?: () => void`
+- 데이터 — 옵션 A (클라이언트 필터):
+  - `useChatRooms()` 전체를 받아 `myRole==='SELLER' ? room.buyer_id : room.seller_id === partnerUserId` 로 필터
+  - 주문 요약(품목·수량·상태)은 `useOrders({ partner_user_id, limit: 200 })` 응답을 `Map<order_id, Order>` 로 만들어 `room.order_id` 와 매칭
+  - 백엔드 변경 0. 채팅방 N 이 커지면 옵션 B(백엔드 partner 필터 쿼리) 로 전환
+- "진행 중" 정의: `order_id` 가 있는 방은 `order.status` 가 `COMPLETED`/`CANCELLED` 가 아닐 때만 노출. `order_id` 가 없는 일반 대화방은 항상 노출
+- 정렬: 주문 채팅 우선 → `last_message_at` (없으면 `created_at`) DESC
+- 클릭 → `router.push(/{role}/chat?room_id={id})` + `onNavigate?.()` 로 부모 모달 닫기
+- 주문 요약 라벨: `order.product_summary` 우선 (백엔드가 채워줌). 미제공 시 `items[0].product_name + qty + 외 N건` 폴백. 주문 정보가 아직 로드되기 전엔 "주문 정보 불러오는 중..." 표시
+
+#### 빈 상태
+"이 거래처와 진행 중인 채팅이 없어요. 새 주문이 들어오면 자동으로 채팅방이 열려요." — 점선 박스(`border-dashed`) + 회색 톤. 사용자가 직접 채팅을 만들 동작은 헤더의 "채팅 시작" 빠른액션이 이미 담당하므로 빈 상태에 별도 CTA 두지 않음.
+
+#### PartnerDetailModal 통합
+거래 통계 섹션과 정기배송 섹션 사이에 신규 `<section>` 으로 삽입. `MessageCircle` 아이콘 + "진행 중 채팅" 헤더. `isPendingOutgoing` 일 때는 채팅 액션 자체가 잠겨있으므로 섹션도 숨김 (정기배송 섹션과 동일한 가드 패턴).
+
+```tsx
+{!isPendingOutgoing && (
+  <section>
+    <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-700">
+      <MessageCircle className="h-4 w-4" /> 진행 중 채팅
+    </h3>
+    <PartnerChatRooms
+      partnerUserId={partner.partner_user_id}
+      myRole={myRole}
+      onNavigate={onClose}
+    />
+  </section>
 )}
 ```
+
+#### 카드 스타일 — 모바일 대응
+`flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between` — 좁은 화면(<640px)에선 라벨/메시지 위에 메타(시각·바로가기) 가 쌓이고, sm 이상에선 좌우 2열 배치. 메시지 한 줄은 항상 `truncate`.
+
+#### 상대 시각 헬퍼
+`ChatRoomGroup.formatRelativeTime` 와 동일 시그니처 (`방금 전 / N분 전 / N시간 전 / N일 전 / M.D`). 두 컴포넌트가 별개 파일이라 시그니처/로직만 맞춤. 향후 `lib/date.ts` 로 끌어올려 통합 예정.
 
 ### 납품일 변경 요청·승인 채팅 카드 (검증됨, 2026-04-29)
 
@@ -827,6 +1130,69 @@ case 'DELIVERY_DATE_REJECTED':
 3개 신규 타입을 추가하고, `useMessagesWithWebSocket` useEffect 안에서:
 - 모든 delivery date 메시지 → `['orders', orderId, 'delivery-date-changes']` invalidate
 - `DELIVERY_DATE_ACCEPTED` 만 추가로 `['calendar']` invalidate
+
+### 협상 의도 감지 — metadata.draft_negotiation + 본인 전용 WS push (US-2, 2026-05-04)
+
+**핵심 보안 원칙: 자동 등록 절대 X, 발신자 본인에게만 카드 노출.**
+
+평문 메시지 ("옥수수 50kg 7만원에 어때요?") 에서 가격 협상 의도를 감지해 본인이 [등록] 클릭 시 협상가 제시로 등록할 수 있도록 안내한다. 감지 결과는 `messages.metadata` JSONB 의 `draft_negotiation` 키에 별도 저장 — 기존 협상 흐름(`COUNTER_OFFER` 카드/`negotiations` 테이블) 과 완전 분리.
+
+#### 흐름
+
+```
+POST /chat/rooms/{room_id}/messages
+  → chat_service.send_message (메시지 INSERT, last_message UPDATE, NEW_MESSAGE notification)
+  → 응답 즉시 반환 (201 + MessageResponse)
+  → BackgroundTasks.add_task(process_message_for_negotiation)
+        ├─ chat_room + (있으면) order_items + products 조회 → room_context
+        ├─ OpenAI gpt-4o-mini structured output (response_format=json_object, temp=0)
+        │    → {product_name, quantity, unit, unit_price, confidence}
+        ├─ confidence < 0.7 → return (저장도 push도 안 함)
+        ├─ messages.metadata['draft_negotiation'] = {...} UPDATE
+        └─ ws_manager.send_private_message(sender_id, payload)
+                payload: { type: "negotiation_draft_detected",
+                           message_id, room_id, target_user_id: sender_id,
+                           draft: {...} }
+```
+
+#### metadata.draft_negotiation 구조 (JSONB)
+
+```json
+{
+  "draft_negotiation": {
+    "product_name": "옥수수",   // string|null — 한국어 명사
+    "quantity": 50,              // int|null — 양수
+    "unit": "kg",                 // string|null — kg/box/piece/bag/개/포대 등
+    "unit_price": 1400,           // int|null — KRW 정수, 양수
+    "confidence": 0.9,            // float 0.0~1.0
+    "detected_at": "2026-05-04T12:34:56.123456+00:00",
+    "dismissed_at": null         // 사용자가 [무시] 클릭 시 NOW() 채움
+  }
+}
+```
+
+#### WS 이벤트 — `negotiation_draft_detected`
+
+- `connection_manager.send_private_message(user_id, payload)` 사용 → 발신자 본인의 모든 활성 ws 에만 전송 (다중 탭 지원). broadcast 가 아니므로 채팅방 상대방은 절대 못 봄.
+- 페이로드에 `target_user_id` 도 포함 (클라이언트 측 추가 가드용 — 정상 케이스에선 불필요하지만 디버깅/로깅 용이).
+- 서버 재시작 시 in-memory 매핑이 사라지므로 즉시 push 가 도달 못 할 수 있음 → 그래서 metadata 저장도 같이 함 (페이지 새로고침/메시지 재로드 시 fallback).
+
+#### 등록/무시 흐름
+
+- [등록] 클릭 → 기존 `useSubmitCounterOfferViaChat` 또는 `POST /chat/rooms/{room_id}/counter-offer` 그대로 호출 (별도 신규 흐름 X). draft 의 `unit_price * quantity` 를 `proposed_total_amount` 로 변환.
+- [무시] 클릭 → `PATCH /chat/messages/{message_id}/dismiss-draft-negotiation` (본인 메시지만, 멱등). 응답으로 갱신된 `draft_negotiation` 반환.
+- 5분 timeout → **프론트가 시각적으로만 hide** (white-list `confidence>=0.7 && !dismissed_at && (now - detected_at) < 5min`). 백엔드는 timeout 처리 안 함.
+
+#### 보안/중복 방지 가드 (검증됨)
+
+1. `confidence >= 0.7` 미만은 metadata 저장도 WS push 도 안 함 → 잡담/안부 메시지로 false-positive 차단.
+2. `_normalize_detection_result` 가 음수 quantity/unit_price/confidence 를 None/0 으로 강제.
+3. 빈/4자 미만 메시지는 LLM 호출조차 하지 않음 (`_MIN_CONTENT_LENGTH = 4`).
+4. `process_message_for_negotiation` 의 모든 예외는 try/except 로 흡수 — 채팅 흐름이 절대 막히지 않음.
+
+#### messages.metadata JSONB 부분 업데이트 패턴
+
+`negotiation_detection_service._save_draft_to_message_metadata` 는 fetch → merge → update 3-step 패턴. 기존 metadata 가 있으면 머지 보존(다른 키 덮어쓰지 않음), 없으면 새로 생성. SECURITY DEFINER RPC 가 없어서 `jsonb_set` 일괄 사용 불가하지만, 단건 mutation 이라 성능 영향 미미.
 
 ```typescript
 if (msgType === 'DELIVERY_DATE_CHANGE' ||
@@ -891,6 +1257,108 @@ StatusBadge + ChevronDown 버튼으로 표시되고, 클릭 시 다음으로 전
 
 ---
 
+### AI 답장 초안 — POST /chat/draft (검증됨, 2026-05-03)
+
+채팅방 입력창의 슬래시 명령(`/초안 ...`) 으로 호출하는 AI 답장 초안 엔드포인트. 채팅 메시지 테이블에 저장하지 않고 초안 텍스트만 반환 — 사용자가 검토·수정 후 일반 메시지로 직접 발송한다.
+
+#### 엔드포인트 명세
+- 메소드: `POST /api/v1/chat/draft`
+- 인증: 본인 채팅방 참여자(seller/buyer) 검증 — 다른 사용자가 호출하면 403
+- Body: `{ "room_id": UUID, "instruction": str }` (instruction min_length=1, max_length=500)
+- 응답: `{ "data": { "draft": str } }`
+- 에러: 채팅방 없음 404, 권한 없음 403, OpenAI 실패 502, 빈 초안 502
+
+#### 구조 결정 — chat_node 재사용 안 함
+
+`chat_node` 는 `send_chat_message` 도구를 가진 채라 자칫 메시지가 실제 발송될 위험이 있다 (orchestrator.py 라인 1928 의 `'"success": true' in result_content` 단락회로 등). 그래서 별도 `services/draft_service.py` 단일 함수 `generate_chat_draft(user_id, room_id, instruction)` 로 분리한다 — 도구 호출 없는 단순 OpenAI 호출만 수행, 메시지 INSERT 경로 자체가 없어 안전.
+
+#### 컨텍스트 빌드 흐름 (draft_service.generate_chat_draft)
+
+1. `_fetch_chat_room(room_id)` — chat_rooms 단건 조회 (chat_rooms 에 `deleted_at` 컬럼 없음, 필터 금지)
+2. 권한 검증 — `user_id` 가 seller_id/buyer_id 둘 중 하나여야 함
+3. 병렬 fetch (`asyncio.gather`):
+   - `_fetch_user(my_id)` — 본인 이름/회사명/역할
+   - `_fetch_user(counterpart_id)` — 상대방 정보
+   - `_fetch_recent_messages(room_id, 20)` — `is_("deleted_at", None)` + `order(created_at, desc)` + `limit(20)` 후 메모리에서 reverse
+   - `_fetch_order_summary(order_id)` — `room.order_id` 가 있을 때만 (없으면 즉시 None)
+4. `_build_system_prompt` — 본인/상대 정보 + 주문 요약 + 최근 대화 평탄화 텍스트 합성
+5. user prompt = "사용자가 보낼 답장 초안을 작성해 주세요\n[사용자 지시]\n{instruction}"
+6. OpenAI `gpt-4o-mini`, `temperature=0.5`, `max_tokens=400`, 일반 응답 (스트리밍 X)
+7. `_sanitize_draft` — 마크다운 별표 제거 + 메타 prefix("초안:", "답장:" 등) 제거 + 코드블록 펜스 제거
+
+#### 시스템 프롬프트 톤 (chat_node 와 일관)
+
+- 마크다운 별표(**), 리스트 기호(-, *, 1.) 절대 금지 — chat_node 와 동일 정책
+- 메타 설명("아래는 초안입니다" 등) 금지
+- 응답은 사용자가 그대로 복사해 보낼 답장 본문만
+- 정중하지만 간결한 비즈니스 한국어, 1~3문장 기본
+- 가격/수량/납기일 등 구체 수치 요구 시 컨텍스트(주문/대화)에서 가져와 정확히 반영
+
+#### 주의사항 & 함정
+
+- **chat_rooms.deleted_at 필터 금지** — 운영 DB 정합 (SKILL_DB.md 검증 패턴). `_fetch_chat_room` 에서는 `.is_("deleted_at", None)` 적용 안 함, `_fetch_user`/`_fetch_recent_messages`/`_fetch_order_summary` 에는 적용.
+- **order_id 가 None 인 일반 채팅방도 동작해야 함** — `asyncio.ensure_future(asyncio.sleep(0, result=None))` 로 placeholder Future 를 만들어 gather 시그니처 통일.
+- **메시지 테이블 INSERT 절대 안 함** — 사용자가 검토 후 직접 발송하는 흐름이라 send_message 호출 금지. 향후 "초안 자동 발송" 기능을 추가하더라도 별도 엔드포인트로 분리할 것.
+- **OpenAI 호출 실패 시 502 + type(e).__name__** — RTT 초과 / 네트워크 에러 / 환각으로 빈 텍스트 반환은 모두 502 로 통일하여 프론트에서 "AI 응답 실패" UX 단일화.
+
+#### 프론트엔드 통합 — MessageInput 슬래시 명령 (검증됨, 2026-05-03)
+
+채팅 입력창은 `frontend/components/chat/MessageInput.tsx` 단일 공유 컴포넌트로 추출되어 있다. seller/buyer 두 페이지 모두 이 컴포넌트를 사용한다.
+
+```tsx
+// seller/buyer chat page.tsx — 입력창 + 빠른 액션 popover
+<MessageInput
+  roomId={selectedRoomId}
+  isConnected={isConnected}
+  onSend={handleSend}                              // (content: string) => void
+  leadingActions={                                 // 입력창 좌측 슬롯 — 기존 popover 유지
+    <>
+      <PriceOfferPopover {...} />
+      <DeliveryDatePopover {...} />
+    </>
+  }
+/>
+```
+
+**슬래시 명령 처리 흐름:**
+1. 사용자가 `/초안 [지시]` 형식으로 입력 (예: `/초안 가격 협상해줘`)
+2. Enter → 메시지 발송 분기 X, 대신 `useGenerateChatDraft` mutation 호출 (POST /chat/draft)
+3. 입력창은 그대로 유지 (실패 시 instruction 재전송 가능)
+4. 입력창 위 회색 박스에 로딩 → 응답 도착 시 초안 텍스트 표시
+5. "사용" 버튼 클릭 → 입력창 textarea 에 초안 텍스트 채워짐 + 박스 dismiss → 사용자가 자유롭게 수정·발송
+6. "닫기" 버튼 / 에러 시 → 박스만 dismiss, 입력창은 원본 그대로
+
+**`/초안 ` 으로 시작하지 않는 일반 메시지**: 기존 발송 흐름 그대로 (`onSend(content)` 호출 → 부모의 `wsSendMessage`).
+
+**가드 규칙:**
+- `/초안 ` 뒤에 instruction 이 비어있으면 발송도 초안 호출도 안 함 (Enter 무시)
+- `/` 로 시작하지만 `/초안 ` 패턴이 아니면 슬래시 후보로 간주 → 발송 차단 + hint 박스 노출 ("/초안 [지시] 형식으로 AI 답장 초안을 받을 수 있어요")
+- 전송 버튼 활성 조건: 일반 메시지는 trim 비어있지 않고 WS 연결됨 / `/초안 ` 명령은 mutation pending 아닐 때만 활성 (WS 연결 무관 — REST API)
+
+**시각 디자인:**
+- `/초안 ` 명령 입력 중에는 input 테두리/배경이 보라색 톤 (`border-purple-300 bg-purple-50/50`), 전송 버튼도 보라색 + Sparkles 아이콘으로 일반 발송과 시각적으로 구분
+- 초안 박스: `bg-gray-50 border-gray-200 rounded-lg`, 라벨 "AI 초안" + Sparkles 아이콘, "사용" 은 `bg-primary-600`, "닫기" 는 outline
+
+**훅 (`useGenerateChatDraft`):**
+```tsx
+// frontend/hooks/useChat.ts
+export function useGenerateChatDraft() {
+  return useMutation({
+    mutationFn: async ({ roomId, instruction }) => {
+      const res = await api.post<SuccessResponse<{ draft: string }>>(
+        '/chat/draft',
+        { room_id: roomId, instruction }
+      );
+      return res.data?.draft ?? '';
+    },
+  });
+}
+```
+
+성공 시 `draft` 가 빈 문자열이면 에러 처리로 분기 (백엔드 `_sanitize_draft` 가 모두 제거한 극단 케이스 대비).
+
+---
+
 ## 작업 체크리스트
 
 - [ ] FastAPI chat 라우터 (rooms, messages CRUD)
@@ -903,3 +1371,4 @@ StatusBadge + ChevronDown 버튼으로 표시되고, 클릭 시 다음으로 전
 - [x] 읽음 처리 (채팅방 진입 시 자동)
 - [x] 안읽은 메시지 수 뱃지
 - [x] AI 요약 버튼 연동
+- [x] AI 답장 초안 (POST /chat/draft) 백엔드
