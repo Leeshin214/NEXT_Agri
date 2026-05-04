@@ -299,9 +299,13 @@ TOOLS = [
         "function": {
             "name": "get_orders",
             "description": (
-                "사용자의 주문 목록을 조회한다. "
+                "사용자의 주문 목록을 조회한다 (삭제된 주문은 제외 — soft delete 자동 필터). "
                 "판매자는 받은 주문, 구매자는 넣은 주문이 조회된다. "
-                "status로 특정 상태(예: QUOTE_REQUESTED, SHIPPING)만 필터링할 수 있다."
+                "단일 상태 필터는 status, 다중 상태 필터는 status_in 을 사용한다 (status_in 이 우선). "
+                "사용자가 '진행 중인 주문', '활성 주문', '내 주문' 처럼 진행 상태 전체를 물어보면 "
+                "반드시 status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING'] "
+                "로 호출하라 — 완료(COMPLETED)/취소(CANCELLED) 는 자동 제외된다. "
+                "단일 상태(예: '배송 중인 주문', '견적 요청만') 만 묻는 경우엔 status='SHIPPING' 처럼 단일 값 사용. "
                 "주의: 사용자가 '거래요청 들어온거 있어?', '새로운 거래' 등을 물어보면 "
                 "이것은 새로운 주문/견적 요청을 의미하므로 반드시 이 도구를 호출하여 확인하라."
             ),
@@ -320,9 +324,26 @@ TOOLS = [
                     "status": {
                         "type": "string",
                         "description": (
-                            "필터링할 주문 상태 (선택). "
+                            "필터링할 단일 주문 상태 (선택, 하위호환). "
                             "QUOTE_REQUESTED / NEGOTIATING / CONFIRMED / "
-                            "PREPARING / SHIPPING / COMPLETED / CANCELLED"
+                            "PREPARING / SHIPPING / COMPLETED / CANCELLED. "
+                            "status_in 과 동시 지정 시 status_in 이 우선."
+                        ),
+                    },
+                    "status_in": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "QUOTE_REQUESTED", "NEGOTIATING", "CONFIRMED",
+                                "PREPARING", "SHIPPING", "COMPLETED", "CANCELLED",
+                            ],
+                        },
+                        "description": (
+                            "다중 상태 필터 (선택, 권장). 사용자가 '진행 중', '활성', '내 주문' 등 "
+                            "여러 상태를 한 번에 묻는 표현을 쓰면 "
+                            "['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING'] 로 호출. "
+                            "완료/취소는 명시적으로 요청한 경우에만 포함."
                         ),
                     },
                 },
@@ -1599,6 +1620,41 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 - 결과 0건 또는 전부 품절이면 사용자에게 그 사실을 명시적으로 안내하고("참치 판매자가 검색되지 않았습니다") "다른 품목이나 비슷한 카테고리로 대체 거래처를 찾아볼까요?"라고 묻는다.
 - 사용자가 명시 동의("응", "찾아줘", "그래") 한 뒤에만 find_alternative_partners 를 호출한다. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에서 동시에 호출해 다른 품목을 추천하는 행위는 금지.
 
+[주문 목록 조회 가이드 — 자연어 → status_in 매핑 (매우 중요)]
+사용자가 주문 목록을 묻는 발화는 표현이 다양해도 항상 get_orders 의 status_in 다중 상태 파라미터로 정확히 매핑한다. 단일 status 는 사용자가 정말 한 가지 상태만 콕 집어 물었을 때만 쓰고, 그 외에는 status_in 을 우선한다.
+
+매핑 규칙:
+- "진행 중인 주문" / "활성 주문" / "내 주문" / "오픈된 주문" / "처리 중 주문" → status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"]
+- "완료된 주문" / "끝난 주문" / "마감된 주문" → status_in=["COMPLETED"]
+- "취소된 주문" / "취소건" → status_in=["CANCELLED"]
+- "협상 중 주문" / "협상 중인 거래" → status_in=["NEGOTIATING"]
+- "확정된 주문" / "확정 주문" → status_in=["CONFIRMED"]
+- "배송 중 주문" / "배송 중인 거" → status_in=["SHIPPING"]
+- "준비 중 주문" / "출고 준비 중" → status_in=["PREPARING"]
+- "견적 요청" / "받은 견적" / "들어온 견적" → status_in=["QUOTE_REQUESTED"]
+- 사용자가 특정 상태를 명시하지 않고 그냥 "주문 보여줘", "주문 목록", "주문 좀 확인해줘"라고 하면 → 진행 중 기본값 status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"] 로 호출 (완료·취소는 사용자가 명시 요청할 때만 포함).
+
+[주문 응답 표시 규칙 — 환각 방지]
+get_orders 결과를 사용자에게 안내할 때 다음 원칙을 반드시 지킨다.
+
+- 도구가 반환한 status enum 값을 그대로 자연스러운 한국어로 풀어 사용한다. 임의로 "협상 요청 중", "상태 없음", "검토 중", "보류" 같이 enum 에 없는 표현을 만들어내지 마라.
+- 한글 매핑 (이 매핑만 사용):
+  · QUOTE_REQUESTED → "견적 요청"
+  · NEGOTIATING → "협상 중"
+  · CONFIRMED → "주문 확정"
+  · PREPARING → "준비 중"
+  · SHIPPING → "배송 중"
+  · COMPLETED → "완료"
+  · CANCELLED → "취소"
+- 도구가 반환하지 않은 주문은 절대 응답에 포함하지 마라. 컨텍스트 메모리·이전 대화에 옛 주문이 기억나도, 이번 도구 결과 외의 어떤 주문 정보도 출력하지 마라. 사용자가 직접 묻지 않은 다른 주문(예: 옛날 참치 주문, 어제 본 견적)을 끌어와 함께 답하지 말 것.
+- 도구 결과가 0건이면 "현재 진행 중인 주문이 없습니다" 또는 "조회된 주문이 없습니다" 정도로만 안내하고, 다른 정보(거래처 추천, 상품 정보, 다른 카테고리 주문)를 늘어놓지 마라. 사용자가 추가로 물어본 뒤에만 다음 단계로 넘어간다.
+- 마크다운 강조(`**굵게**`)·표(`|`)·헤더(`#`) 사용 금지. 자연체 한국어 문장 + 필요 시 `-` 불릿이나 `1.` 번호만 사용. 항목별로 줄바꿈으로 구분.
+- 응답 예시 (자연체, 수치 우선):
+  "현재 진행 중인 주문 3건입니다.
+   1. 옥수수 50kg — 협상 중, 납품일 5월 20일, ₩600,000
+   2. 사과 5박스 — 견적 요청, 납품일 6월 3일, 박스당 ₩38,000
+   3. 양파 100kg — 배송 중, 납품일 5월 5일, ₩200,000"
+
 [도구 실패 시 응답 가이드 — 매우 중요 (환각 방지)]
 도구 호출이 실패하거나(success: false / error 필드 반환) 0건을 돌려준 경우, 사용자에게 답변할 때 다음 원칙을 반드시 지켜라.
 
@@ -2565,6 +2621,21 @@ async def chat_node(state: AgentState) -> dict:
         "- 다음 액션 제안은 짧게 하나만 — '다시 시도해 보시겠어요?' / '정확한 이름을 알려주세요' / '다른 수량으로 진행할까요?' 정도. 옵션을 카탈로그처럼 나열하지 마라.\n"
         "- 도구가 실패했는데도 마치 성공한 것처럼 '주문이 접수됐습니다', '메시지를 보냈습니다'라고 답하는 행위 절대 금지. 도구 결과의 success 값을 반드시 확인하고 사실대로 전달.\n"
         "- error 코드(예: 'user_not_found', 'order_not_found', 'invalid_user_id')는 영문 그대로 노출하지 말고 사용자가 이해할 자연체 한국어로 풀어 안내.\n"
+        "\n"
+        "[주문 목록 조회 가이드 — 자연어 → status_in 매핑 (매우 중요)]\n"
+        "- 사용자가 주문 목록을 묻는 발화는 표현이 다양해도 항상 get_orders 의 status_in 다중 상태 파라미터로 정확히 매핑한다. 단일 status 는 사용자가 정말 한 가지 상태만 물었을 때만 쓰고, 그 외에는 status_in 을 우선한다.\n"
+        "- '진행 중인 주문' / '활성 주문' / '내 주문' / '오픈된 주문' / '처리 중 주문' → status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING']\n"
+        "- '완료된 주문' / '끝난 주문' → status_in=['COMPLETED']\n"
+        "- '취소된 주문' / '취소건' → status_in=['CANCELLED']\n"
+        "- '협상 중 주문' → status_in=['NEGOTIATING'], '확정된 주문' → status_in=['CONFIRMED'], '배송 중 주문' → status_in=['SHIPPING'], '준비 중 주문' → status_in=['PREPARING'], '견적 요청' / '들어온 견적' → status_in=['QUOTE_REQUESTED']\n"
+        "- 사용자가 특정 상태를 명시하지 않고 그냥 '주문 보여줘', '주문 목록', '주문 좀 확인해줘'라고 하면 → 진행 중 기본값 status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING'] 로 호출 (완료·취소는 사용자가 명시 요청할 때만 포함).\n"
+        "\n"
+        "[주문 응답 표시 규칙 — 환각 방지 (매우 중요)]\n"
+        "- 도구가 반환한 status enum 값을 그대로 자연스러운 한국어로 풀어 사용한다. 임의로 '협상 요청 중', '상태 없음', '검토 중', '보류' 같이 enum 에 없는 표현을 만들어내지 마라.\n"
+        "- 한글 매핑 (이 매핑만 사용): QUOTE_REQUESTED→'견적 요청', NEGOTIATING→'협상 중', CONFIRMED→'주문 확정', PREPARING→'준비 중', SHIPPING→'배송 중', COMPLETED→'완료', CANCELLED→'취소'.\n"
+        "- 도구가 반환하지 않은 주문은 절대 응답에 포함하지 마라. 컨텍스트 메모리·이전 대화에 옛 주문이 기억나도, 이번 도구 결과 외의 어떤 주문 정보도 출력하지 마라. 사용자가 직접 묻지 않은 다른 주문을 끌어와 함께 답하지 말 것.\n"
+        "- 도구 결과가 0건이면 '현재 진행 중인 주문이 없습니다' 또는 '조회된 주문이 없습니다' 정도로만 안내하고, 다른 정보(거래처 추천, 상품 정보, 다른 카테고리 주문)를 늘어놓지 마라. 사용자가 추가로 물어본 뒤에만 다음 단계로 넘어간다.\n"
+        "- 마크다운 강조·표·헤더 금지. 자연체 한국어 문장 + 필요 시 '1.' 번호만 사용. 수치(품목·수량·날짜·금액)를 먼저 풀어 제시.\n"
         "\n"
         "[자연어 협상/납품일 → 카드 도구 매핑 (매우 중요)]\n"
         "- 사용자가 가격 협상이나 납품일 변경을 요청하면 일반 send_chat_message 로 보내지 말고 전용 카드 도구를 호출합니다. 카드는 채팅방에 PENDING 상태로 노출돼 상대방이 [수락]/[거절] 버튼을 누를 수 있어 합의 흐름이 명확해집니다.\n"

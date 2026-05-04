@@ -402,54 +402,66 @@ def update_product(
 # 주문 관련 도구
 # ─────────────────────────────────────────────
 
-def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
+def get_orders(
+    user_id: str,
+    role: str,
+    status: Optional[str] = None,
+    status_in: Optional[list[str]] = None,
+) -> dict:
     """사용자의 주문 목록을 조회한다. role에 따라 buyer_id / seller_id로 필터링.
 
-    응답 평탄화 (LLM 토큰 절약 + 응답 우선순위 정책 — 상품명·거래처명 메인):
-    - buyer_name / buyer_company / seller_name / seller_company
-    - product_summary: "{첫 상품명}" 또는 "{첫 상품명} 외 N건" (items 비면 None)
-    - items_count: order_items 길이
-    임베딩 객체(buyer/seller/order_items)는 응답에서 제거.
+    조회는 order_service.list_orders 에 위임한다 — soft delete (deleted_at IS NULL)
+    필터와 status_in 다중 상태 필터, 페이지네이션이 서비스 레이어에서 일관 처리된다.
+    응답은 도구 전용으로 다시 평탄화 — LLM 이 참조하는 product_summary / primary_*
+    /item_summary / items_count 필드를 유지한다 (orchestrator 시스템 프롬프트 라인
+    1643-1644, 2542 가 이 필드명으로 주문 매칭/선택을 지시).
+
+    파라미터:
+      - user_id: 조회 대상 사용자 UUID (필수).
+      - role:    "SELLER" 또는 "BUYER" (필수).
+      - status:  단일 상태 필터 (선택, 하위호환). 예) "SHIPPING".
+      - status_in: 다중 상태 필터 (선택, 권장). status 보다 우선 적용.
+                   진행 중 주문은 ["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED",
+                   "PREPARING","SHIPPING"] 5종으로 호출 (완료/취소 제외).
+
+    응답 키:
+      - buyer_name / buyer_company / seller_name / seller_company
+      - product_summary: "{첫 상품명}" 또는 "{첫 상품명} 외 N건" (items 비면 None)
+      - primary_product_name / primary_quantity / primary_unit_price / primary_subtotal
+      - item_summary: 모든 라인을 "이름 수량단위 x 단가원" 으로 join
+      - items_count: order_items 길이
+    임베딩 객체(buyer/seller/items)는 응답에서 제거 — LLM 토큰 절약.
     """
     try:
-        supabase = get_supabase_client()
+        if role not in ("SELLER", "BUYER"):
+            return {
+                "success": False,
+                "error": f"invalid role: {role} (SELLER|BUYER)",
+                "orders": [],
+                "count": 0,
+            }
 
-        # 역할에 따라 어느 컬럼으로 필터할지 결정
-        # 판매자는 자신이 받은 주문(seller_id), 구매자는 자신이 넣은 주문(buyer_id)
-        if role == "SELLER":
-            id_column = "seller_id"
-        else:
-            id_column = "buyer_id"
+        from app.services.order_service import order_service
 
-        query = (
-            supabase.table("orders")
-            .select(
-                "id, order_number, status, total_amount, delivery_date, "
-                "delivery_address, notes, created_at, buyer_id, seller_id, "
-                "buyer:users!buyer_id(name,company_name), "
-                "seller:users!seller_id(name,company_name), "
-                "order_items(quantity, unit_price, products(name))"
+        # order_service.list_orders 위임 — deleted_at IS NULL + status_in 일관 처리
+        # status_in 이 있으면 list_orders 가 우선 적용, 없으면 단일 status fallback
+        rows, _meta = _run_async_in_thread(
+            lambda: order_service.list_orders(
+                user_id=user_id,
+                role=role,
+                status=status,
+                status_in=status_in,
+                page=1,
+                limit=20,
             )
-            .eq(id_column, user_id)
         )
 
-        # 특정 상태로 필터링 (예: QUOTE_REQUESTED, SHIPPING 등)
-        if status:
-            query = query.eq("status", status)
-
-        result = query.order("created_at", desc=True).limit(20).execute()
-
-        rows = result.data or []
+        # _flatten_order_row 가 buyer_name/seller_name 등 평탄 키를 이미 채워주고
+        # items: [{quantity, unit_price, product_name, product_unit, ...}] 형태.
+        # 도구 전용 summary 필드를 추가로 재가공한다.
         flattened: list[dict] = []
         for row in rows:
-            buyer = row.pop("buyer", None) or {}
-            seller = row.pop("seller", None) or {}
-            items = row.pop("order_items", None) or []
-
-            row["buyer_name"] = buyer.get("name")
-            row["buyer_company"] = buyer.get("company_name")
-            row["seller_name"] = seller.get("name")
-            row["seller_company"] = seller.get("company_name")
+            items = row.pop("items", None) or []
 
             product_names: list[str] = []
             item_summaries: list[str] = []
@@ -460,11 +472,11 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
             row["primary_subtotal"] = None
 
             for idx, item in enumerate(items):
-                product = item.get("products") if isinstance(item, dict) else None
-                if not product:
+                if not isinstance(item, dict):
                     continue
 
-                name = product.get("name")
+                name = item.get("product_name")
+                unit = item.get("product_unit") or "kg"
                 quantity = item.get("quantity")
                 unit_price = item.get("unit_price")
 
@@ -472,9 +484,9 @@ def get_orders(user_id: str, role: str, status: Optional[str] = None) -> dict:
                     product_names.append(name)
 
                     if quantity is not None and unit_price is not None:
-                        item_summaries.append(f"{name} {quantity}kg x {unit_price:,}원")
+                        item_summaries.append(f"{name} {quantity}{unit} x {unit_price:,}원")
                     elif quantity is not None:
-                        item_summaries.append(f"{name} {quantity}kg")
+                        item_summaries.append(f"{name} {quantity}{unit}")
                     else:
                         item_summaries.append(name)
 

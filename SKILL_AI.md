@@ -630,3 +630,39 @@ create_subscription_from_order,
 - 회귀 검증 통과: "자동 확정 / 협상 분기", "auto_confirmed=true", "재고를 자동 차감한다", "[🚨 단가 자동 조회 강제]" 등 옛 표현 모두 미존재.
 - 핵심 교훈: **이름→UUID 매핑 가이드는 LLM 본문 프롬프트보다 schema description 에 박아야 효과 있음.** OpenAI tool_call 은 schema 의 description 을 인자 생성 직전에 다시 읽어 들이므로, "이 필드는 UUID 만 받음"을 schema 차원에서 못 박으면 LLM 이 평문(이름)을 넣을 확률이 거의 사라진다. 본문 프롬프트는 보조 — schema 가 1차 방어선.
 - 핵심 교훈 2: **도구 실패 시 환각 방지는 "안 물은 정보 끌어오지 마라"를 명시적으로 박아야 함.** 단순히 "에러를 정확히 안내하라"만 박으면 LLM 이 친절을 가장해 컨텍스트 메모리의 다른 주문/거래처를 줄줄이 추가로 노출한다. "사용자가 직접 물은 대상의 에러만 답한다"를 본문에 단정문으로 박아야 멈춘다.
+
+#### get_orders 도구 — service 위임 + status_in 다중 상태 (2026-05-04 추가)
+- 기존 `agent_tools.get_orders` 가 (1) `.is_("deleted_at", None)` 누락으로 삭제된 주문도 응답에 포함되고 (2) 단일 `status` 만 받아 사용자의 "진행 중인 주문" (UI 의 5상태 다중 정의: `QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING`) 같은 발화를 표현 못하던 두 가지 결함이 있었다 → `order_service.list_orders` 위임 패턴으로 동시 해결.
+- **위임 패턴**: 도구 본문에서 직접 `supabase.table("orders").select(...)` 를 호출하지 않고 `_run_async_in_thread(lambda: order_service.list_orders(user_id=..., role=..., status=status, status_in=status_in, page=1, limit=20))` 으로 service 의 비동기 메서드 호출. service 가 이미 `deleted_at IS NULL` + `status_in` 다중 + 페이지네이션 + buyer/seller/items 임베딩을 일관 처리하므로 도구는 응답을 LLM-친화 형식으로 재가공만 한다.
+- **시그니처**: `def get_orders(user_id, role, status: Optional[str]=None, status_in: Optional[list[str]]=None) -> dict`. 기존 호출 (`status=...`) 은 그대로 동작 (하위호환). status_in 우선 적용은 service 레이어에서 결정.
+- **schema description 강화** (orchestrator.py `TOOLS` 의 `get_orders` 엔트리): "사용자가 '진행 중', '활성', '내 주문' 등 표현 시 `status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING']` 로 호출. 완료/취소 제외" 를 명시. enum 도 7종 모두 박음 (단일 `status` 와 동일). LLM 이 schema description 을 tool_call 인자 생성 직전에 직접 읽으므로, 다중 상태 매핑은 본문 프롬프트보다 schema 에 박는 것이 준수율이 높다.
+- **LLM 응답 contract 보존**: `_flatten_order_row` 가 채워주는 `items: [...]` 에서 `product_name`/`product_unit`/`quantity`/`unit_price` 를 다시 모아 `product_summary` / `primary_product_name` / `primary_quantity` / `primary_unit_price` / `primary_subtotal` / `item_summary` / `items_count` 7종 derived 필드를 도구 응답에 추가한다 — 시스템 프롬프트 (`AGENT_BASE_SYSTEM` 라인 1643-1644 "product_summary 또는 primary_product_name 이 상품명과 일치", chat_node 라인 2542 "get_chat_rooms 결과의 product_summary, primary_quantity, item_summary") 가 이 필드명으로 주문 매칭/선택을 지시하므로 service 응답을 그대로 노출하면 안 됨. 임베딩 객체(`buyer`/`seller`/`items`) 는 응답에서 제거 → LLM 토큰 절약.
+- **검증 패턴 (venv 없는 환경에서도 통과)**: AST 로 `get_orders` body 를 unparse 한 뒤 `"order_service.list_orders" in body` / `"_run_async_in_thread" in body` / `"product_summary" in body` 등 substring assertion. 동시에 `ast.literal_eval(TOOLS_node)` 로 orchestrator 의 `TOOLS` list 를 파싱해 `status_in` properties 가 `type:"array"`, `items.enum` 7종 보유하는지 검증 + `json.dumps(tool_entry)` round-trip 으로 OpenAI tool calling 포맷 준수 확인. 동일 패턴이 다른 schema 변경 검증에도 재사용 가능.
+- **`_execute_tool` 의 kwargs 호출 (`func(**tool_input)`) 덕분에 새 파라미터 추가가 안전**: 기존 `INT_FIELDS` 변환 로직과 충돌 없음. list 파라미터는 OpenAI 가 array 로 직접 보내주므로 별도 변환 불필요. dispatch 코드 변경 없이 도구 함수 + schema 두 곳만 갱신하면 된다.
+- **service 위임의 부수 효과 — 정렬/페이지네이션도 통일**: 기존 도구는 `.order("created_at", desc=True).limit(20)` 직접 박고 있었는데 service.list_orders 도 동일 (`order("created_at", desc=True).range(...)`) 이라 응답 순서/개수는 그대로 유지. 향후 service 가 정렬·페이지 정책을 바꾸면 도구도 자동 따라간다.
+- **확장 가이드**: `agent_tools.get_chat_rooms` 도 같은 패턴 (직접 supabase 호출 + 자체 flatten) 인데 `chat_room_service` 가 있다면 위임으로 통일 가능. 다른 도구 (`get_calendar_events`, `find_alternative_partners`) 는 deleted_at 필터를 직접 챙기고 있으니 이번 함정 대상은 아님 — 신규 도구 추가 시 "service 가 있으면 무조건 위임" 을 1순위 패턴으로 적용할 것.
+
+#### get_orders 자연어 → status_in 매핑 + 응답 환각 방지 가이드 (2026-05-04 추가)
+- schema description 만으로는 LLM 이 사용자의 다양한 한국어 표현을 정확히 status_in 으로 옮긴다는 보장이 부족. tool_call 인자 생성 직전 schema 를 읽기는 하지만, 자연어 → enum 다중 매핑은 본문 프롬프트와 schema description 양쪽에 동시에 박아야 LLM 이 일관되게 호출한다. 또한 `get_orders` 결과 응답 표현 규칙(환각 방지)도 함께 박아야 "협상 요청 중" / "상태 없음" / "검토 중" 같이 enum 에 없는 LLM 임의 표현을 막을 수 있다.
+- 적용 위치 (orchestrator.py):
+  - `AGENT_BASE_SYSTEM` 의 `[주문 목록 조회 가이드 — 자연어 → status_in 매핑 (매우 중요)]` (라인 1623 근방, [재고 검색 vs 대체 거래처 추천 분리 원칙] 직후, [도구 실패 시 응답 가이드] 직전) + `[주문 응답 표시 규칙 — 환각 방지]` (라인 1637 근방). SELLER/BUYER 합성본 양쪽에 자동 반영. response_node 의 요약 단계에서도 BASE 가 적용되므로 한 곳에 박는 것으로 전체 흐름 커버.
+  - `chat_node` 시스템 프롬프트의 동일 두 섹션 (라인 2625 / 2633 근방, [도구 실패 시 응답 가이드] 직후, [자연어 협상/납품일 → 카드 도구 매핑] 직전). chat intent 라우팅 시 사용자가 "주문 보여줘" / "진행 중인 주문 확인" 같이 자연어로 가장 자주 묻는 노드라 BASE 와 별도로 직접 명시 — 5중 패턴(BASE + chat_node + schema description) 의 일부.
+- 자연어 매핑 핵심 (8종):
+  1. "진행 중인 주문" / "활성 주문" / "내 주문" / "오픈된 주문" / "처리 중 주문" → `status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"]` (5상태)
+  2. "완료된 주문" / "끝난 주문" → `status_in=["COMPLETED"]`
+  3. "취소된 주문" / "취소건" → `status_in=["CANCELLED"]`
+  4. "협상 중 주문" → `status_in=["NEGOTIATING"]`
+  5. "확정된 주문" → `status_in=["CONFIRMED"]`
+  6. "배송 중 주문" → `status_in=["SHIPPING"]`
+  7. "준비 중 주문" / "출고 준비 중" → `status_in=["PREPARING"]`
+  8. "견적 요청" / "들어온 견적" → `status_in=["QUOTE_REQUESTED"]`
+  9. **상태 미명시** ("주문 보여줘" / "주문 목록") → 진행 중 기본값 (5상태). 완료/취소는 사용자가 명시 요청해야 포함.
+- 응답 표시 규칙 핵심 (환각 방지 5종):
+  - status enum 한글 매핑 고정: `QUOTE_REQUESTED→"견적 요청"`, `NEGOTIATING→"협상 중"`, `CONFIRMED→"주문 확정"`, `PREPARING→"준비 중"`, `SHIPPING→"배송 중"`, `COMPLETED→"완료"`, `CANCELLED→"취소"`. 임의 표현("협상 요청 중", "상태 없음", "검토 중", "보류") 금지.
+  - 도구가 반환하지 않은 주문은 절대 응답에 포함 금지 — 컨텍스트 메모리/이전 대화에 옛 주문이 기억나도 출력 X. 사용자가 직접 묻지 않은 다른 주문(어제 본 견적, 옛 참치 주문)을 끌어와 답하지 말 것.
+  - 0건이면 "현재 진행 중인 주문이 없습니다" 또는 "조회된 주문이 없습니다" 만 안내. 거래처 추천·다른 카테고리 주문·상품 정보 늘어놓지 말 것.
+  - 마크다운 강조·표·헤더 금지(가독성 일관). 자연체 한국어 + 필요 시 `1.` 번호.
+  - 응답 예시는 수치(품목·수량·날짜·금액) 우선 형식: `"옥수수 50kg — 협상 중, 납품일 5월 20일, ₩600,000"` — 검증된 패턴 ("수치를 먼저 제시하는 응답 형식이 더 효과적") 그대로 적용.
+- 검증 결과: AST OK, placeholder 11/11 보존, 잔여 placeholder 0(SELLER/BUYER 양쪽), 신규 가이드 BASE + chat_node 모두 포함, BUYER 전용 가이드 SELLER 누출 0건, 옛 표현 회귀 0건, 이전 가이드 26종 모두 보존.
+- **핵심 교훈 — 다중 enum 매핑은 schema + 본문 5중 명시**: 단일 status 만 있을 때는 schema description 한 줄로 충분했지만 status_in 처럼 LLM 이 다중 enum 배열을 추론해야 하는 파라미터는 (1) schema description 의 enum + 매핑 안내, (2) BASE 본문의 [주문 목록 조회 가이드] 8종 매핑, (3) chat_node 의 동일 매핑 — 3중으로 박아야 LLM 이 "진행 중인 주문" 같은 자연어 발화를 정확히 5상태 배열로 변환한다. schema 만 있으면 LLM 이 자주 단일 status 만 보내고 다른 4상태를 누락시키는 사례가 있어 본문 프롬프트가 백업 역할을 한다.
+- **핵심 교훈 — 응답 표시 규칙은 enum 매핑까지 명시 박아야 환각 차단**: 도구 결과의 status 값을 그대로 LLM 에 던져주면, GPT-4o-mini 가 "협상 요청 중" / "상태 없음" 같이 enum 에 없는 한국어 표현을 자기 멋대로 만들어내 사용자 혼란을 유발한다. "이 매핑만 사용" + 한글 표 7종을 본문에 박으면 LLM 이 곧이곧대로 따라가 일관된 표현이 나온다. 부정형("X 라고 말하지 마라")은 한 번 더 강조해서 본문 + 헤더 옆 강조 + 마지막 문장 3중으로 박는 패턴을 그대로 유지.
