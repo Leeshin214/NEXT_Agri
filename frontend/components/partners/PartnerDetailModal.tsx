@@ -20,6 +20,7 @@ import {
 import Modal from '@/components/common/Modal';
 import StatusBadge from '@/components/common/StatusBadge';
 import SubscriptionFormModal from '@/components/subscriptions/SubscriptionFormModal';
+import PartnerChatRooms from '@/components/partners/PartnerChatRooms';
 import {
   usePartnerStats,
   useTogglePartnerFavorite,
@@ -555,6 +556,21 @@ export default function PartnerDetailModal({
               </div>
             </div>
           </section>
+
+          {/* US-3 — 진행 중 채팅 (보낸 거래처 요청 상태에선 채팅 액션이 잠겨있으므로 노출 X) */}
+          {!isPendingOutgoing && (
+            <section>
+              <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-700">
+                <MessageCircle className="h-4 w-4" />
+                진행 중 채팅
+              </h3>
+              <PartnerChatRooms
+                partnerUserId={partner.partner_user_id}
+                myRole={myRole}
+                onNavigate={onClose}
+              />
+            </section>
+          )}
 
           {/* V1.6 — 받은 정기배송 요청 (보낸 거래처 요청 상태에선 정기배송 자체를 노출하지 않음) */}
           {!isPendingOutgoing && incomingPendingSubs.length > 0 && (

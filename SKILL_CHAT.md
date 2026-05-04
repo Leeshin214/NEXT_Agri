@@ -1060,6 +1060,48 @@ seller/chat, buyer/chat 페이지의 인라인 리스트 ~50줄을 `<ChatRoomLis
 `useChatRooms` / `useMessagesWithWebSocket` / `useMarkAsRead` / `useSummarizeChat` 등 기존
 훅·로직은 모두 그대로 유지 — 메시지 영역 / 헤더 / OrderContextBanner / 빠른 액션 popover 변경 없음.
 
+### 거래처 상세 — 진행 중 채팅 카드 섹션 (US-3, 검증됨 2026-05-04)
+
+거래처 상세(`PartnerDetailModal`) 안에 그 거래처와의 채팅방을 카드 형태로 노출. 채팅 페이지로 가지 않고도 그 거래처와 어떤 주문이 협상 중인지 한눈에 보여주기 위한 진입점.
+
+#### 컴포넌트 (frontend/components/partners/PartnerChatRooms.tsx)
+- props: `partnerUserId: string`, `myRole: 'SELLER' | 'BUYER'`, `onNavigate?: () => void`
+- 데이터 — 옵션 A (클라이언트 필터):
+  - `useChatRooms()` 전체를 받아 `myRole==='SELLER' ? room.buyer_id : room.seller_id === partnerUserId` 로 필터
+  - 주문 요약(품목·수량·상태)은 `useOrders({ partner_user_id, limit: 200 })` 응답을 `Map<order_id, Order>` 로 만들어 `room.order_id` 와 매칭
+  - 백엔드 변경 0. 채팅방 N 이 커지면 옵션 B(백엔드 partner 필터 쿼리) 로 전환
+- "진행 중" 정의: `order_id` 가 있는 방은 `order.status` 가 `COMPLETED`/`CANCELLED` 가 아닐 때만 노출. `order_id` 가 없는 일반 대화방은 항상 노출
+- 정렬: 주문 채팅 우선 → `last_message_at` (없으면 `created_at`) DESC
+- 클릭 → `router.push(/{role}/chat?room_id={id})` + `onNavigate?.()` 로 부모 모달 닫기
+- 주문 요약 라벨: `order.product_summary` 우선 (백엔드가 채워줌). 미제공 시 `items[0].product_name + qty + 외 N건` 폴백. 주문 정보가 아직 로드되기 전엔 "주문 정보 불러오는 중..." 표시
+
+#### 빈 상태
+"이 거래처와 진행 중인 채팅이 없어요. 새 주문이 들어오면 자동으로 채팅방이 열려요." — 점선 박스(`border-dashed`) + 회색 톤. 사용자가 직접 채팅을 만들 동작은 헤더의 "채팅 시작" 빠른액션이 이미 담당하므로 빈 상태에 별도 CTA 두지 않음.
+
+#### PartnerDetailModal 통합
+거래 통계 섹션과 정기배송 섹션 사이에 신규 `<section>` 으로 삽입. `MessageCircle` 아이콘 + "진행 중 채팅" 헤더. `isPendingOutgoing` 일 때는 채팅 액션 자체가 잠겨있으므로 섹션도 숨김 (정기배송 섹션과 동일한 가드 패턴).
+
+```tsx
+{!isPendingOutgoing && (
+  <section>
+    <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-700">
+      <MessageCircle className="h-4 w-4" /> 진행 중 채팅
+    </h3>
+    <PartnerChatRooms
+      partnerUserId={partner.partner_user_id}
+      myRole={myRole}
+      onNavigate={onClose}
+    />
+  </section>
+)}
+```
+
+#### 카드 스타일 — 모바일 대응
+`flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between` — 좁은 화면(<640px)에선 라벨/메시지 위에 메타(시각·바로가기) 가 쌓이고, sm 이상에선 좌우 2열 배치. 메시지 한 줄은 항상 `truncate`.
+
+#### 상대 시각 헬퍼
+`ChatRoomGroup.formatRelativeTime` 와 동일 시그니처 (`방금 전 / N분 전 / N시간 전 / N일 전 / M.D`). 두 컴포넌트가 별개 파일이라 시그니처/로직만 맞춤. 향후 `lib/date.ts` 로 끌어올려 통합 예정.
+
 ### 납품일 변경 요청·승인 채팅 카드 (검증됨, 2026-04-29)
 
 backend 가 `delivery_date_change_history` 테이블 + 4개 엔드포인트 (`/orders/{id}/delivery-date-changes` GET/POST + `.../{change_id}/accept`, `.../{change_id}/reject`) 추가. 채팅에는 3개 신규 message_type 이 broadcast 된다:
