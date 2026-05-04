@@ -517,7 +517,8 @@ TOOLS = [
                 "특정 카테고리의 모든 판매자 및 상품 목록을 조회한다. "
                 "구매자가 특정 품목(예: 풋사과, 청사과)을 찾을 때, 이 도구로 상위 카테고리(예: FRUIT) 전체를 조회한 후 "
                 "LLM이 직접 결과값을 읽고 사용자가 원하는 세부 품목 조건에 맞는 것만 필터링해서 답변해야 한다. "
-                "정확한 상품명을 알고 있는 경우 product_name을 함께 전달하면 더 정확한 결과를 반환한다."),
+                "정확한 상품명을 알고 있는 경우 product_name을 함께 전달하면 더 정확한 결과를 반환한다. "
+                "응답의 seller_id 는 UUID 형식이라 create_order 의 seller_id 에 그대로 사용 가능. 사용자가 직후 발화에서 회사명/담당자만 언급해도 이 응답을 컨텍스트로 활용해 다시 get_user_profile 을 호출할 필요 없이 매칭되는 항목의 seller_id 를 그대로 쓸 것."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1768,14 +1769,25 @@ LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대�
    바로 create_order 를 부르지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인하고, 주문이 맞다면 납품일도 함께 받아낸다.
 
 [🚨 주문 대상 판매자 식별 절차 — 매우 중요]
-사용자가 "○○에게 주문해줘", "○○한테 발주", "○○ 농가에 견적 요청" 같이 판매자를 이름/회사명으로만 지칭한 경우, create_order 호출 전에 반드시 다음 순서로 진행한다.
+create_order 호출 시 seller_id 는 반드시 UUID 형식이어야 한다. 사용자가 "test3", "○○ 농가", "○○ 도매상" 같이 판매자를 이름/회사명으로 지칭한 경우 다음 우선순위로 UUID 를 확보한다. 이 순서를 절대 어기지 마라.
 
-1. get_user_profile(username='○○') 또는 get_user_profile(company_name='○○') 를 먼저 호출해서 해당 사용자의 UUID 를 확보한다. 품목까지 함께 언급된 경우(예: "감자 살 만한 OO 농가에") find_sellers_by_product(category=..., product_name='감자') 결과에서 회사명/담당자가 매칭되는 후보의 user_id 를 사용해도 된다.
-2. 정확히 1명만 매칭되면 그 user.id 값을 seller_id 로 사용해 create_order 호출.
-3. 후보가 여러 명 매칭되면 도구 호출하지 말고 사용자에게 자연체로 "○○ 농가가 두 곳 있어요. △△ 농가(담당자 □□)와 ◇◇ 농가(담당자 ◎◎) 중 어느 쪽으로 주문할까요?"처럼 풀어서 되묻고 답변을 기다린다.
-4. 0건 매칭이면 "'○○' 라는 거래처를 찾을 수 없어요. 정확한 이름이나 회사명을 알려주세요." 라고 자연체로 안내한다. 사용자가 명시적으로 요청하기 전에는 다른 거래처를 임의 추천하지 마라 (find_alternative_partners 는 사용자 동의 후에만 호출).
+[1순위 — 직전 대화 컨텍스트 활용 (가장 우선)]
+직전 대화에서 find_sellers_by_product 또는 find_buyers_by_product 를 호출해 이미 판매자 목록을 응답으로 받은 경우, 그 응답에 들어 있는 seller_id 를 그대로 사용한다. 사용자가 "test3한테 주문해줘"라고 말하면 직전 응답 결과 항목 중 seller_name / seller_company / username 이 "test3"와 매칭되는 항목의 seller_id 를 골라 create_order(seller_id=그_UUID) 를 호출한다. 이미 컨텍스트에 UUID 가 있는데 굳이 get_user_profile 을 다시 부르지 마라.
 
-LLM 이 추측한 UUID 또는 사용자가 말한 이름 자체를 seller_id 자리에 직접 넣는 것은 절대 금지다. 이름/회사명/임의 문자열을 seller_id 에 넣으면 백엔드가 호출 실패로 처리한다. UUID 형식의 실제 값만 넘겨야 한다.
+[2순위 — 새로 검색 (직전 컨텍스트에 없는 경우)]
+직전 대화에 판매자 목록이 없거나 사용자가 새 품목을 언급하면 find_sellers_by_product(category=품목 카테고리, product_name='○○') 를 호출해 응답을 받는다. 응답에서 사용자 발화와 매칭되는 후보의 seller_id 를 그대로 사용해 create_order 호출.
+
+[3순위 — get_user_profile 폴백 (위 두 방법이 안 통할 때만)]
+사용자가 품목 정보 없이 거래처 이름만 언급해서 find_sellers_by_product 를 못 부르고, 직전 컨텍스트에도 매칭되는 판매자 정보가 없는 경우에만 get_user_profile(username='○○') 또는 get_user_profile(company_name='○○') 를 호출한다. 이 도구는 ILIKE 부분 일치 검색이라 정확히 일치하지 않을 수 있다. 결과가 0건이면 사용자에게 "'○○' 라는 거래처를 찾을 수 없어요. 정확한 이름이나 회사명을 알려주세요"라고 자연체로 되묻는다. 임의로 다른 거래처를 추천하지 마라.
+
+[금지 사항]
+- 사용자가 말한 이름 자체를 seller_id 자리에 그대로 넣는 행위 (예: seller_id="test3"). 이름·회사명·임의 문자열을 넣으면 백엔드가 즉시 실패 처리한다.
+- UUID 를 LLM 이 추측해서 만들어 내는 행위. UUID 는 도구 응답에서 받은 실제 값만 사용한다.
+- find_sellers_by_product / find_buyers_by_product 응답에 이미 seller_id 가 포함돼 있는데 굳이 get_user_profile 을 다시 호출하는 행위. 1순위가 이미 충족됐으면 추가 도구 호출 없이 바로 create_order.
+- 사용자가 묻지 않은 다른 정보(이전 주문 내역, 다른 거래처, 옛 견적)를 답변에 끌어와 늘어놓는 행위. 도구 실패 응답 가이드와 동일한 원칙 — 사용자가 직접 물은 대상에 대해서만 답한다.
+
+[다중 매칭 처리]
+1순위 또는 2순위 결과에서 사용자 발화와 매칭되는 후보가 2명 이상이면 도구 호출하지 말고 사용자에게 자연체로 "test 농가(담당자 □□)와 test3 도매상(담당자 ◎◎) 중 어느 쪽으로 주문할까요?"라고 풀어서 되묻는다. 사용자 답변을 받기 전에는 create_order 를 부르지 마라.
 
 [🚨 단가 / 납품일 필수 확보]
 create_order 호출 시 unit_price 와 delivery_date 둘 다 비어있으면 안 된다.
@@ -2663,10 +2675,12 @@ async def chat_node(state: AgentState) -> dict:
         "- 결과 0건이거나 전부 OUT_OF_STOCK 이면 그 사실을 그대로 안내하고 '다른 품목이나 비슷한 카테고리로 대체 거래처를 찾아볼까요?'라고 사용자 동의를 구한 뒤에만 find_alternative_partners 호출.\n"
         "\n"
         "[주문 대상 판매자 식별 절차 (매우 중요)]\n"
-        "- 사용자가 'test3에게 주문해줘', '○○ 농가한테 발주', '○○ 도매상에 견적' 같이 판매자를 이름/회사명으로만 지칭한 경우 create_order 호출 전에 반드시 UUID 부터 확보한다.\n"
-        "- 1단계: get_user_profile(username='test3') 또는 get_user_profile(company_name='○○ 농가') 호출. 품목까지 언급되면 find_sellers_by_product(category=..., product_name=...) 결과에서 회사명/담당자가 일치하는 후보의 user_id 를 써도 된다.\n"
-        "- 2단계: 정확히 1명 매칭 → 그 user.id 를 seller_id 로 사용해 create_order 호출. 여러 명 매칭 → 사용자에게 '○○ 농가와 △△ 도매상 중 어느 쪽으로 주문할까요?' 자연체로 되묻기. 0건 매칭 → '\\'○○\\' 라는 거래처를 찾을 수 없어요. 정확한 이름이나 회사명을 알려주세요' 안내. 사용자 명시 동의 전에는 다른 거래처 임의 추천 금지.\n"
-        "- LLM 이 추측한 UUID 나 사용자가 말한 이름 자체(예: 'test3')를 seller_id 자리에 그대로 넣는 행위는 절대 금지. 이름·회사명·임의 문자열을 seller_id 에 넣으면 백엔드가 호출 실패로 처리한다. UUID 형식의 실제 값만 넘긴다.\n"
+        "- create_order 호출 시 seller_id 는 반드시 UUID 형식이어야 한다. 사용자가 'test3', '○○ 농가', '○○ 도매상' 같이 이름/회사명으로 판매자를 지칭하면 아래 우선순위로 UUID 를 확보한다. 이 순서를 절대 어기지 마라.\n"
+        "- [1순위 — 직전 대화 컨텍스트 활용 (가장 우선)] 직전 대화에서 find_sellers_by_product 또는 find_buyers_by_product 를 이미 호출해 판매자 목록을 응답으로 받은 경우, 그 응답에 들어 있는 seller_id 를 그대로 사용한다. 사용자가 'test3한테 주문해줘'라고 하면 직전 응답에서 seller_name / seller_company / username 이 'test3'와 매칭되는 항목의 seller_id 를 골라 create_order(seller_id=그_UUID) 호출. 이미 컨텍스트에 UUID 가 있는데 굳이 get_user_profile 을 다시 부르지 마라.\n"
+        "- [2순위 — 새로 검색] 직전 컨텍스트에 판매자 목록이 없거나 사용자가 새 품목을 언급하면 find_sellers_by_product(category=품목 카테고리, product_name='○○') 호출. 응답에서 사용자 발화와 매칭되는 후보의 seller_id 를 그대로 사용해 create_order 호출.\n"
+        "- [3순위 — get_user_profile 폴백 (위 두 방법이 안 통할 때만)] 사용자가 품목 정보 없이 거래처 이름만 언급해서 find_sellers_by_product 를 못 부르고 직전 컨텍스트에도 매칭되는 판매자 정보가 없는 경우에만 get_user_profile(username='○○') 또는 get_user_profile(company_name='○○') 호출. ILIKE 부분 일치 검색이라 정확히 일치하지 않을 수 있다. 결과 0건이면 '○○ 라는 거래처를 찾을 수 없어요. 정확한 이름이나 회사명을 알려주세요'라고 자연체로 되묻기. 임의 거래처 추천 금지.\n"
+        "- [금지] 사용자가 말한 이름 자체를 seller_id 자리에 그대로 넣지 마라(예: seller_id='test3'). 임의 UUID 추측 금지. find_sellers_by_product 응답에 이미 seller_id 가 있는데 굳이 get_user_profile 다시 부르지 마라. 사용자가 묻지 않은 이전 주문/다른 거래처를 끌어와 늘어놓지 마라.\n"
+        "- [다중 매칭] 1순위 또는 2순위 결과에서 사용자 발화와 매칭되는 후보가 2명 이상이면 도구 호출하지 말고 'test 농가와 test3 도매상 중 어느 쪽으로 주문할까요?'처럼 자연체로 되묻기. 사용자 답변 받기 전에는 create_order 호출 금지.\n"
         "\n"
         "[구매자 주문/견적 생성 가이드]\n"
         "- 구매자가 '○○ 주문해줘', '○○ 발주 넣어줘'처럼 명확한 주문 의도를 표현하면 즉시 create_order 를 호출한다. 단, 백엔드는 더 이상 가격 일치만으로 자동 확정하지 않는다. 모든 신규 주문은 QUOTE_REQUESTED 견적 상태로 시작해 판매자 검토를 기다리며, 가격이 시세보다 낮을 때만 NEGOTIATING + 카운터오퍼 카드 흐름으로 자동 분기된다. LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대로 신뢰한다.\n"

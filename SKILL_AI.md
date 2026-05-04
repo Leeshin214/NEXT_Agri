@@ -619,17 +619,25 @@ create_subscription_from_order,
 - 이유: GPT-4o-mini 는 가이드의 마지막 예시 문장을 그대로 따라가는 경향이 있어, **명사 + 수치 + 핵심 정보를 마침표로 끊어 나열**하는 패턴이 채팅창에서 가독성도 좋고 LLM 도 잘 재현함.
 - 반대로 부정형 ("절대 X 라고 말하지 마라") 은 한 번 더 강조 — `[응답 표현]` 섹션 본문 + 헤더 옆 강조 + 가이드 맨 마지막 문장 3중으로 박아야 LLM 이 무의식적으로 옛 표현으로 돌아가는 걸 막을 수 있음 (이번 작업에서 "주문이 확정됐습니다 절대 금지"를 3곳에 분산 명시).
 
-#### 주문 대상 판매자 식별 절차 + 도구 실패 시 환각 방지 (2026-05-04 추가)
+#### 주문 대상 판매자 식별 절차 + 도구 실패 시 환각 방지 (2026-05-04 갱신 — 우선순위 재정의)
 - 실제 사용자 시나리오 실패: "test3한테 감자 10kg 주문해줘" → AI 가 `create_order(seller_id="test3")` 처럼 이름을 UUID 자리에 직접 넣어 호출 실패 + 그 후 환각으로 컨텍스트 메모리에 있던 다른 주문(동해 참치·참나물 등)을 줄줄이 노출. 두 가지 결함을 동시에 강제로 차단해야 한다.
 - (1) **schema description 강화** (orchestrator.py 라인 ~423-434): `create_order` 의 `seller_id` 와 `buyer_id` description 에 "이름/회사명 평문 금지", "get_user_profile / find_sellers_by_product 로 UUID 조회 후 사용", "UUID 아닌 값은 백엔드가 즉시 실패시킨다"를 명시. JSON schema description 은 OpenAI 가 tool_call 인자 생성 시점에 직접 참조하므로, 이 위치에서 막는 것이 BUYER_ROLE_APPENDIX 본문 가이드보다 LLM 준수율이 더 높다.
-- (2) **BUYER_ROLE_APPENDIX 신규 섹션** `[🚨 주문 대상 판매자 식별 절차]` (라인 ~1693 근방, [구매자 주문/견적 생성 규칙] 직후, [단가/납품일 필수 확보] 직전): 1단계 get_user_profile / find_sellers_by_product 호출 → 2단계 정확 1명 매칭 → create_order, 여러 명 → 되묻기, 0건 → "정확한 이름 알려주세요" 의 4단계 절차 명시. 사용자 명시 동의 없이 find_alternative_partners 호출 금지 함께 박음.
-- (3) **chat_node 시스템 프롬프트** (라인 ~2556 근방, [needs_confirmation 응답 가이드] / [자연어 협상/납품일 → 카드 도구 매핑] 사이): chat intent 라우팅 시 가장 자주 호출되는 노드라 BUYER_ROLE_APPENDIX 와 별도로 동일 매핑 명시. UUID 조회 → seller_id 채우기 → create_order 호출 순서.
+- (1.5) **find_sellers_by_product schema description 보강** (라인 ~520): description 끝에 "응답의 seller_id 는 UUID 형식이라 create_order 의 seller_id 에 그대로 사용 가능. 사용자가 직후 발화에서 회사명/담당자만 언급해도 이 응답을 컨텍스트로 활용해 다시 get_user_profile 을 호출할 필요 없이 매칭되는 항목의 seller_id 를 그대로 쓸 것" 추가. find_*_by_product 응답을 다음 발화의 컨텍스트로 활용하는 패턴을 schema 차원에서 LLM 에게 알려줌.
+- (2) **BUYER_ROLE_APPENDIX `[🚨 주문 대상 판매자 식별 절차 — 매우 중요]` 섹션 (라인 ~1770)** — 우선순위 명시 버전. 1단계 get_user_profile 부터 부르라고 박았던 옛 가이드는 LLM 을 ILIKE 매칭 실패로 유도해 "거래처 찾을 수 없다" 잘못된 응답 양산. **컨텍스트에 이미 seller_id 가 있으면 그것부터 쓰는 게 정답**. 새 우선순위 4단계로 재구성:
+  - **[1순위 — 직전 대화 컨텍스트 활용]** 직전 find_sellers_by_product / find_buyers_by_product 응답의 seller_id 를 그대로 사용. seller_name / seller_company / username 매칭만 해서 create_order 호출. **이미 컨텍스트에 UUID 가 있는데 굳이 get_user_profile 다시 부르지 마라**.
+  - **[2순위 — 새로 검색]** 직전 컨텍스트에 판매자 목록이 없거나 사용자가 새 품목 언급 → find_sellers_by_product(category, product_name) 호출 → seller_id 사용.
+  - **[3순위 — get_user_profile 폴백]** 사용자가 품목 정보 없이 거래처 이름만 언급해서 find_sellers_by_product 를 못 부르고 직전 컨텍스트에도 매칭이 없을 때**만** get_user_profile(username/company_name) 호출. ILIKE 부분 일치라 정확 매칭 안 될 수 있음을 명시. 0건이면 사용자에게 정확한 이름 되묻기.
+  - **[금지 사항]** 명시적 단정문 4종: 이름을 seller_id 에 그대로 넣지 마라 / UUID 추측 금지 / 응답에 이미 seller_id 가 있는데 get_user_profile 다시 부르지 마라 / 안 물은 다른 정보(이전 주문, 다른 거래처) 끌어오지 마라.
+  - **[다중 매칭]** 1순위/2순위 결과에서 후보 2명 이상이면 도구 호출 X, 사용자에게 자연체로 되묻기.
+- (3) **chat_node 시스템 프롬프트 동일 섹션 (라인 ~2677)** 에도 동일한 4단계(우선순위 + 금지 + 다중매칭) 매핑을 직접 명시. chat intent 라우팅 시 가장 자주 호출되는 노드라 BUYER_ROLE_APPENDIX 와 별도로 박음 — 5중 명시 패턴 일부.
 - (4) **AGENT_BASE_SYSTEM 신규 섹션** `[도구 실패 시 응답 가이드 — 매우 중요 (환각 방지)]` (라인 ~1591 근방, [재고 검색 vs 대체 거래처 추천 분리 원칙] 직후, [주의사항] 직전): SELLER/BUYER 합성본 양쪽에 자동 반영. 핵심 원칙 6개 — (a) 실패 사실+원인을 한 줄, (b) 안 물은 다른 정보 끌어와 늘어놓지 마라, (c) 다음 액션 1개만 짧게, (d) 실패를 성공으로 포장 금지, (e) 컨텍스트 메모리의 다른 주문/거래처 자기멋대로 노출 금지, (f) error 코드 영문 그대로 노출 금지.
 - (5) **chat_node** 에도 동일한 [도구 실패 시 응답 가이드] 섹션을 직접 명시. BASE 안에서도 들어가지만, chat 라우팅이 가장 자주 도구 실패를 마주치는 노드라 중복 명시 — 5번 정도가 LLM 망각을 가장 잘 방어하는 표준 패턴 (가독성/마크다운 금지 가이드도 같은 5중 패턴).
 - 검증 결과: AST OK, placeholder 11개 모두 보존 (`role_label`, `role_label_short`, `case1/2/10/11_action`, `auth_product_rule`, `ambiguity_modify_rule`, `user_id`, `company_name`, `user_name`), BUYER 합성본 잔여 placeholder 0, SELLER 합성본 잔여 placeholder 0, BUYER 전용 가이드(`주문 대상 판매자 식별 절차`)가 SELLER 합성본에 누출 0건, 도구 실패 가이드는 BASE 에 박힌 결과 SELLER/BUYER 양쪽 자동 반영 확인. 이전 가이드 14종(가독성, 핵심 대화 원칙, 대체 거래처, send_chat_message needs_confirmation, 자연어→카드 도구, 안전장치, 재고 vs 대체, 구매자 주문/견적, 단가/납품일 필수, 주문 결과 응답 표현, 납품일 변경, 채팅방 연결, 신규 구매자 발굴, 카드 도구 매핑) 모두 보존.
 - 회귀 검증 통과: "자동 확정 / 협상 분기", "auto_confirmed=true", "재고를 자동 차감한다", "[🚨 단가 자동 조회 강제]" 등 옛 표현 모두 미존재.
 - 핵심 교훈: **이름→UUID 매핑 가이드는 LLM 본문 프롬프트보다 schema description 에 박아야 효과 있음.** OpenAI tool_call 은 schema 의 description 을 인자 생성 직전에 다시 읽어 들이므로, "이 필드는 UUID 만 받음"을 schema 차원에서 못 박으면 LLM 이 평문(이름)을 넣을 확률이 거의 사라진다. 본문 프롬프트는 보조 — schema 가 1차 방어선.
 - 핵심 교훈 2: **도구 실패 시 환각 방지는 "안 물은 정보 끌어오지 마라"를 명시적으로 박아야 함.** 단순히 "에러를 정확히 안내하라"만 박으면 LLM 이 친절을 가장해 컨텍스트 메모리의 다른 주문/거래처를 줄줄이 추가로 노출한다. "사용자가 직접 물은 대상의 에러만 답한다"를 본문에 단정문으로 박아야 멈춘다.
+- 핵심 교훈 3 (2026-05-04 신규 — 우선순위 가이드 회귀 사고에서 학습): **"가장 정확한 도구를 부르라"는 본능적 직관이 오히려 함정**. 옛 가이드가 "1단계: get_user_profile 호출"을 우선순위 맨 위에 둔 이유는 "사용자 이름 → user 테이블 정확 조회"가 가장 직관적이기 때문이지만, 실제로는 (a) ILIKE 부분 일치라 정확히 매칭 안 될 수 있고 (b) 직전 대화 컨텍스트의 seller_id 를 무시하게 만들어 이미 확보된 UUID 를 버리고 다시 검색하는 비효율 + 매칭 실패 흐름을 유발했다. **"컨텍스트에 이미 답이 있으면 그것부터 쓰라"가 1순위여야 한다.** LLM 가이드를 쓸 때 "어느 도구를 부르라" 가 아니라 "현재 상태 → 가장 적은 도구 호출로 정답 도달"의 결정 트리를 먼저 박아야 한다. find_*_by_product 같이 응답에 UUID 가 포함된 도구는 그 응답이 곧 다음 라운드의 컨텍스트가 됨을 schema description 에서도 함께 알려주면 LLM 이 자연스럽게 컨텍스트 활용 흐름을 따라간다.
+- 핵심 교훈 4 (2026-05-04 — 명령형 어조의 효과): "다시 부르지 마라" 같은 부정 명령형 + 구체 예시("seller_id='test3' 같이 넣지 마라")를 같이 박는 것이 "권장합니다" 같은 산문체보다 LLM 준수율이 훨씬 높음. **금지 사항은 본문에 단정문 + 헤더 옆 강조 + 구체 anti-example** 3중 패턴이 표준 — 이번 작업에서 [금지 사항] 섹션에 4종 단정문을 박아 옛 우선순위로 회귀하지 않도록 봉쇄.
 
 #### get_orders 도구 — service 위임 + status_in 다중 상태 (2026-05-04 추가)
 - 기존 `agent_tools.get_orders` 가 (1) `.is_("deleted_at", None)` 누락으로 삭제된 주문도 응답에 포함되고 (2) 단일 `status` 만 받아 사용자의 "진행 중인 주문" (UI 의 5상태 다중 정의: `QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING`) 같은 발화를 표현 못하던 두 가지 결함이 있었다 → `order_service.list_orders` 위임 패턴으로 동시 해결.
