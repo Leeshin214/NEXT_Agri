@@ -487,7 +487,7 @@ class AgentState(TypedDict):
 - 다른 노드(inventory_order/calendar_data/calendar_reason)는 모두 `state["history"]` 를 직접 사용 → 오염된 messages 를 다시 필터링할 필요 없음
 - `AgentOrchestrator.run()` 에서 `clean_history` 를 한 번만 만들어 `history` / `messages` 양쪽에 주입
 
-#### TOOL_FUNCTION_MAP 전체 목록 (36개, 2026-05-04 갱신)
+#### TOOL_FUNCTION_MAP 전체 목록 (41개, 2026-05-04 갱신)
 ```
 # 상품/재고
 get_products, check_stock, update_stock, create_product, delete_product, update_product,
@@ -499,8 +499,12 @@ find_sellers_by_product, find_buyers_by_product, find_alternative_partners, get_
 open_chat_room, get_chat_rooms, get_chat_messages, send_chat_message,
 # 캘린더
 get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event,
-# 거래처 등록 (양방향 PENDING)
+# 거래처 (조회 / 등록 / 응답)
+get_partners,                                  # 2026-05-04 신규 — ACTIVE/PENDING_OUTGOING/PENDING_INCOMING/INACTIVE 조회
 request_partner_registration, request_partner_registration_by_name,
+get_incoming_partner_requests, accept_partner_request, reject_partner_request,
+# 정기배송 받은 요청
+get_incoming_subscription_requests,
 # 카운터오퍼 / 납품일 변경 (2026-05-04 신규)
 submit_counter_offer, accept_counter_offer, reject_counter_offer,
 submit_delivery_date_change, accept_delivery_date_change, reject_delivery_date_change,
@@ -700,3 +704,24 @@ create_subscription_from_order,
 - **핵심 교훈 — 결정 트리는 매핑 가이드와 분리해서 독립 섹션으로 박아야 LLM 이 따라간다**: 자연어 → 도구 매핑 섹션 안에 "후보 여러 개면 되묻기" 가이드를 같이 박아두면 LLM 이 매핑 규칙만 보고 결정 트리는 무시한다. 결정 트리(0/1/N 분기)는 별도 섹션 + 각 단계에 헤더([1단계], [2단계], [3단계])를 박고 각 분기마다 구체 발화 예시까지 같이 넣어야 LLM 이 단계별로 검토한다. 매핑 가이드는 "어느 도구를 부르라"이고, 결정 트리는 "그 도구의 인자를 어떻게 정하라"이므로 관심사가 다름 → 분리가 자연스럽다.
 - **핵심 교훈 — order_id 같은 UUID 인자는 schema description 에 결정 절차까지 박아야 LLM 준수율 최대화**: 본문 프롬프트만으로는 LLM 이 모호한 발화에서 임의로 한 후보를 선택하는 환각이 자주 발생. tool_call 인자 생성 직전에 LLM 이 다시 읽는 schema description 에 "0개/1개/2개+ 분기 + 임의 추측 금지" 절차를 박으면 schema 가 1차 방어선이 되고 본문 프롬프트가 보조한다. (이전 작업에서 검증된 패턴: seller_id 환각 차단 시에도 schema description 강화가 본문보다 효과 컸음. 이번 order_id 도 동일 패턴 적용.)
 - **핵심 교훈 — 후보 0개 응답에서 "다른 주문 끼워 넣기" 환각이 가장 위험**: 후보 1개/2개+ 분기는 LLM 이 비교적 잘 따라가지만, 후보 0개일 때 GPT-4o-mini 가 "친절을 가장해" 컨텍스트 메모리의 다른 주문 정보를 줄줄이 노출하는 환각이 빈번. "○○ 상품에 대한 협상 가능한 주문이 없습니다" 만 짧게 답하고 끝내라는 단정문을 명시적으로 박아야 함. 이전 [도구 실패 시 응답 가이드] 의 "안 물은 정보 끌어오지 마라" 패턴과 동일 구조 — 환각 방지 가이드는 매번 명시적 단정문이 필요.
+
+#### get_partners 자연어 → status 매핑 가이드 (2026-05-04 추가)
+- 신규 `get_partners(user_id, status?, status_in?, role?)` 도구는 schema description 에 자연어 트리거("거래처 목록", "내 거래처", "거래 중인 곳" 등)와 ACTIVE/PENDING_OUTGOING/PENDING_INCOMING/INACTIVE 4종 enum 을 명시했지만, 본문 프롬프트에도 동일한 매핑을 박아야 LLM 이 일관되게 status 인자를 채운다. 이전 `get_orders` status_in 작업과 동일한 "schema + 본문 2중 명시" 패턴을 그대로 적용.
+- 적용 위치 (orchestrator.py):
+  - `AGENT_BASE_SYSTEM` 의 `[거래처 목록 조회 가이드 — 자연어 → status 매핑 (매우 중요)]` (라인 1753 근방, [주문 목록 조회 가이드] 직후, [주문 응답 표시 규칙] 직전). SELLER/BUYER 합성본 양쪽에 자동 반영.
+  - `chat_node` 시스템 프롬프트의 동일 섹션 (라인 2940 근방, [주문 목록 조회 가이드] 직후, [주문 응답 표시 규칙 — 환각 방지 (매우 중요)] 직전). 사용자가 채팅 노드에서 "거래처 보여줘" 같이 자연어로 자주 묻는 위치라 BASE 와 별도로 박음.
+- 자연어 매핑 핵심 (5종):
+  1. "거래처 목록" / "내 거래처" / "거래 중인 곳" / "거래처 보여줘" / "거래하고 있는 거래처" / "내가 거래하는 사람들" → `status="ACTIVE"` (기본값)
+  2. "보낸 거래처 신청" / "신청 보낸 곳" / "내가 신청한 거래처" / "보낸 요청" → `status="PENDING_OUTGOING"`
+  3. "받은 거래처 신청" / "들어온 거래처 요청" / "거래처 신청 왔어?" → 단독 조회는 `get_incoming_partner_requests` 우선, 다른 상태와 함께 묻는 맥락에서만 `status="PENDING_INCOMING"`.
+  4. "거절된 거래처" / "비활성 거래처" / "거래 종료된 곳" → `status="INACTIVE"`
+  5. **상태 미명시** ("거래처 보여줘" / "거래처 목록") → 기본값 `status="ACTIVE"`.
+- 응답 표시 규칙 핵심 (환각 방지 4종):
+  - 0건이면 "현재 활성 거래처가 없습니다" (또는 status 에 맞춰 "보낸 거래처 신청이 없습니다" / "거절된 거래처가 없습니다") 만 안내. 다른 정보(주문 내역, 상품 추천, 다른 카테고리 거래처) 늘어놓지 말 것.
+  - 도구가 반환하지 않은 거래처는 절대 응답에 포함 금지 — 컨텍스트 메모리/이전 대화의 옛 거래처 정보 출력 X.
+  - 도구 결과 외 임의 정보 추가 금지. 사용자가 안 물은 다른 거래처 정보 카탈로그처럼 늘어놓지 말 것.
+  - 마크다운 강조·표·헤더 금지. 자연체 한국어 + 필요 시 `1.` 번호.
+- `get_orders` 와 차이점: `get_orders` 는 status_in 다중 enum 매핑이 핵심이라 8종 매핑을 본문에 박았지만, `get_partners` 는 사용자가 보통 한 번에 한 상태만 묻는 패턴이라 단일 status 매핑 5종이면 충분. status_in 은 "활성 거래처와 보낸 신청 둘 다" 같은 명시적 다중 요청에서만 사용한다는 단서를 본문에 박았다. PENDING_INCOMING 은 단독 조회 시 `get_incoming_partner_requests` 가 우선 — 도구 description 과 본문 가이드 모두에 동일하게 명시해 LLM 이 두 도구 중 어느 쪽을 부를지 헷갈리지 않게 함.
+- 검증 결과: AST OK, placeholder 23/23 보존(이번 작업 23종 — 이전 11에서 변경 없음), BASE/chat_node 양쪽 1회씩 추가 확인, 이전 가이드 27종 모두 보존(`grep -c` 27 카운트), git diff --stat = 80 insertions(+) (단순 추가, 기존 줄 수정 0).
+- **핵심 교훈 — 단일 enum 매핑도 schema 만 믿지 말고 본문에 한 번 더 박아야 일관성 확보**: `get_partners` schema description 에 이미 "거래처 목록", "내 거래처", "거래 중인 곳" 등 자연어 트리거가 명시돼 있어도, 사용자가 "보낸 신청" 같이 변형된 표현을 쓰면 LLM 이 status 인자를 누락하거나 status_in 으로 잘못 보내는 사례가 발생할 가능성이 있음. 본문 프롬프트의 5종 매핑이 backup 역할 — schema 가 1차, 본문이 2차 방어선. 단일 enum 도구도 다중 enum 도구와 동일하게 schema + 본문 2중 명시 패턴을 따라가는 것이 안전.
+- **핵심 교훈 — 두 도구가 같은 의도(예: 받은 거래처 요청 조회)를 처리할 수 있을 때는 우선순위를 본문에 명시**: `get_partners(status="PENDING_INCOMING")` 와 `get_incoming_partner_requests` 가 둘 다 같은 데이터를 돌려주는 상황에서 LLM 이 둘 중 어느 쪽을 부를지 헷갈리면 같은 라운드에 두 도구를 동시 호출하거나 매번 다른 도구를 부르는 일관성 문제가 생긴다. "단독 조회 시엔 get_incoming_partner_requests 우선, 다른 상태와 함께 묻는 맥락에서만 get_partners(status='PENDING_INCOMING')" 처럼 우선순위 단서를 본문 + 도구 description 양쪽에 똑같이 박아야 LLM 이 일관되게 따라간다.

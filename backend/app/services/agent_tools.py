@@ -3841,6 +3841,92 @@ def get_incoming_subscription_requests(user_id: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def get_partners(
+    user_id: str,
+    status: Optional[str] = None,
+    status_in: Optional[list[str]] = None,
+) -> dict:
+    """현재 거래처 목록 조회.
+
+    status (단일) 또는 status_in (배열) 으로 필터링.
+    가능한 status: ACTIVE, PENDING_OUTGOING, PENDING_INCOMING, INACTIVE
+      (REJECTED 는 partners 스키마에 없어 0건 반환됨 — 거절 시 soft-delete 처리됨)
+    상태 미지정 시 ACTIVE 만 기본 (사용자 의도가 보통 '활성 거래처').
+
+    내부적으로 partner_service.list_partners 에 위임 (limit=200 으로 1페이지 조회).
+    응답 row 는 partner_user 임베딩이 평탄화된 형태:
+      {id, user_id, partner_user_id, status, nickname, notes,
+       partner_name, partner_company, partner_role, partner_phone,
+       created_at, updated_at, ...}
+    """
+    user_clean = (user_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {
+            "success": False,
+            "error": "invalid_user_id",
+            "partners": [],
+            "count": 0,
+        }
+
+    # status_in 우선 적용 — 배열이면 status 단일 필터를 무시하고 OR 조회.
+    # supabase-py 는 in_() 를 지원 — partner_service.list_partners 가 단일 status 만
+    # 지원하므로, status_in 이 들어오면 직접 supabase 쿼리로 처리한다.
+    requested_status_list: Optional[list[str]] = None
+    if status_in and isinstance(status_in, list) and len(status_in) > 0:
+        requested_status_list = [s for s in status_in if isinstance(s, str) and s]
+    elif status and isinstance(status, str):
+        requested_status_list = [status]
+    else:
+        # 기본값 — 활성 거래처만
+        requested_status_list = ["ACTIVE"]
+
+    try:
+        supabase = get_supabase_client()
+
+        # 임베디드 조인 — partner_service.list_partners 와 동일한 패턴.
+        query = (
+            supabase.table("partners")
+            .select(
+                "*, partner_user:users!partner_user_id(name, company_name, role, phone)"
+            )
+            .eq("user_id", user_clean)
+            .is_("deleted_at", None)
+        )
+
+        # 단일 vs 다중 필터 분기
+        if len(requested_status_list) == 1:
+            query = query.eq("status", requested_status_list[0])
+        else:
+            query = query.in_("status", requested_status_list)
+
+        # 최신 순, 도구 응답은 1페이지 200건 한도
+        result = query.order("created_at", desc=True).limit(200).execute()
+        rows = result.data or []
+
+        partners: list[dict] = []
+        for row in rows:
+            partner_user = row.pop("partner_user", None) or {}
+            row["partner_name"] = partner_user.get("name")
+            row["partner_company"] = partner_user.get("company_name")
+            row["partner_role"] = partner_user.get("role")
+            row["partner_phone"] = partner_user.get("phone")
+            partners.append(row)
+
+        return {
+            "success": True,
+            "partners": partners,
+            "count": len(partners),
+            "filter_status": requested_status_list,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "partners": [],
+            "count": 0,
+        }
+
+
 def get_incoming_partner_requests(user_id: str) -> dict:
     """내게 들어온 PENDING_INCOMING 거래처 등록 요청 목록을 반환한다."""
     user_clean = (user_id or "").strip()
@@ -3946,6 +4032,7 @@ TOOL_FUNCTION_MAP = {
     "get_user_profile": get_user_profile,
     "request_partner_registration": request_partner_registration,
     "request_partner_registration_by_name": request_partner_registration_by_name,
+    "get_partners": get_partners,
     "get_incoming_subscription_requests": get_incoming_subscription_requests,
     "get_incoming_partner_requests": get_incoming_partner_requests,
     "accept_partner_request": accept_partner_request,
