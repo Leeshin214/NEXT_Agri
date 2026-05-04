@@ -297,13 +297,8 @@ ai-assistant 페이지의 풀 사이즈 (text-sm, max-w-[75%], px-4 py-2) 와 �
 const { isStreaming, manualReview, stream } = useAIStream();  // response 는 안 씀
 useAIHistory(100);
 const turns = useAIChatStore((s) => s.turns);
-const messagesEndRef = useRef<HTMLDivElement>(null);
 const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
 const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
-
-useEffect(() => {
-  messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-}, [turns.length, lastTurn?.response]);
 
 // pending 마지막 turn 의 AI 말풍선은 깜빡이는 캐럿만 표시
 const isLastPending = idx === turns.length - 1 && turn.pending && turn.response === '';
@@ -312,6 +307,51 @@ const isLastPending = idx === turns.length - 1 && turn.pending && turn.response 
 **핵심**: `response` state 는 useAIStream 이 외부 호환성으로 유지하되,
 실제 화면 렌더는 `useAIChatStore.turns` 가 SSOT (Single Source of Truth).
 이렇게 해야 새 응답이 와도 이전 대화가 사라지지 않고, 페이지 이동 후 돌아와도 그대로 남는다.
+
+### AIChatPanel 스크롤 동작 (검증됨, 2026-05-04)
+
+자동 스크롤은 **컨테이너 ref + scrollTop 직접 제어** 방식. 과거의 `messagesEndRef.scrollIntoView` 는 폐기 — `scrollIntoView` 는 ancestor 컨테이너에도 영향을 주어 페이지 전환 시 main 스크롤이 함께 점프하는 부작용이 있었다.
+
+```tsx
+const messagesContainerRef = useRef<HTMLDivElement>(null);
+const [isAtBottom, setIsAtBottom] = useState(true);
+
+// 1. 사용자 스크롤 위치 추적 (BOTTOM_THRESHOLD_PX = 80)
+useEffect(() => {
+  const el = messagesContainerRef.current;
+  if (!el) return;
+  const onScroll = () => {
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setIsAtBottom(distance < 80);
+  };
+  onScroll();
+  el.addEventListener('scroll', onScroll, { passive: true });
+  return () => el.removeEventListener('scroll', onScroll);
+}, [aiPanelOpen]);
+
+const scrollToBottom = useCallback((smooth = true) => {
+  const el = messagesContainerRef.current;
+  if (!el) return;
+  el.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+}, []);
+
+// 2. 패널 첫 오픈 / turns hydrate 직후 즉시 점프 (페이지 전환 후 최신 메시지 보장)
+useEffect(() => {
+  if (!aiPanelOpen || turns.length === 0) return;
+  const raf = requestAnimationFrame(() => scrollToBottom(false));
+  return () => cancelAnimationFrame(raf);
+}, [aiPanelOpen, turns.length === 0]);
+
+// 3. 새 메시지 / 응답 갱신 — 사용자가 바닥 근처일 때만 자동 따라가기
+useEffect(() => {
+  if (!isAtBottom) return;
+  scrollToBottom(true);
+}, [turns.length, lastTurn?.response, isAtBottom, scrollToBottom]);
+```
+
+**"맨 밑으로 내리기" 동그란 버튼** — 입력창 영역(`relative`) 안에 `absolute -top-5 left-1/2 -translate-x-1/2` 로 입력창 바로 위 중앙에 배치. `isAtBottom || turns.length === 0` 일 때 `pointer-events-none opacity-0` 으로 숨김, 그 외에는 `opacity-100` + `transition-opacity duration-200` 로 부드럽게 노출. 스타일: `h-9 w-9 rounded-full border border-gray-200 bg-white text-gray-600 shadow-md hover:bg-gray-50 hover:text-primary-600`. 아이콘은 `lucide-react` 의 `ChevronDown h-4 w-4`.
+
+**페이지 전환 시 위치 유지**: AppLayout 이 `(dashboard)/layout.tsx` 에 마운트되어 있어 AIChatPanel 은 (dashboard) 그룹 내 라우트 변경에서 unmount 되지 않는다. 즉 컴포넌트 자체가 영속이며, 위 effect 들은 마운트가 아닌 `aiPanelOpen` 토글이나 turns 변화에만 반응한다. `messagesContainerRef.scrollTop` 자체도 라우트 전환 사이에 보존된다 — 별도의 store 저장 불필요.
 
 ---
 
