@@ -7,6 +7,7 @@ import PageHeader from '@/components/common/PageHeader';
 import Modal from '@/components/common/Modal';
 import MessageBubble from '@/components/chat/MessageBubble';
 import OrderContextBanner from '@/components/chat/OrderContextBanner';
+import ChatRoomInquiryProduct from '@/components/chat/ChatRoomInquiryProduct';
 import PriceOfferPopover from '@/components/chat/PriceOfferPopover';
 import DeliveryDatePopover from '@/components/chat/DeliveryDatePopover';
 import ChatHeaderStatusControl from '@/components/chat/ChatHeaderStatusControl';
@@ -272,6 +273,13 @@ export default function SellerChatPage() {
                     router.push(`/seller/orders?id=${id}`)
                   }
                 />
+              )}
+
+              {/* 문의 상품 미니카드 — 일반 대화방(linkedOrderId 없음)에서만 노출.
+                  주문방은 OrderContextBanner 가 컨텍스트를 제공하므로 중복 표시 안 함.
+                  SELLER 가 본 채팅방은 본인 상품에 대한 buyer 의 문의이므로 본인 상품 페이지로 라우팅. */}
+              {!linkedOrderId && (
+                <ChatRoomInquiryProduct messages={messages} role="seller" />
               )}
 
               {/* 대체 거래처 제안 배너 */}

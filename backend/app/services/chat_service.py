@@ -123,8 +123,21 @@ class ChatService:
         return rooms
 
     async def get_or_create_room(
-        self, user_id: UUID, role: str, partner_user_id: UUID, order_id: Optional[UUID] = None
+        self,
+        user_id: UUID,
+        role: str,
+        partner_user_id: UUID,
+        order_id: Optional[UUID] = None,
+        inquiry_product_id: Optional[UUID] = None,
     ) -> dict:
+        """채팅방을 찾거나 새로 생성한다.
+
+        - inquiry_product_id 가 전달되고 새 채팅방이 만들어진 경우(즉, 같은 buyer-seller-order
+          조합의 기존 방이 없는 경우) 자동으로 시스템 메시지 1건을 발송하고
+          그 메시지의 metadata 에 {kind: 'product_inquiry', inquiry_product_id} 를 저장한다.
+          기존 방을 그대로 반환하는 경우엔 자동 메시지 발송 X — 호출처가 별도로 처리.
+        - inquiry_product_id 가 None 이면 기존 동작 그대로 (다른 흐름 영향 없음).
+        """
         if role == "SELLER":
             seller_id, buyer_id = str(user_id), str(partner_user_id)
         else:
@@ -141,6 +154,8 @@ class ChatService:
 
         result = await asyncio.to_thread(lambda: query.execute())
         if result.data:
+            # 기존 방이 있으면 그대로 반환 — inquiry_product_id 자동 메시지 발송 안 함
+            # (호출처가 같은 상품 문의를 다시 보내고 싶으면 직접 send_message 호출)
             return result.data[0]
 
         # 새 채팅방 생성
@@ -148,7 +163,97 @@ class ChatService:
         if order_id:
             payload["order_id"] = str(order_id)
         result = await asyncio.to_thread(lambda: self.rooms.insert(payload).execute())
-        return result.data[0]
+        new_room = result.data[0]
+
+        # inquiry_product_id 가 있으면 자동으로 시스템 메시지 발송 (B.2, 2026-05-04)
+        # 메시지 발송 실패해도 채팅방 자체는 정상 생성된 상태 — best-effort 로그만.
+        if inquiry_product_id and new_room:
+            try:
+                await self._send_product_inquiry_system_message(
+                    room_id=new_room["id"],
+                    sender_id=user_id,
+                    inquiry_product_id=inquiry_product_id,
+                )
+            except Exception as e:
+                logger.error(
+                    "[chat_service.get_or_create_room] product inquiry system message 실패 "
+                    "(무시): room_id=%s product_id=%s error=%s: %s",
+                    new_room.get("id"),
+                    inquiry_product_id,
+                    type(e).__name__,
+                    e,
+                )
+
+        return new_room
+
+    async def _send_product_inquiry_system_message(
+        self,
+        *,
+        room_id: UUID | str,
+        sender_id: UUID | str,
+        inquiry_product_id: UUID | str,
+    ) -> Optional[dict]:
+        """상품 문의로 채팅방이 새로 만들어졌을 때 발송하는 시스템 메시지.
+
+        - 메시지 본문에는 상품명/단가/단위/카테고리/원산지 정보를 자연어로 포함.
+        - metadata 에 {kind: 'product_inquiry', inquiry_product_id} 를 저장 — 프론트가
+          채팅방 진입 시 첫 메시지의 metadata.inquiry_product_id 로 미니카드 렌더 가능.
+        - 상품 정보 조회 실패 시 fallback 으로 product_id 만 metadata 에 저장하고
+          본문은 '[상품 문의]' 로 단순화.
+        """
+        product_id_str = str(inquiry_product_id)
+
+        # 상품 정보 조회 (best-effort) — 실패해도 metadata 만은 저장
+        product_info: dict = {}
+        try:
+            product_result = await asyncio.to_thread(
+                lambda: self.client.table("products")
+                .select("id, name, category, unit, price_per_unit, origin")
+                .eq("id", product_id_str)
+                .is_("deleted_at", None)
+                .limit(1)
+                .execute()
+            )
+            if product_result.data:
+                product_info = product_result.data[0] or {}
+        except Exception as e:
+            logger.warning(
+                "[chat_service._send_product_inquiry_system_message] "
+                "product 조회 실패 (메타데이터만 저장): %s: %s",
+                type(e).__name__,
+                e,
+            )
+
+        # 본문 작성
+        if product_info:
+            name = product_info.get("name") or "-"
+            unit = product_info.get("unit") or ""
+            price = product_info.get("price_per_unit")
+            origin = product_info.get("origin")
+            price_text = (
+                f"{int(price):,}원/{unit}" if isinstance(price, (int, float)) and price is not None
+                else "-"
+            )
+            origin_text = f" / 원산지: {origin}" if origin else ""
+            content = (
+                f"[상품 문의] 상품: {name} / 단가: {price_text}{origin_text}"
+            )
+        else:
+            content = "[상품 문의]"
+
+        metadata = {
+            "kind": "product_inquiry",
+            "inquiry_product_id": product_id_str,
+        }
+
+        return await self.send_event_message(
+            room_id=room_id,
+            sender_id=sender_id,
+            message_type="SYSTEM",
+            content=content,
+            metadata=metadata,
+            is_read=False,  # 상대방에게 미읽음으로 노출
+        )
 
     async def list_messages(
         self, room_id: UUID, limit: int = 50, before: Optional[str] = None

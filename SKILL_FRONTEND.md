@@ -30,7 +30,8 @@ frontend/
 │           ├── dashboard/page.tsx
 │           ├── calendar/page.tsx
 │           ├── partners/page.tsx
-│           ├── browse/page.tsx
+│           ├── browse/page.tsx                  ← 상품 카드 클릭 → /buyer/browse/[productId] 라우팅
+│           ├── browse/[productId]/page.tsx     ← 상품 상세 페이지 (B.1, 2026-05-04)
 │           ├── orders/page.tsx
 │           └── chat/page.tsx
 ├── components/

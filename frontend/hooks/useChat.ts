@@ -327,10 +327,20 @@ export function useSendMessage() {
 
 // ─── 채팅방 생성 ───
 
+// 채팅방 생성 페이로드.
+// inquiry_product_id 가 전달되고 새 채팅방이 만들어지면 백엔드가 자동으로 첫 시스템 메시지를
+// 발송하고 그 메시지의 metadata 에 {kind: 'product_inquiry', inquiry_product_id} 를 저장한다.
+// 기존 채팅방을 재사용하는 경우엔 이 필드는 무시 (메시지 자동 발송 X).
+export interface CreateChatRoomPayload {
+  partner_user_id: string;
+  order_id?: string;
+  inquiry_product_id?: string;
+}
+
 export function useCreateChatRoom() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (data: { partner_user_id: string; order_id?: string }) =>
+    mutationFn: (data: CreateChatRoomPayload) =>
       api.post<SuccessResponse<ChatRoom>>('/chat/rooms', data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['chatRooms'] });

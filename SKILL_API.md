@@ -194,11 +194,33 @@ _ALLOWED_SEARCH_ROLES = {"SELLER", "BUYER"}               # ADMIN 등 거부용
 ```python
 router = APIRouter(prefix="/products", tags=["products"])
 
-# GET /products - 상품 목록 (구매자: 전체 탐색, 판매자: 내 상품)
-# GET /products/{id} - 상품 상세
-# POST /products - 상품 등록 (판매자만)
-# PATCH /products/{id} - 상품 수정 (판매자만)
-# DELETE /products/{id} - 상품 삭제 (판매자만)
+# GET /products              - 상품 목록 (구매자: 전체 탐색, 판매자: 내 상품)
+# GET /products/{id}         - 상품 상세 (단순, ProductResponse — 호환성 유지)
+# GET /products/{id}/detail  - 상품 상세 페이지 전용 — 판매자 join + 거래 관계 + 같은 판매자 다른 상품 (B.1, 2026-05-04)
+# POST /products             - 상품 등록 (판매자만)
+# PATCH /products/{id}       - 상품 수정 (판매자만)
+# DELETE /products/{id}      - 상품 삭제 (판매자만)
+
+# GET /products/{id}/detail (B.1, 2026-05-04) — 상세 페이지 한 번 호출로 종합 컨텍스트
+# 응답: SuccessResponse[ProductDetailResponse]
+#   - ProductResponse 모든 필드
+#   - seller_name / seller_company    : users 임베딩 join (판매자 담당자명/회사명)
+#   - partner_relationship_status     : 현재 BUYER ↔ 판매자 partners.status
+#                                        값: 'ACTIVE' | 'PENDING_OUTGOING' | 'PENDING_INCOMING'
+#                                            | 'INACTIVE' | None (관계 없음)
+#                                        SELLER 본인이 자기 상품 조회 시 None.
+#   - previous_order_count            : BUYER ↔ 판매자 주문 총 건수 (CANCELLED/soft-deleted 제외)
+#   - completed_order_count           : 그 중 status='COMPLETED' 만
+#   - other_seller_products           : 같은 판매자의 다른 상품 (최대 4개, OUT_OF_STOCK 후순위)
+#                                        ProductMinimal: {id, name, category, unit, price_per_unit,
+#                                                          stock_quantity, status, image_url}
+# 가드:
+#   - 상품 없음 또는 soft-deleted → 404
+#   - 판매자 자체가 soft-deleted 면 SELLER 본인 외엔 404 (구매자 노출 차단)
+# 성능:
+#   - SELLER 본인 조회: products+seller 1쿼리 + other_products 1쿼리 = 2쿼리
+#   - BUYER 조회:       products+seller + partners + orders + other_products = 4쿼리
+# 서비스: product_service.get_product_detail(product_id, *, current_user_id, current_user_role)
 
 @router.get("", response_model=SuccessResponse[list[ProductResponse]])
 async def list_products(
