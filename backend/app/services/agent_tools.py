@@ -906,18 +906,26 @@ def create_order(
     product_id: str,
     quantity: int,
     unit_price: int,
-    delivery_date: Optional[str] = None,
+    delivery_date: str,
     delivery_address: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> dict:
-    """새 주문을 생성한다 (AI 도우미 흐름 — auto_confirm=True 단가 비교 분기 적용).
+    """새 주문을 생성한다 (AI 도우미 흐름 — auto_confirm=True 자동 협상 분기 적용).
 
     내부적으로 product_id 해석/검증을 마친 뒤 order_service.create_order(auto_confirm=True)
     에 위임한다. 라우터(POST /orders) 와 달리 자동 분기를 거치므로:
-      - unit_price == products.price_per_unit (또는 그 이상): 즉시 CONFIRMED + 재고 차감 + 채팅 SYSTEM 메시지
-      - unit_price < products.price_per_unit: QUOTE_REQUESTED → 자동 카운터오퍼 → NEGOTIATING (PENDING 카드)
-    product_id가 UUID가 아닌 상품명으로 들어온 경우 자동으로 이름 검색해 UUID로 변환한다.
+      - unit_price >= products.price_per_unit: QUOTE_REQUESTED 로 시작
+        (판매자 검토 후 수락 시 CONFIRMED — 즉시 확정 아님)
+      - unit_price <  products.price_per_unit: QUOTE_REQUESTED → 자동 카운터오퍼 → NEGOTIATING (PENDING 카드)
+
+    delivery_date 는 필수 (V2, 2026-05-04). YYYY-MM-DD ISO 형식 문자열.
+    product_id 가 UUID 가 아닌 상품명으로 들어온 경우 자동으로 이름 검색해 UUID 로 변환한다.
     """
+    if not delivery_date or not isinstance(delivery_date, str) or not delivery_date.strip():
+        return {
+            "success": False,
+            "error": "delivery_date 는 필수입니다. 사용자에게 납품일(YYYY-MM-DD)을 확인해주세요.",
+        }
     try:
         supabase = get_supabase_client()
 
@@ -996,15 +1004,9 @@ def create_order(
         order_status = order.get("status", "QUOTE_REQUESTED")
 
         # 분기에 따른 안내 메시지 (LLM 자연어 응답 생성에 도움)
-        if order_status == "CONFIRMED":
-            human_message = (
-                f"주문 {order_number}이 즉시 확정되었습니다. 판매자 재고가 자동 차감되었습니다."
-            )
-            next_action_hint = (
-                "사용자에게 주문 확정과 납품일을 안내하세요. 추가 변경이 필요하면 "
-                "submit_delivery_date_change 또는 update_order_status 를 사용하세요."
-            )
-        elif order_status == "NEGOTIATING":
+        # V2 (2026-05-04): 신규 주문은 항상 QUOTE_REQUESTED 또는 NEGOTIATING 으로 시작.
+        # 가격 일치라도 즉시 CONFIRMED 되지 않고 판매자 검토 후 수락 시 CONFIRMED 전이.
+        if order_status == "NEGOTIATING":
             human_message = (
                 f"주문 {order_number}이 생성되어 자동 협상이 시작되었습니다. "
                 f"채팅방에 카운터오퍼(PENDING) 카드가 노출되었습니다."
@@ -1013,10 +1015,14 @@ def create_order(
                 "사용자에게 협상 카드를 발송했음을 알리세요. 판매자가 수락/거절하기 전까지 PENDING."
             )
         else:
-            human_message = f"주문 {order_number}이 생성되었습니다."
+            # QUOTE_REQUESTED — UI 모달 흐름 + 단가 일치 (MATCH) 흐름 모두 포함
+            human_message = (
+                f"주문 견적 {order_number}이 판매자에게 전달됐습니다. 판매자 검토 후 확정됩니다."
+            )
             next_action_hint = (
-                "사용자가 이어서 '채팅방 열어줘'라고 하면 "
-                "open_chat_room 호출 시 반드시 이 order_id와 seller_id를 함께 사용하세요."
+                "사용자에게 견적이 전달됐고 판매자 응답을 기다리는 중임을 안내하세요. "
+                "사용자가 '채팅방 열어줘'라고 하면 open_chat_room 호출 시 반드시 이 order_id와 "
+                "seller_id를 함께 사용하세요."
             )
 
         return {
@@ -1025,7 +1031,9 @@ def create_order(
             "order_id": order_id,
             "order_number": order_number,
             "status": order_status,
-            "auto_confirmed": order_status == "CONFIRMED",
+            # V2: CONFIRMED 자동 진입이 사라졌으므로 auto_confirmed 는 항상 False.
+            # 호환성을 위해 키는 유지 — 외부 LLM 시스템 프롬프트가 점진적으로 마이그레이션될 때까지.
+            "auto_confirmed": False,
             "negotiating": order_status == "NEGOTIATING",
             "seller_id": seller_id,
             "buyer_id": buyer_id,

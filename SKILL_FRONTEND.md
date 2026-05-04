@@ -1567,6 +1567,62 @@ useEffect(() => {
 
 상품 select는 그대로 `useProducts({ seller_id: sellerId, limit: 200 })` 사용. seller_id 단수 컬럼이므로 다른 SELLER 상품 섞기 자연 차단.
 
+##### 납품일 필수화 (검증됨, 2026-05-04)
+
+백엔드 `OrderCreate.delivery_date` 가 V2 부터 Required(`date`) 로 변경됨 — 빈 값 제출 시 422. 프론트도 동일하게 강제한다.
+
+`types/order.ts`:
+```typescript
+export interface OrderCreate {
+  seller_id: string;
+  /** YYYY-MM-DD — 백엔드 V2 부터 필수. 빈 값 제출 시 422. */
+  delivery_date: string;        // ← Optional 제거
+  delivery_address?: string;
+  notes?: string;
+  items: OrderItemInput[];
+}
+```
+
+`CreateOrderModal.tsx` — 기존 controlled state + manual validation 패턴 유지 (react-hook-form/zod 미도입). 핵심 4가지:
+
+```tsx
+// 1. 라벨에 빨간 별표 + 안내문
+<label>납품 희망일 <span className="text-red-500">*</span></label>
+<input
+  type="date"
+  value={deliveryDate}
+  onChange={(e) => setDeliveryDate(e.target.value)}
+  min={minDeliveryDate}     // 2. 최소 = 오늘 + 1일
+  required                  // 3. HTML5 native validation
+  aria-required="true"
+/>
+<p className="mt-1 text-xs text-gray-400">
+  판매자가 일정을 확인할 수 있도록 납품일을 반드시 선택해 주세요.
+</p>
+
+// 4. handleSubmit 진입부에서 sellerId 검증 직후 가드
+if (!deliveryDate) {
+  setError('납품 희망일을 선택해 주세요.');
+  return;
+}
+
+// mutateAsync 호출 시 `delivery_date: deliveryDate || undefined` 가 아니라 `delivery_date: deliveryDate` (필수 string)
+```
+
+`minDeliveryDate` 는 `useMemo` 로 KST 기준 YYYY-MM-DD 문자열 한 번만 계산 (timezone-safe — `new Date().toISOString()` 는 UTC 라 1일 어긋날 수 있음):
+```typescript
+const minDeliveryDate = useMemo(() => {
+  const t = new Date();
+  t.setDate(t.getDate() + 1);
+  const y = t.getFullYear();
+  const m = String(t.getMonth() + 1).padStart(2, '0');
+  const d = String(t.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}, []);
+```
+
+**주의**: `OrderUpdate.delivery_date` 는 여전히 Optional 이므로 `EditOrderModal` 은 손대지 않는다 (백엔드 schemas/order.py 의 `OrderUpdate` 도 Optional 유지).
+
 #### browse 페이지 — 문의(채팅) + 견적 요청(모달) 분리 (검증됨)
 
 상품 카드 액션을 두 버튼으로 분리하여 의도를 명확히 구분.

@@ -990,27 +990,29 @@ pytest-cov==6.0.0
   ```
   적용 위치: `order_service.create_order` 단일 진입점. 이전에는 `agent_tools.create_order` 가 직접 INSERT 하며 같은 패턴을 중복 구현했으나, 2026-05-04 부터 `order_service.create_order` 로 통합됨 (아래 auto_confirm 항목 참조).
 
-- **`order_service.create_order` auto_confirm 단가 비교 분기 (2026-05-04)**: 구매자가 상품 목록 가격 그대로 살 의도면 즉시 CONFIRMED, 가격을 깎으면 NEGOTIATING + 자동 카운터오퍼로 분기. 라우터(POST /orders)는 기본값 `auto_confirm=False` 로 호출해 기존 CreateOrderModal 흐름 (QUOTE_REQUESTED 시작) 유지. AI 도구 (`agent_tools.create_order`) 와 chat consensus 자동 주문은 `auto_confirm=True` 로 호출해 즉시 확정/협상으로 분기.
+- **`order_service.create_order` V2 정책 — 모든 신규 주문은 QUOTE_REQUESTED 로 시작 (2026-05-04 갱신)**: 가격이 일치해도 즉시 CONFIRMED 자동 진입을 제거. 판매자 검토 후 `update_status(CONFIRMED)` 시점에 재고 차감. `auto_confirm=True` 의 의미는 "단가 일치 시 즉시 확정" 이 아니라 "단가 차이가 있을 때 자동 협상(카운터오퍼) 발사" 로 좁혀짐. 라우터(POST /orders) 는 그대로 `auto_confirm=False` (기본) 로 호출해 UI 모달 흐름 유지.
   ```python
   async def create_order(self, buyer_id: UUID, data: dict, auto_confirm: bool = False) -> dict:
-      # 1) auto_confirm=True 면 products.price_per_unit 일괄 조회 → 라인별 비교
-      #    모든 라인 unit_price >= price_per_unit → "MATCH" (CONFIRMED)
-      #    한 라인이라도 unit_price < price_per_unit → "NEGOTIATE" (QUOTE_REQUESTED + 카운터오퍼)
-      # 2) MATCH 분기:
-      #    - status='CONFIRMED' 로 INSERT
-      #    - _deduct_seller_stock_for_order() 명시 호출 (재고 부족 → HTTPException 400)
-      #    - 채팅 ORDER_STATUS 메시지 ("○○ N단위 주문이 확정되었습니다. 납품일은 ○월 ○일 입니다.")
-      # 3) NEGOTIATE 분기:
-      #    - status='QUOTE_REQUESTED' 로 INSERT
-      #    - 기존 "새 견적 요청" SYSTEM 메시지 emit
-      #    - submit_counter_offer 호출 (proposed_total_amount=구매자 제시 합계)
-      #      → submit_counter_offer 내부에서 NEGOTIATING 자동 전환 + COUNTER_OFFER 카드 emit
+      # V2 (2026-05-04): initial_status = "QUOTE_REQUESTED" — 항상 동일.
+      # auto_confirm=True 면 products.price_per_unit 일괄 조회 → 라인별 비교
+      #   "MATCH"     — 모든 라인 unit_price >= price_per_unit
+      #                  → QUOTE_REQUESTED INSERT + "주문 견적 도착" SYSTEM 메시지
+      #                    (상품/단가/납품일 정리, 판매자 수락 대기)
+      #   "NEGOTIATE" — 한 라인이라도 unit_price < price_per_unit
+      #                  → QUOTE_REQUESTED INSERT + 자동 카운터오퍼 → NEGOTIATING 전환
+      # auto_confirm=False (UI 모달 / API 직접 흐름)
+      #   → QUOTE_REQUESTED INSERT + "새 견적 요청" SYSTEM 메시지
+      #
+      # 재고 차감은 update_status(CONFIRMED) 시점에 일어남 (create_order 본문에서 호출 X)
   ```
   - 호출처별 정책: 라우터 = `auto_confirm` 미전달(기본 False); `agent_tools.create_order` = `auto_confirm=True` 명시; chat_ws consensus = agent_tools 경유로 자동 적용.
-  - `agent_tools.create_order` 는 더 이상 자체 INSERT 하지 않고 `_run_async_in_thread(lambda: order_service.create_order(buyer_id, data, auto_confirm=True))` 로 위임. product_id UUID/이름 해석 + seller 소속 검증 로직만 유지.
-  - MATCH 분기 재고 부족 시 HTTPException 400 (주문 행은 INSERT 된 상태로 남음 — buyer 가 재시도/취소 가능). NEGOTIATE 분기 자동 카운터오퍼 실패는 logger.error 만 + 주문은 QUOTE_REQUESTED 로 살아남음 (best-effort).
-  - 회귀 안전: 라우터 호출은 시그니처 변경 없음 (auto_confirm 기본값 False), 기존 CreateOrderModal/E2E 테스트 동작 그대로.
-  - 검증: AST 파싱 + venv import + signature 검증 (`['self', 'buyer_id', 'data', 'auto_confirm']`).
+  - `agent_tools.create_order` 는 자체 INSERT 하지 않고 `order_service.create_order(buyer_id, data, auto_confirm=True)` 로 위임. product_id UUID/이름 해석 + seller 소속 검증 로직만 유지.
+  - 반환 dict 의 `auto_confirmed` 키는 V2 부터 항상 False (호환성용 키 유지). LLM 시스템 프롬프트는 status 값으로 분기.
+  - NEGOTIATE 분기 자동 카운터오퍼 실패는 logger.error 만 + 주문은 QUOTE_REQUESTED 로 살아남음 (best-effort).
+  - 마이그레이션 영향: SHA `76c7736` 의 즉시-확정/재고-차감 코드는 이번 변경으로 제거됨. 기존 INSERT 직후 재고 차감 검증 테스트는 update_status(CONFIRMED) 분기 검증으로 이전 필요.
+  - 검증: AST 파싱 + venv import + Pydantic Required 검증 (`OrderCreate.delivery_date.is_required() == True`) + TOOLS schema required list 에 `delivery_date` 포함 확인.
+
+- **`OrderCreate.delivery_date` Required (2026-05-04)**: V2 부터 모든 주문 생성 흐름에서 납품일 필수. POST /orders 라우터는 422 자동 반환, agent_tools.create_order 는 빈 값 가드 (`{"success": False, "error": "..."}`) 로 명시 차단, orchestrator TOOLS create_order required list 에 `delivery_date` 추가. chat_ws consensus 흐름은 이전부터 `_validate_consensus_extracted` 에서 필수 검증 중이라 변경 없음.
 
 - **PostgREST 임베딩으로 N+1 제거 (2026-04-27 검증)**: orders 같은 부모 테이블 응답에 buyer/seller(users), items+product 정보를 함께 내려야 할 때, 서비스 안에서 N개의 자식 select 를 따로 부르는 대신 PostgREST 의 select 임베딩 한 번으로 처리한다. count="exact" 와 임베딩이 동시에 잘 동작한다 (HTTP 206 + content-range 헤더 정상).
   ```python

@@ -590,23 +590,31 @@ create_subscription_from_order,
 - 환각 방지: "참치 찾아줘" → product_name='참치'만 정확 검색. 0건이라도 새우/연어 같은 다른 품목 추천 절대 금지. 사용자 명시 동의 후에만 find_alternative_partners 호출. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에 동시 호출 금지.
 - 도구 시그니처는 실제 함수 정의 그대로 매핑 (notes/proposed_total_amount/proposed_delivery_date/offer_id/change_id 등 실제 키 사용). placeholder 추가 없음 → KeyError 위험 0. AST OK, SELLER/BUYER 합성본 모두 _render_agent_system 통과 확인 완료.
 
-#### 구매자 자동 주문 확정 / 협상 분기 가이드 (2026-05-04)
-- 백엔드(`order_service.create_order`)에 `auto_confirm: bool` 파라미터가 추가되어 단가 비교 자동 분기 로직이 들어왔다 (`agent_tools.create_order` 는 항상 `auto_confirm=True` 로 호출). LLM 이 단가 비교를 흉내 내면 분기 판단이 이중으로 일어나 UX 가 망가지므로, 시스템 프롬프트에서 "백엔드가 알아서 분기한다"를 명시적으로 박는 것이 핵심.
-- 동작 분기:
-  - `unit_price >= product.price_per_unit` → 즉시 CONFIRMED + 재고 자동 차감 + 채팅 SYSTEM 메시지.
-  - `unit_price < product.price_per_unit` → QUOTE_REQUESTED 로 시작 후 자동 카운터오퍼 발송 → NEGOTIATING + PENDING 카드.
+#### 구매자 주문/견적 생성 가이드 (2026-05-04 갱신 — auto_confirm 제거, delivery_date 필수화)
+- 백엔드(`order_service.create_order`)가 다음과 같이 바뀌었다:
+  - **delivery_date 필수화** — `OrderCreate` 스키마 / `agent_tools.create_order` / orchestrator `TOOLS` schema 의 required 모두 강제. 빠지면 422.
+  - **가격 일치 시 CONFIRMED 자동 진입 제거** — 모든 신규 주문은 `QUOTE_REQUESTED` 견적 상태로 시작해 판매자 검토를 기다린다. (이전엔 `unit_price >= price_per_unit` 일 때 즉시 CONFIRMED + 재고 차감 했지만, 이제는 판매자가 명시적으로 수락해야 확정.)
+  - **가격 협상 분기는 유지** — `unit_price < price_per_unit` 일 때만 자동 카운터오퍼 → NEGOTIATING + PENDING 카드.
+- 시스템 프롬프트가 옛 흐름 ("가격 일치 → CONFIRMED 자동")을 전제로 작성돼 있어 사용자에게 "주문이 확정됐습니다"라고 거짓 답변하던 문제 → 두 위치를 새 흐름에 맞게 교체.
 - 적용 위치 (orchestrator.py):
-  - `BUYER_ROLE_APPENDIX` 의 `[🚨 구매자 주문/견적 생성 규칙 — 자동 확정 / 협상 분기]` 섹션 (4가지 발화 패턴 분기), `[🚨 단가 자동 조회 강제]` 섹션, `[🚨 주문 생성 결과 응답 표현]` 섹션. 기존 `[🚨 구매자 주문/견적 생성 규칙]` (단순히 create_order 호출만 안내하던 1줄짜리) 를 교체.
-  - `chat_node` 시스템 프롬프트 — `[재고 검색 vs 대체 거래처 분리]` 직후에 `[구매자 자동 주문 확정 / 협상 분기 가이드]` 섹션 추가. chat intent 로 라우팅된 구매자 주문 발화도 동일 분기 인식.
-- 핵심 발화 패턴 (4종):
-  1. 가격 미명시 ("망고 2kg 주문해줘") → `check_stock` 또는 `find_sellers_by_product` 로 `price_per_unit` 조회 → 그 값을 그대로 `unit_price` 로 채워 `create_order` → 백엔드가 단가 일치로 판단해 CONFIRMED.
-  2. 가격 명시 ("13만원에 망고 2kg 주문해줘") → 명시 가격 그대로 `unit_price` → 일치/이상이면 CONFIRMED, 낮으면 NEGOTIATING + 자동 카운터오퍼.
-  3. 협상 명시 ("깎아줘", "할인 받고 싶어") → `submit_counter_offer` 사용 (이미 PENDING/NEGOTIATING 주문 있어야). 가격 함께 언급된 새 주문이면 그 가격으로 `create_order` 해서 자동 협상 분기에 태움.
-  4. 수량만 + 의도 모호 ("망고 2kg") → 즉시 호출 X, "바로 주문할지 채팅방에서 조율할지" 한 번 확인.
-- 단가 자동 조회 강제: `unit_price` 가 비어있으면 안 됨. 사용자가 명시 안 했으면 반드시 조회 도구로 `price_per_unit` 확보 후 채울 것. "단가를 모르겠어요" 답변 금지.
-- 응답 표현 가이드 (별표/표/헤더 금지, 자연체):
-  - CONFIRMED (auto_confirmed=true): "○○ ○단위 주문이 확정됐습니다. 납품일은 ○월 ○일 예정입니다. 변경이 필요하시면 말씀해 주세요."
-  - NEGOTIATING (negotiating=true): "○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 판매자가 수락/거절하면 알려드릴게요."
-  - QUOTE_REQUESTED 등: "주문이 접수됐고 판매자 확인을 기다리고 있습니다."
-- placeholder 추가 없음 (한국어 본문만 추가). format KeyError 위험 0. AST OK, BUYER/SELLER 합성본 `_render_agent_system` 통과 확인 완료, 신규 BUYER 가이드는 SELLER 합성본에 누출되지 않음 확인.
-- 주의: SELLER 합성본에는 의도적으로 추가하지 않음 — 판매자는 직접 주문을 만들지 않으므로(`create_order` 권한 없음) 분기 판단 가이드가 불필요. SELLER 의 주문 확정은 `update_order_status(new_status="CONFIRMED")` 흐름이라 별개.
+  - `BUYER_ROLE_APPENDIX` 의 `[🚨 구매자 주문/견적 생성 규칙]` (라인 1572 근방) — 기존 `[🚨 구매자 주문/견적 생성 규칙 — 자동 확정 / 협상 분기]` + `[🚨 단가 자동 조회 강제]` + `[🚨 주문 생성 결과 응답 표현]` 3개 섹션을 합쳐서 `[🚨 구매자 주문/견적 생성 규칙]` + `[🚨 단가 / 납품일 필수 확보]` + `[🚨 주문 생성 결과 응답 표현]` + `[🚨 납품일 변경]` 4개 섹션으로 재구성.
+  - `chat_node` 시스템 프롬프트의 `[구매자 자동 주문 확정 / 협상 분기 가이드]` (라인 2427 근방) — `[구매자 주문/견적 생성 가이드]` 로 교체.
+- 핵심 발화 패턴 (5종):
+  1. **납품일 + 수량 명시** ("망고 2kg 5월 20일에 받게 주문해줘") → `check_stock`/`find_sellers_by_product` 로 `price_per_unit` 조회 → `unit_price` 채우고 날짜를 'YYYY-MM-DD' 정규화 → `create_order` → QUOTE_REQUESTED.
+  2. **가격까지 명시** ("13만원에 망고 2kg 5/20일 받기로 주문해줘") → 명시 가격 + 날짜 그대로 → 일치/이상이면 QUOTE_REQUESTED, 낮으면 NEGOTIATING + 카운터오퍼.
+  3. **납품일 빠짐** ("망고 2kg 주문해줘") → `create_order` 호출 금지. "납품일은 언제로 할까요? (예: 5월 20일)" 라고 자연체로 되묻고 사용자 답변 받기 전까지는 대기. "오늘"/"내일" 같은 모호한 표현을 LLM 임의로 날짜로 바꿔치기 금지.
+  4. **협상 명시** ("깎아줘", "할인 받고 싶어") → `submit_counter_offer` (이미 PENDING/NEGOTIATING 주문 있을 때). 가격 함께 언급된 새 주문이면 납품일 받아낸 뒤 그 가격으로 `create_order`.
+  5. **수량만 + 의도 모호** ("망고 2kg") → 의도 확인 + 납품일 확보.
+- 필수 확보 강제: `unit_price` 와 `delivery_date` 둘 다 비어있으면 안 됨. 단가는 조회 도구로 확보, 납품일은 사용자에게 받아낼 때까지 호출 금지.
+- 응답 표현 가이드 (별표/표/헤더 금지, 자연체, **"주문이 확정됐습니다" 절대 금지**):
+  - QUOTE_REQUESTED (정상 신규 견적): "○○ ○단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일. 판매자가 수락하면 알려드릴게요."
+  - NEGOTIATING (가격 협상 시작): "○○ ○단위 주문에 대해 ₩○○으로 협상가를 제시했습니다. 채팅방에 카드를 발송했고, 판매자가 수락/거절하면 알려드릴게요."
+  - 그 외: "주문이 접수됐고 판매자 확인을 기다리고 있습니다."
+- 납품일 변경 (`submit_delivery_date_change`): QUOTE_REQUESTED 단계면 "판매자가 견적을 검토하는 중이라 변경 요청도 함께 전달했습니다" 같이 자연스럽게 안내.
+- placeholder 추가 없음. AST OK, render 후 잔여 placeholder 0개, BUYER 합성본에 새 가이드 9개 marker 모두 포함, SELLER 합성본 누출 0건, 옛 표현 4종("자동 확정 / 협상 분기", "auto_confirmed=true", "재고를 자동 차감한다", "[🚨 단가 자동 조회 강제]") 모두 제거 확인 완료.
+- 주의: SELLER 합성본에는 의도적으로 추가하지 않음 — 판매자는 `create_order` 권한 없음. SELLER 의 주문 확정은 `update_order_status(new_status="CONFIRMED")` 흐름.
+
+#### 검증된 패턴: "수치를 먼저 제시하는 응답 형식이 더 효과적" (2026-05-04 추가)
+- 응답 표현 예시를 가이드에 박을 때 "○○ N단위 주문 견적을 판매자에게 보냈습니다. 가격 ₩○○, 납품일 ○월 ○일." 처럼 수치 (수량·가격·날짜) 를 먼저 풀어서 제시하는 형식이, "주문 견적이 발송됐고 가격은 ₩○○이고 납품일은 ○월 ○일입니다" 처럼 산문체로 풀어쓰는 형식보다 LLM 모방률이 높음.
+- 이유: GPT-4o-mini 는 가이드의 마지막 예시 문장을 그대로 따라가는 경향이 있어, **명사 + 수치 + 핵심 정보를 마침표로 끊어 나열**하는 패턴이 채팅창에서 가독성도 좋고 LLM 도 잘 재현함.
+- 반대로 부정형 ("절대 X 라고 말하지 마라") 은 한 번 더 강조 — `[응답 표현]` 섹션 본문 + 헤더 옆 강조 + 가이드 맨 마지막 문장 3중으로 박아야 LLM 이 무의식적으로 옛 표현으로 돌아가는 걸 막을 수 있음 (이번 작업에서 "주문이 확정됐습니다 절대 금지"를 3곳에 분산 명시).

@@ -78,7 +78,8 @@ export interface Order {
 
 export interface OrderCreate {
   seller_id: string;
-  delivery_date?: string;
+  /** YYYY-MM-DD — 백엔드 V2 부터 필수 (2026-05-04). 빈 값 제출 시 422. */
+  delivery_date: string;
   delivery_address?: string;
   notes?: string;
   items: OrderItemInput[];
