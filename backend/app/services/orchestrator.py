@@ -1652,6 +1652,8 @@ A. 후보 0개:
 
 B. 후보 1개:
    즉시 submit_counter_offer(order_id=그_주문의_id, proposed_total_amount=..., notes=...) 호출. 결과를 자연체로 안내.
+   ⚠️ order_id 는 반드시 get_orders 응답의 `id` 필드 값(UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 형식)을 사용하라.
+   `order_number` 필드(ORD-YYYYMMDD-XXXX 형식)는 UUID 가 아니므로 order_id 로 절대 사용 불가.
 
 C. 후보 2개 이상:
    사용자에게 어떤 주문인지 묻는다: "옥수수 50kg 주문 (ORD-20260505-1234) 과 옥수수 80kg 주문 (ORD-20260505-5678) 중 어느 주문에 협상가를 제시할까요?" 형식. 사용자 답변을 받기 전에는 절대 도구를 호출하지 마라.
@@ -2378,6 +2380,39 @@ async def inventory_order_node(state: AgentState) -> dict:
                             "1건이면 바로 호출, 2건 이상이면 사용자에게 선택을 물어봐라."
                         )
                     agent_messages.append({"role": "user", "content": _force_msg})
+                    continue
+
+                # submit_counter_offer 가 invalid_order_id 로 실패한 경우 재시도
+                # — LLM 이 order_number(ORD-XXXX) 를 order_id 로 잘못 사용하거나
+                #   get_orders 없이 임의 값을 넣은 경우
+                _last_tr = all_tool_results[-1] if all_tool_results else {}
+                _last_tr_result = _last_tr.get("result") or {}
+                _counter_invalid_id = (
+                    _last_tr.get("tool_name") == "submit_counter_offer"
+                    and isinstance(_last_tr_result, dict)
+                    and _last_tr_result.get("error") == "invalid_order_id"
+                    and round_idx < MAX_TOOL_ROUNDS - 1
+                )
+                if _counter_invalid_id:
+                    agent_messages.append(assistant_stop_msg)
+                    _had_get_orders = any(
+                        r["tool_name"] == "get_orders" for r in all_tool_results
+                    )
+                    if _had_get_orders:
+                        _retry_msg = (
+                            "submit_counter_offer 에 전달한 order_id 가 UUID 형식이 아닙니다. "
+                            "방금 get_orders 로 조회한 결과에서 각 주문의 `id` 필드(UUID 형식: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)를 "
+                            "order_id 로 사용해야 합니다. `order_number` 필드(ORD-YYYYMMDD-XXXX)는 절대 사용 불가. "
+                            "올바른 UUID 를 사용해 submit_counter_offer 를 즉시 다시 호출하라."
+                        )
+                    else:
+                        _retry_msg = (
+                            "submit_counter_offer 에 전달한 order_id 가 UUID 형식이 아닙니다. "
+                            "먼저 get_orders 를 호출해 주문 목록을 조회하고, "
+                            "사용자가 언급한 품목('새우' 등)과 일치하는 주문의 `id` 필드(UUID)를 order_id 로 사용하라. "
+                            "`order_number`(ORD-YYYYMMDD-XXXX 형식)는 절대 사용 불가."
+                        )
+                    agent_messages.append({"role": "user", "content": _retry_msg})
                     continue
                 # ───────────────────────────────────────────────────────────
 
