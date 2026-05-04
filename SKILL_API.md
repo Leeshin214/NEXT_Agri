@@ -679,6 +679,22 @@ pytest-cov==6.0.0
   )
   ```
 
+- **agent_tools 도구는 항상 sync — async service 호출 시 sync 재구현 (2026-05-04 partner 거래처 등록 도구 추가)**: `orchestrator._execute_tool` 은 `func(**tool_input)` 패턴으로 도구 함수를 호출한다 (await 없음). 따라서 `agent_tools.py` 의 모든 도구는 동기 함수여야 한다. 만약 호출하고 싶은 비즈니스 로직이 `partner_service.create_partner` 처럼 `async def` 라면, 그 안의 핵심 로직(자기 자신 차단, 양방향 PENDING 두 row INSERT, 23505 처리, partner_user 임베딩)을 supabase 클라이언트 동기 호출 패턴으로 재구현한다. 검증된 패턴:
+  ```python
+  def request_partner_registration(user_id: str, target_user_id: str, note: Optional[str] = None) -> dict:
+      # 1) 입력 검증 — UUID 형식 + 자기 자신 차단
+      if user_id == target_user_id: return {"success": False, "error": "self_registration_not_allowed"}
+      # 2) 상대방 존재 확인 — users.is_active=true AND deleted_at IS NULL
+      # 3) 사전 active row 체크 — partial unique index (user_id, partner_user_id) WHERE deleted_at IS NULL
+      #    → 23505 발생 전에 already_partner 응답
+      # 4) 본인 row INSERT (PENDING_OUTGOING) — 23505 catch 시 already_partner
+      # 5) 상대 row INSERT (PENDING_INCOMING) — 실패 시 본인 row hard-delete 보상
+      # 6) partner_user 임베딩 응답 — _build_partner_response 헬퍼 재사용
+  ```
+  - 다중 매칭 시 confirmation 응답: `{"success": False, "needs_confirmation": True, "candidates": [{user_id, name, company_name, role}, ...]}` — `send_chat_message` 의 needs_confirmation 패턴과 일관. LLM 이 후보 리스트를 사용자에게 안내하고 사용자 응답 후 UUID 기반 도구로 다시 호출하도록 유도.
+  - `_fix_id_params` 는 `user_id` 를 자동 강제 주입하므로 LLM 이 user_id 를 빠뜨려도 안전. `target_user_id` 는 LLM 이 보낸 값 보존 → 도구 내부 검증으로 invalid UUID/self/missing 을 각각 다른 error code 로 반환.
+  - 신규 도구 등록 4단계: (1) `agent_tools.py` 함수 추가, (2) `TOOL_FUNCTION_MAP` 등록, (3) `orchestrator.py` `TOOLS` 리스트에 OpenAI tool schema 추가, (4) 검증 — `python -c "from app.services.orchestrator import TOOLS; tool_names=[t['function']['name'] for t in TOOLS]; assert all(n in TOOL_FUNCTION_MAP for n in tool_names)"`.
+
 - **LangGraph 노드별 TOOLS 분리 시 시스템 프롬프트 동기화 필수 (2026-04-29 검증)**: 한 노드가 보유하던 도구를 별도 노드로 옮길 때(예: `inventory_order_node` 의 캘린더 도구 2개를 `calendar_data_node` 의 `TOOLS_CALENDAR` 로 이동), 도구 정의만 옮기고 원래 노드의 시스템 프롬프트를 그대로 두면 LLM 이 존재하지 않는 도구를 호출 시도해서 OpenAI API 가 tool 이름을 모른다고 거부하거나, 가이드와 실제 도구 노출이 어긋나 답변이 어색해진다. 반드시 다음 4 영역을 동시에 정리한다.
   - 시스템 프롬프트 안의 `[사용 가능한 도구]` 목록에서 옮긴 도구 이름 삭제
   - CASE 매트릭스에서 해당 도구 호출 케이스 통째 삭제 (CASE 번호 재정렬 권장)

@@ -111,7 +111,7 @@ export const config = { matcher: [] };
 
 ---
 
-## Zustand Auth Store (탭별 격리 + 만료시각)
+## Zustand Auth Store (탭별 격리 + 만료시각 + 하이드레이션 플래그)
 
 ```typescript
 // frontend/store/authStore.ts
@@ -119,17 +119,28 @@ export const LOGIN_DURATION_MS = 2 * 24 * 60 * 60 * 1000; // 정확히 2일
 
 interface AuthState {
   user: User | null;
-  loginExpiresAt: number | null;          // ← 신규: 만료 epoch ms
+  loginExpiresAt: number | null;          // 만료 epoch ms
   isLoading: boolean;
+  isHydrated: boolean;                    // ← persist rehydration 완료 플래그
   setUser: (user: User | null) => void;
-  setSession: (user: User, expiresAt: number) => void;  // ← 신규: 로그인 시 호출
+  setSession: (user: User, expiresAt: number) => void;  // 로그인 시 호출
   setLoading: (loading: boolean) => void;
+  setHydrated: (hydrated: boolean) => void;
   logout: () => void;                     // user + loginExpiresAt 모두 null로
 }
 
 // persist name을 tabId suffix로 분리 → 탭마다 독립된 store
 const persistName = `agriflow-auth-store-${getTabId()}`;
 // partialize: user + loginExpiresAt 둘 다 persist 대상
+// onRehydrateStorage 콜백에서 isHydrated=true 로 마킹
+persist(..., {
+  name: persistName,
+  storage: createJSONStorage(() => window.localStorage),
+  partialize: (s) => ({ user: s.user, loginExpiresAt: s.loginExpiresAt }),
+  onRehydrateStorage: () => () => {
+    useAuthStore.setState({ isHydrated: true });
+  },
+});
 ```
 
 `getTabId()` 는 `sessionStorage['agriflow-tab-id']` 에 UUID 저장. Supabase 클라이언트와 동일한 키를 공유하여 탭 단위 격리.

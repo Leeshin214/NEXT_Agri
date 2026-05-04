@@ -2194,6 +2194,316 @@ def find_alternative_partners(
 
 
 # ─────────────────────────────────────────────
+# 카운터오퍼 / 납품일 변경 도구 (LangGraph TEA 노드 → order_service async 메서드)
+# ─────────────────────────────────────────────
+#
+# 모든 도구는 동기(sync) 함수이며, 내부적으로 별도 thread + 새 event loop 를
+# 만들어 order_service 의 async 메서드를 호출한다 (orchestrator._execute_tool 이
+# 이미 async 컨텍스트 안에서 sync 호출되기 때문에 asyncio.run() 직접 사용 시
+# RuntimeError 위험 — concurrent.futures + asyncio.new_event_loop 패턴이 안전).
+#
+# service 메서드가 HTTPException 등을 raise 하면 도구는
+# {"success": False, "error": ..., "code": <status>} 형태로 반환하여
+# 다른 agent_tools 함수와 일관된 에러 포맷 유지.
+#
+# user 인자는 {"id": <user_uuid>} dict 만 만들어 넘긴다 (service 가 user["id"] 만 사용).
+
+def _run_async_in_thread(coro_fn):
+    """async coroutine 함수를 새 thread + 새 event loop 에서 실행하고 결과 반환.
+
+    coro_fn: 인자 없는 async 함수 (lambda 또는 async def). thread 내에서 새 loop 를
+    만들어 실행하므로 호출자가 이미 async 컨텍스트 안에 있어도 안전하다.
+    """
+    import concurrent.futures
+
+    def _runner():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro_fn())
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_runner)
+        return future.result()
+
+
+def _service_error_payload(exc: Exception) -> dict:
+    """order_service 가 raise 한 HTTPException 등을 도구 응답 dict 로 변환."""
+    from fastapi import HTTPException as _HTTPException
+    if isinstance(exc, _HTTPException):
+        return {
+            "success": False,
+            "error": str(exc.detail),
+            "code": exc.status_code,
+        }
+    return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def submit_counter_offer(
+    user_id: str = "",
+    order_id: str = "",
+    proposed_total_amount: int = 0,
+    notes: Optional[str] = None,
+) -> dict:
+    """주문 카운터오퍼(가격 제시) 발송. 채팅방에 PENDING 상태 카드로 자동 노출됨.
+
+    LLM 자연어 트리거 예: "1300000원으로 협상해줘", "13만원에 어때요", "가격 좀 깎아주세요".
+    호출 즉시 상대방 채팅창에 수락/거절 버튼이 있는 COUNTER_OFFER 메시지 카드가 발송된다.
+    이전 PENDING 카운터오퍼는 자동 SUPERSEDED 처리.
+
+    파라미터:
+      - user_id: 제시자 UUID (orchestrator._fix_id_params 가 항상 현재 user_id 강제 주입)
+      - order_id: 대상 주문 UUID (필수). QUOTE_REQUESTED 또는 NEGOTIATING 상태여야 함.
+      - proposed_total_amount: 제시 총 금액 (KRW 정수, 양수)
+      - notes: 협상 메모 (선택)
+
+    반환:
+      성공: {success: True, offer: {...negotiation_history row...}}
+      실패: {success: False, error: ..., code: <http_status>}
+    """
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+    if not order_id or not _UUID_PATTERN.match(str(order_id)):
+        return {"success": False, "error": "invalid_order_id"}
+    try:
+        amount_int = int(proposed_total_amount)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "proposed_total_amount must be an integer"}
+    if amount_int <= 0:
+        return {"success": False, "error": "proposed_total_amount must be > 0"}
+
+    from app.services.order_service import order_service
+
+    payload: dict = {"proposed_total_amount": amount_int}
+    if notes:
+        payload["notes"] = notes
+    user_dict = {"id": str(user_id)}
+
+    try:
+        offer = _run_async_in_thread(
+            lambda: order_service.submit_counter_offer(
+                order_id=order_id, payload=payload, user=user_dict
+            )
+        )
+        return {"success": True, "offer": offer}
+    except Exception as e:
+        return _service_error_payload(e)
+
+
+def accept_counter_offer(
+    user_id: str = "",
+    order_id: str = "",
+    offer_id: str = "",
+) -> dict:
+    """상대방의 PENDING 카운터오퍼를 수락. orders.total_amount, order_items 갱신 + 채팅 OFFER_ACCEPTED 카드 발송.
+
+    LLM 자연어 트리거 예: "수락해줘", "OK", "그 가격으로 진행", "좋아요 그렇게 합시다".
+    채팅방의 PENDING 카운터오퍼 카드 status 도 ACCEPTED 로 자동 동기화되어
+    프론트의 수락/거절 버튼이 즉시 사라진다. 본인이 제시한 카운터오퍼는 수락 불가 (상대방만).
+
+    반환:
+      성공: {success: True, offer: {...accepted negotiation_history row...}}
+      실패: {success: False, error: ..., code: <http_status>}
+    """
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+    if not order_id or not _UUID_PATTERN.match(str(order_id)):
+        return {"success": False, "error": "invalid_order_id"}
+    if not offer_id or not _UUID_PATTERN.match(str(offer_id)):
+        return {"success": False, "error": "invalid_offer_id"}
+
+    from app.services.order_service import order_service
+    user_dict = {"id": str(user_id)}
+
+    try:
+        offer = _run_async_in_thread(
+            lambda: order_service.accept_counter_offer(
+                order_id=order_id, offer_id=offer_id, user=user_dict
+            )
+        )
+        return {"success": True, "offer": offer}
+    except Exception as e:
+        return _service_error_payload(e)
+
+
+def reject_counter_offer(
+    user_id: str = "",
+    order_id: str = "",
+    offer_id: str = "",
+) -> dict:
+    """상대방의 PENDING 카운터오퍼를 거절. 채팅 OFFER_REJECTED 카드 발송.
+
+    LLM 자연어 트리거 예: "거절해줘", "안 돼", "그 가격은 어렵습니다", "거절".
+    채팅방의 PENDING 카드 status 도 REJECTED 로 자동 동기화. 본인 제시 카운터오퍼는 거절 불가.
+
+    반환:
+      성공: {success: True, offer: {...rejected negotiation_history row...}}
+      실패: {success: False, error: ..., code: <http_status>}
+    """
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+    if not order_id or not _UUID_PATTERN.match(str(order_id)):
+        return {"success": False, "error": "invalid_order_id"}
+    if not offer_id or not _UUID_PATTERN.match(str(offer_id)):
+        return {"success": False, "error": "invalid_offer_id"}
+
+    from app.services.order_service import order_service
+    user_dict = {"id": str(user_id)}
+
+    try:
+        offer = _run_async_in_thread(
+            lambda: order_service.reject_counter_offer(
+                order_id=order_id, offer_id=offer_id, user=user_dict
+            )
+        )
+        return {"success": True, "offer": offer}
+    except Exception as e:
+        return _service_error_payload(e)
+
+
+def submit_delivery_date_change(
+    user_id: str = "",
+    order_id: str = "",
+    proposed_delivery_date: str = "",
+    notes: Optional[str] = None,
+) -> dict:
+    """납품일 변경 요청 발송. 채팅방에 PENDING 카드로 자동 노출됨.
+
+    LLM 자연어 트리거 예: "납품일 5월 10일로 바꿔줘", "배송일 변경 요청", "납기 다음 주 월요일로".
+    호출 즉시 상대방 채팅창에 수락/거절 버튼이 있는 DELIVERY_DATE_CHANGE 메시지 카드가 발송된다.
+    이전 PENDING 변경 요청은 자동 SUPERSEDED 처리.
+
+    파라미터:
+      - user_id: 요청자 UUID
+      - order_id: 대상 주문 UUID. QUOTE_REQUESTED/NEGOTIATING/CONFIRMED 상태여야 함
+                  (PREPARING 이상은 출하 준비 중이므로 차단됨).
+      - proposed_delivery_date: 변경 희망일 (ISO YYYY-MM-DD). 오늘 이상이어야 함 (router 검증과 동일 정책).
+      - notes: 변경 사유/메모 (선택)
+
+    반환:
+      성공: {success: True, change: {...delivery_date_change_history row...}}
+      실패: {success: False, error: ..., code: <http_status>}
+    """
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+    if not order_id or not _UUID_PATTERN.match(str(order_id)):
+        return {"success": False, "error": "invalid_order_id"}
+
+    date_str = (proposed_delivery_date or "").strip()
+    if not date_str:
+        return {"success": False, "error": "proposed_delivery_date required (YYYY-MM-DD)"}
+    try:
+        proposed_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return {
+            "success": False,
+            "error": "proposed_delivery_date must be ISO date (YYYY-MM-DD)",
+        }
+
+    # KST 기준 오늘 이상 (router 와 동일 정책 — 과거 날짜 차단)
+    from datetime import timedelta as _timedelta
+    _kst_now = datetime.now(timezone(_timedelta(hours=9)))
+    today_kst = _kst_now.date()
+    if proposed_date < today_kst:
+        return {
+            "success": False,
+            "error": "proposed_delivery_date must be today or later (KST)",
+            "code": 422,
+        }
+
+    from app.services.order_service import order_service
+
+    payload: dict = {"proposed_delivery_date": proposed_date.isoformat()}
+    if notes:
+        payload["notes"] = notes
+    user_dict = {"id": str(user_id)}
+
+    try:
+        change = _run_async_in_thread(
+            lambda: order_service.submit_delivery_date_change(
+                order_id=order_id, payload=payload, user=user_dict
+            )
+        )
+        return {"success": True, "change": change}
+    except Exception as e:
+        return _service_error_payload(e)
+
+
+def accept_delivery_date_change(
+    user_id: str = "",
+    order_id: str = "",
+    change_id: str = "",
+) -> dict:
+    """상대방의 PENDING 납품일 변경 요청을 수락. orders.delivery_date 갱신 + 캘린더 재동기화.
+
+    LLM 자연어 트리거 예: "수락해줘", "OK", "그 날짜로 좋아요", "납품일 변경 동의".
+    채팅 DELIVERY_DATE_ACCEPTED 카드 발송 + PENDING 카드 status → ACCEPTED 자동 동기화.
+    양 당사자 캘린더가 새 납품일로 자동 이동(옛 event_date row 는 soft-delete).
+    본인 제시 변경 요청은 수락 불가 (상대방만).
+
+    반환:
+      성공: {success: True, change: {...accepted delivery_date_change row...}}
+      실패: {success: False, error: ..., code: <http_status>}
+    """
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+    if not order_id or not _UUID_PATTERN.match(str(order_id)):
+        return {"success": False, "error": "invalid_order_id"}
+    if not change_id or not _UUID_PATTERN.match(str(change_id)):
+        return {"success": False, "error": "invalid_change_id"}
+
+    from app.services.order_service import order_service
+    user_dict = {"id": str(user_id)}
+
+    try:
+        change = _run_async_in_thread(
+            lambda: order_service.accept_delivery_date_change(
+                order_id=order_id, change_id=change_id, user=user_dict
+            )
+        )
+        return {"success": True, "change": change}
+    except Exception as e:
+        return _service_error_payload(e)
+
+
+def reject_delivery_date_change(
+    user_id: str = "",
+    order_id: str = "",
+    change_id: str = "",
+) -> dict:
+    """상대방의 PENDING 납품일 변경 요청을 거절. 채팅 DELIVERY_DATE_REJECTED 카드 발송.
+
+    LLM 자연어 트리거 예: "거절해줘", "안 돼", "그 날짜는 어려워요", "납품일 변경 거부".
+    채팅방의 PENDING 카드 status 도 REJECTED 로 자동 동기화. 본인 제시 변경 요청은 거절 불가.
+
+    반환:
+      성공: {success: True, change: {...rejected delivery_date_change row...}}
+      실패: {success: False, error: ..., code: <http_status>}
+    """
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+    if not order_id or not _UUID_PATTERN.match(str(order_id)):
+        return {"success": False, "error": "invalid_order_id"}
+    if not change_id or not _UUID_PATTERN.match(str(change_id)):
+        return {"success": False, "error": "invalid_change_id"}
+
+    from app.services.order_service import order_service
+    user_dict = {"id": str(user_id)}
+
+    try:
+        change = _run_async_in_thread(
+            lambda: order_service.reject_delivery_date_change(
+                order_id=order_id, change_id=change_id, user=user_dict
+            )
+        )
+        return {"success": True, "change": change}
+    except Exception as e:
+        return _service_error_payload(e)
+
+
+# ─────────────────────────────────────────────
 # 사용자 프로필 조회 도구
 # ─────────────────────────────────────────────
 
@@ -2262,6 +2572,331 @@ def get_user_profile(
         return {"success": False, "error": "user_not_found"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────
+# 거래처 등록 도구 (양방향 PENDING — V1.6)
+# ─────────────────────────────────────────────
+
+
+def _build_partner_response(supabase, partner_row: dict) -> dict:
+    """본인 row 에 partner_user 임베딩(name/company_name/role/phone)을 붙여 반환.
+
+    partner_service.create_partner 의 응답 형식과 동일하게 맞춘다.
+    임베딩 조회 실패 시에는 partner_row 만 반환 (best-effort).
+    """
+    partner_id = partner_row.get("id")
+    if not partner_id:
+        return partner_row
+
+    try:
+        result = (
+            supabase.table("partners")
+            .select(
+                "*, partner_user:users!partner_user_id(name, company_name, role, phone)"
+            )
+            .eq("id", partner_id)
+            .single()
+            .execute()
+        )
+        row = result.data or partner_row
+    except Exception:
+        row = partner_row
+
+    partner_user = row.pop("partner_user", None) or {}
+    row["partner_name"] = partner_user.get("name")
+    row["partner_company"] = partner_user.get("company_name")
+    row["partner_role"] = partner_user.get("role")
+    row["partner_phone"] = partner_user.get("phone")
+    return row
+
+
+def request_partner_registration(
+    user_id: str,
+    target_user_id: str,
+    note: Optional[str] = None,
+) -> dict:
+    """거래처 등록 요청을 상대방에게 보낸다 (양방향 PENDING).
+
+    이 도구는 상대방 사용자 UUID 가 정확히 알려진 경우에만 호출한다.
+    이름/회사명만 알면 먼저 request_partner_registration_by_name 도구를 사용하거나,
+    get_user_profile 로 UUID 를 조회한 뒤 호출하라.
+
+    동작 (partner_service.create_partner 와 동일):
+      - 본인 row(PENDING_OUTGOING) + 상대 row(PENDING_INCOMING) 두 row 동시 INSERT
+      - 상대가 POST /partners/{id}/accept 호출 시 양쪽 ACTIVE 로 전환
+      - notes 는 본인 row 에만 적용 (상대 row 는 빈 값)
+
+    반환:
+      - 성공: {"success": True, "partner_id": "...", "status": "PENDING_OUTGOING",
+              "partner_name": "...", "partner_company": "...", "message": "..."}
+      - 자기 자신: {"success": False, "error": "self_registration_not_allowed", ...}
+      - 이미 등록됨/요청 중: {"success": False, "error": "already_partner", ...}
+      - 상대방 없음: {"success": False, "error": "user_not_found", ...}
+    """
+    # 입력 검증
+    user_id_str = (user_id or "").strip()
+    target_id_str = (target_user_id or "").strip()
+
+    if not user_id_str or not _UUID_PATTERN.match(user_id_str):
+        return {
+            "success": False,
+            "error": "invalid_user_id",
+            "detail": "요청자 UUID 가 유효하지 않습니다.",
+        }
+    if not target_id_str or not _UUID_PATTERN.match(target_id_str):
+        return {
+            "success": False,
+            "error": "invalid_target_user_id",
+            "detail": (
+                "상대방 UUID 가 유효하지 않습니다. "
+                "이름/회사명으로만 알고 있다면 request_partner_registration_by_name 도구를 사용하세요."
+            ),
+        }
+
+    # 자기 자신 거래처 등록 차단
+    if user_id_str == target_id_str:
+        return {
+            "success": False,
+            "error": "self_registration_not_allowed",
+            "detail": "자기 자신을 거래처로 등록할 수 없습니다.",
+        }
+
+    try:
+        supabase = get_supabase_client()
+
+        # 상대방 존재 + soft-delete 확인
+        target_result = (
+            supabase.table("users")
+            .select("id, name, company_name, role")
+            .eq("id", target_id_str)
+            .is_("deleted_at", None)
+            .limit(1)
+            .execute()
+        )
+        if not target_result.data:
+            return {
+                "success": False,
+                "error": "user_not_found",
+                "detail": "상대방 사용자를 찾을 수 없습니다.",
+            }
+        target = target_result.data[0]
+        target_name = target.get("name") or target.get("company_name") or "상대방"
+
+        # 기존 active row(ACTIVE / PENDING_*) 사전 체크 — partial unique index 충돌 방지
+        existing = (
+            supabase.table("partners")
+            .select("id, status")
+            .eq("user_id", user_id_str)
+            .eq("partner_user_id", target_id_str)
+            .is_("deleted_at", None)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            existing_row = existing.data[0]
+            return {
+                "success": False,
+                "error": "already_partner",
+                "detail": (
+                    f"이미 거래처입니다 (status={existing_row.get('status')}). "
+                    "거래처 목록에서 확인해 주세요."
+                ),
+                "partner_id": existing_row.get("id"),
+                "partner_status": existing_row.get("status"),
+            }
+
+        # 본인 row INSERT (PENDING_OUTGOING)
+        outgoing_payload = {
+            "user_id": user_id_str,
+            "partner_user_id": target_id_str,
+            "status": "PENDING_OUTGOING",
+            "notes": note,
+        }
+        try:
+            outgoing_result = (
+                supabase.table("partners").insert(outgoing_payload).execute()
+            )
+        except Exception as e:
+            err_msg = str(e)
+            if "23505" in err_msg or "duplicate" in err_msg.lower():
+                return {
+                    "success": False,
+                    "error": "already_partner",
+                    "detail": "이미 등록되었거나 요청 중인 거래처입니다.",
+                }
+            return {
+                "success": False,
+                "error": "insert_failed",
+                "detail": f"본인 row INSERT 실패: {type(e).__name__}: {e}",
+            }
+
+        if not outgoing_result.data:
+            return {
+                "success": False,
+                "error": "insert_failed",
+                "detail": "본인 row INSERT 결과가 비어있습니다.",
+            }
+        outgoing_row = outgoing_result.data[0]
+        outgoing_id = outgoing_row["id"]
+
+        # 상대 row INSERT (PENDING_INCOMING) — 실패 시 본인 row hard-delete 보상
+        incoming_payload = {
+            "user_id": target_id_str,
+            "partner_user_id": user_id_str,
+            "status": "PENDING_INCOMING",
+        }
+        try:
+            incoming_result = (
+                supabase.table("partners").insert(incoming_payload).execute()
+            )
+            if not incoming_result.data:
+                raise RuntimeError("상대 row INSERT 결과가 비어있습니다.")
+        except Exception as e:
+            # 보상: 본인 row hard-delete
+            try:
+                supabase.table("partners").delete().eq("id", outgoing_id).execute()
+            except Exception as rollback_err:
+                print(
+                    f"[request_partner_registration] rollback 실패 "
+                    f"outgoing_id={outgoing_id}: "
+                    f"{type(rollback_err).__name__}: {rollback_err}"
+                )
+            err_msg = str(e)
+            if "23505" in err_msg or "duplicate" in err_msg.lower():
+                return {
+                    "success": False,
+                    "error": "already_partner",
+                    "detail": "상대방과 이미 거래처 관계가 존재합니다.",
+                }
+            return {
+                "success": False,
+                "error": "insert_failed",
+                "detail": f"상대 row INSERT 실패: {type(e).__name__}: {e}",
+            }
+
+        # 응답 — partner_user 임베딩 포함
+        enriched = _build_partner_response(supabase, outgoing_row)
+
+        return {
+            "success": True,
+            "partner_id": enriched.get("id"),
+            "status": enriched.get("status", "PENDING_OUTGOING"),
+            "partner_name": enriched.get("partner_name") or target_name,
+            "partner_company": enriched.get("partner_company"),
+            "partner_role": enriched.get("partner_role"),
+            "message": (
+                f"{target_name} 님에게 거래처 등록 요청을 보냈습니다. "
+                "상대가 수락하면 거래처 목록에 활성 상태로 표시됩니다."
+            ),
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": "unexpected_error",
+            "detail": f"{type(e).__name__}: {e}",
+        }
+
+
+def request_partner_registration_by_name(
+    user_id: str,
+    target_name_or_company: str,
+    note: Optional[str] = None,
+) -> dict:
+    """이름/회사명으로 거래처 등록 요청.
+
+    내부적으로 사용자를 검색해 단일 매칭이면 즉시 신청, 다중 매칭이면
+    confirmation 응답을 반환한다 (send_chat_message 의 needs_confirmation 패턴).
+
+    검색 조건:
+      - users.name ilike '%{target}%' 또는 company_name ilike '%{target}%'
+      - is_active=true, deleted_at IS NULL
+      - 본인 제외
+
+    반환:
+      - 단일 매칭 + 신청 성공: request_partner_registration 응답과 동일
+      - 다중 매칭: {"success": False, "needs_confirmation": True,
+                  "candidates": [{user_id, name, company_name, role}, ...]}
+      - 0건: {"success": False, "error": "no_match", "detail": "○○ 님을 찾을 수 없습니다"}
+      - 자기 자신 매칭: {"success": False, "error": "self_registration_not_allowed", ...}
+    """
+    user_id_str = (user_id or "").strip()
+    query_str = (target_name_or_company or "").strip()
+
+    if not user_id_str or not _UUID_PATTERN.match(user_id_str):
+        return {
+            "success": False,
+            "error": "invalid_user_id",
+            "detail": "요청자 UUID 가 유효하지 않습니다.",
+        }
+    if not query_str:
+        return {
+            "success": False,
+            "error": "missing_target",
+            "detail": "거래처로 등록할 상대방의 이름이나 회사명을 알려주세요.",
+        }
+
+    try:
+        supabase = get_supabase_client()
+
+        # 이름/회사명 OR 검색 (본인 제외)
+        result = (
+            supabase.table("users")
+            .select("id, name, company_name, role")
+            .or_(
+                f"name.ilike.%{query_str}%,"
+                f"company_name.ilike.%{query_str}%"
+            )
+            .neq("id", user_id_str)
+            .eq("is_active", True)
+            .is_("deleted_at", None)
+            .limit(10)
+            .execute()
+        )
+        candidates = result.data or []
+
+        if not candidates:
+            return {
+                "success": False,
+                "error": "no_match",
+                "detail": f"'{query_str}' 님을 찾을 수 없습니다.",
+            }
+
+        if len(candidates) >= 2:
+            return {
+                "success": False,
+                "needs_confirmation": True,
+                "candidates": [
+                    {
+                        "user_id": c["id"],
+                        "name": c.get("name"),
+                        "company_name": c.get("company_name"),
+                        "role": c.get("role"),
+                    }
+                    for c in candidates
+                ],
+                "message": (
+                    f"'{query_str}' 와 일치하는 사용자가 {len(candidates)} 명 있습니다. "
+                    "어느 분을 거래처로 등록할지 확인 후 user_id 를 직접 지정해 "
+                    "request_partner_registration 도구로 다시 호출하세요."
+                ),
+            }
+
+        # 단일 매칭 → 즉시 신청
+        target = candidates[0]
+        return request_partner_registration(
+            user_id=user_id_str,
+            target_user_id=target["id"],
+            note=note,
+        )
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": "unexpected_error",
+            "detail": f"{type(e).__name__}: {e}",
+        }
 
 
 # ─────────────────────────────────────────────
@@ -2449,6 +3084,608 @@ def analyze_chat_consensus(
 
 
 # ─────────────────────────────────────────────
+# 정기배송(Subscription) 관련 도구
+# ─────────────────────────────────────────────
+# 참고:
+#   - 실제 INSERT/UPDATE 비즈니스 로직은 app/services/subscription_service.py 에 구현되어 있다.
+#     본 도구들은 LLM tool-use 호환 입력(자연어 친화)을 받아 검증한 뒤 그 서비스를 호출한다.
+#   - sync 도구로 등록하기 위해 _run_async_in_thread 로 비동기 서비스 함수를 실행한다
+#     (이미 검증된 헬퍼; 협상/배송 변경 도구들과 동일 패턴).
+
+_SUBSCRIPTION_FREQUENCIES = ("WEEKLY", "BIWEEKLY", "MONTHLY")
+_SUBSCRIPTION_FREQ_KO = {
+    "매주": "WEEKLY",
+    "주간": "WEEKLY",
+    "주 1회": "WEEKLY",
+    "주1회": "WEEKLY",
+    "격주": "BIWEEKLY",
+    "2주": "BIWEEKLY",
+    "2주마다": "BIWEEKLY",
+    "월": "MONTHLY",
+    "월간": "MONTHLY",
+    "매월": "MONTHLY",
+    "한달": "MONTHLY",
+    "월1회": "MONTHLY",
+    "월 1회": "MONTHLY",
+}
+_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _normalize_frequency(value: Optional[str]) -> Optional[str]:
+    """LLM 이 넘긴 frequency 문자열을 표준 코드로 변환. 표준값이 아니면 None."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    upper = s.upper()
+    if upper in _SUBSCRIPTION_FREQUENCIES:
+        return upper
+    return _SUBSCRIPTION_FREQ_KO.get(s)
+
+
+def _normalize_iso_date(value: Optional[str]) -> Optional[str]:
+    """YYYY-MM-DD 형태로 정규화. 형식 안 맞으면 None."""
+    if not value:
+        return None
+    s = str(value).strip()[:10]
+    if _DATE_PATTERN.match(s):
+        return s
+    return None
+
+
+def _resolve_subscription_items(
+    supabase,
+    *,
+    seller_id: str,
+    items: list[dict],
+) -> tuple[list[dict], list[str]]:
+    """LLM 입력 items 를 subscription_service 가 요구하는 dict 리스트로 정규화.
+
+    각 입력 item 은 다음 키를 가질 수 있다:
+      - product_id   (UUID, 권장)
+      - product_name (UUID 모를 때 사용 — seller_id 범위에서 자동 검색)
+      - quantity     (int > 0)
+      - unit_price   (int >= 0; 미지정 시 product.price_per_unit 자동 채움)
+      - unit         (kg/box/piece 등; 미지정 시 product.unit 자동 채움)
+
+    반환: (정규화된 items 리스트, 에러 메시지 리스트)
+      에러가 있으면 호출 측에서 needs_clarification 응답 구성에 사용.
+    """
+    resolved: list[dict] = []
+    errors: list[str] = []
+
+    if not isinstance(items, list) or not items:
+        return resolved, ["items 가 비어 있습니다. 정기배송할 품목/수량/단가를 1개 이상 알려주세요."]
+
+    for idx, raw in enumerate(items):
+        if not isinstance(raw, dict):
+            errors.append(f"items[{idx}] 형식이 잘못되었습니다 (dict 가 아님).")
+            continue
+
+        product_id = (raw.get("product_id") or "").strip()
+        product_name = (raw.get("product_name") or "").strip()
+        product_row: Optional[dict] = None
+
+        if product_id and _UUID_PATTERN.match(product_id):
+            try:
+                q = (
+                    supabase.table("products")
+                    .select("id, name, unit, price_per_unit")
+                    .eq("id", product_id)
+                    .is_("deleted_at", None)
+                )
+                if seller_id:
+                    q = q.eq("seller_id", seller_id)
+                vr = q.execute()
+                if not vr.data:
+                    errors.append(
+                        f"items[{idx}] product_id '{product_id}' 가 판매자 상품에서 확인되지 않습니다."
+                    )
+                    continue
+                product_row = vr.data[0]
+            except Exception as e:
+                errors.append(f"items[{idx}] 상품 조회 오류: {e}")
+                continue
+        elif product_name:
+            found = _find_product_by_name(supabase, product_name, seller_id)
+            if not found:
+                errors.append(f"items[{idx}] '{product_name}' 상품을 찾을 수 없습니다.")
+                continue
+            product_id = found["id"]
+            try:
+                detail = (
+                    supabase.table("products")
+                    .select("id, name, unit, price_per_unit")
+                    .eq("id", product_id)
+                    .is_("deleted_at", None)
+                    .execute()
+                )
+                product_row = detail.data[0] if detail.data else found
+            except Exception:
+                product_row = found
+        else:
+            errors.append(f"items[{idx}] product_id 또는 product_name 중 하나는 필요합니다.")
+            continue
+
+        try:
+            quantity = int(raw.get("quantity"))
+        except (TypeError, ValueError):
+            errors.append(f"items[{idx}] quantity 가 정수가 아닙니다.")
+            continue
+        if quantity <= 0:
+            errors.append(f"items[{idx}] quantity 는 1 이상이어야 합니다.")
+            continue
+
+        unit_price_raw = raw.get("unit_price")
+        unit_price: Optional[int] = None
+        if unit_price_raw is not None and unit_price_raw != "":
+            try:
+                unit_price = int(unit_price_raw)
+            except (TypeError, ValueError):
+                errors.append(f"items[{idx}] unit_price 가 정수가 아닙니다.")
+                continue
+        if unit_price is None and product_row:
+            unit_price = product_row.get("price_per_unit")
+        if unit_price is None:
+            errors.append(f"items[{idx}] unit_price 가 누락되었습니다.")
+            continue
+        if unit_price < 0:
+            errors.append(f"items[{idx}] unit_price 는 0 이상이어야 합니다.")
+            continue
+
+        unit = (raw.get("unit") or "").strip()
+        if not unit and product_row:
+            unit = product_row.get("unit") or ""
+        if not unit:
+            errors.append(f"items[{idx}] unit 이 누락되었습니다.")
+            continue
+
+        resolved.append({
+            "product_id": product_id,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "unit": unit,
+        })
+
+    return resolved, errors
+
+
+def create_subscription_request(
+    user_id: str = "",
+    target_user_id: str = "",
+    frequency: str = "",
+    start_date: str = "",
+    end_date: Optional[str] = None,
+    items: Optional[list[dict]] = None,
+    delivery_address: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> dict:
+    """정기배송 요청을 상대방에게 보낸다 (status=PENDING 으로 시작).
+
+    상대방이 accept 하면 ACTIVE, reject 하면 REJECTED 로 전환된다.
+    필수 정보(frequency / start_date / items) 가 부족하면
+    needs_clarification=True 응답을 돌려 LLM 이 사용자에게 다시 묻도록 한다.
+
+    파라미터:
+      user_id: 현재 로그인 사용자 UUID (요청자, created_by 로 저장됨)
+      target_user_id: 정기배송 상대방 UUID
+      frequency: WEEKLY / BIWEEKLY / MONTHLY (한국어 '매주'/'격주'/'매월' 도 허용)
+      start_date: YYYY-MM-DD
+      end_date: YYYY-MM-DD (선택)
+      items: [{product_id|product_name, quantity, unit_price?, unit?}, ...]
+      delivery_address: 납품 주소 (선택)
+      notes: 메모 (선택)
+
+    반환:
+      성공: {success: True, subscription_id, status: "PENDING", direction, message}
+      검증 실패: {success: False, needs_clarification: True, missing: [...], message}
+      서비스 실패: {success: False, error, message}
+    """
+    user_clean = (user_id or "").strip()
+    target_clean = (target_user_id or "").strip()
+
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id", "message": "현재 사용자 UUID 가 유효하지 않습니다."}
+    if not target_clean or not _UUID_PATTERN.match(target_clean):
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["target_user_id"],
+            "message": "정기배송을 누구에게 요청할지 알려주세요. (거래처 이름이나 회사명을 알려주시면 자동으로 찾아드립니다.)",
+        }
+    if user_clean == target_clean:
+        return {
+            "success": False,
+            "error": "self_subscription_not_allowed",
+            "message": "자기 자신에게 정기배송을 요청할 수 없습니다.",
+        }
+
+    missing: list[str] = []
+    freq_norm = _normalize_frequency(frequency)
+    if not freq_norm:
+        missing.append("frequency")
+    start_norm = _normalize_iso_date(start_date)
+    if not start_norm:
+        missing.append("start_date")
+
+    end_norm = _normalize_iso_date(end_date) if end_date else None
+    if end_date and not end_norm:
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["end_date"],
+            "message": "end_date 는 YYYY-MM-DD 형식이어야 합니다.",
+        }
+
+    if missing:
+        msg_parts: list[str] = []
+        if "frequency" in missing:
+            msg_parts.append("배송 주기(매주/격주/매월)")
+        if "start_date" in missing:
+            msg_parts.append("시작 날짜(YYYY-MM-DD)")
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": missing,
+            "message": "정기배송을 등록하려면 " + " 와 ".join(msg_parts) + " 가 필요합니다. 알려주세요.",
+        }
+
+    # 역할 매칭 — SELLER↔BUYER 만 허용. seller_id, buyer_id 결정.
+    try:
+        supabase = get_supabase_client()
+        me_result = (
+            supabase.table("users")
+            .select("id, role")
+            .eq("id", user_clean)
+            .is_("deleted_at", None)
+            .limit(1)
+            .execute()
+        )
+        if not me_result.data:
+            return {"success": False, "error": "user_not_found", "message": "현재 사용자 정보를 찾을 수 없습니다."}
+        my_role = (me_result.data[0].get("role") or "").upper()
+
+        target_result = (
+            supabase.table("users")
+            .select("id, role, name, company_name")
+            .eq("id", target_clean)
+            .is_("deleted_at", None)
+            .limit(1)
+            .execute()
+        )
+        if not target_result.data:
+            return {
+                "success": False,
+                "error": "target_not_found",
+                "message": "정기배송 상대방을 찾을 수 없습니다.",
+            }
+        target_role = (target_result.data[0].get("role") or "").upper()
+        target_label = (
+            target_result.data[0].get("company_name")
+            or target_result.data[0].get("name")
+            or "거래처"
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    if my_role == "SELLER" and target_role == "BUYER":
+        seller_id, buyer_id = user_clean, target_clean
+        direction = "SELLER_TO_BUYER"
+    elif my_role == "BUYER" and target_role == "SELLER":
+        seller_id, buyer_id = target_clean, user_clean
+        direction = "BUYER_TO_SELLER"
+    else:
+        return {
+            "success": False,
+            "error": "role_mismatch",
+            "message": (
+                "정기배송은 판매자(SELLER) 와 구매자(BUYER) 간에만 등록할 수 있습니다. "
+                f"(나={my_role or '?'}, 상대={target_role or '?'})"
+            ),
+        }
+
+    resolved_items, item_errors = _resolve_subscription_items(
+        supabase, seller_id=seller_id, items=items or []
+    )
+    if not resolved_items:
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["items"],
+            "message": (
+                "정기배송할 품목/수량/단가를 알려주세요.\n"
+                + ("\n".join(f"- {e}" for e in item_errors) if item_errors else "예) '망고 2box, 단가 30000원'")
+            ),
+        }
+
+    from app.services.subscription_service import subscription_service
+    from uuid import UUID as _UUID
+
+    payload = {
+        "seller_id": seller_id,
+        "buyer_id": buyer_id,
+        "frequency": freq_norm,
+        "start_date": start_norm,
+        "end_date": end_norm,
+        "delivery_address": delivery_address,
+        "notes": notes,
+        "items": resolved_items,
+    }
+
+    try:
+        sub = _run_async_in_thread(
+            lambda: subscription_service.create_subscription(
+                user_id=_UUID(user_clean), payload=payload
+            )
+        )
+    except Exception as e:
+        return _service_error_payload(e)
+
+    return {
+        "success": True,
+        "subscription_id": sub.get("id") if isinstance(sub, dict) else None,
+        "status": sub.get("status") if isinstance(sub, dict) else "PENDING",
+        "direction": direction,
+        "frequency": freq_norm,
+        "start_date": start_norm,
+        "end_date": end_norm,
+        "items_count": len(resolved_items),
+        "target_label": target_label,
+        "message": (
+            f"{target_label} 에게 정기배송 요청을 보냈습니다 (주기: {freq_norm}, 시작: {start_norm}). "
+            "상대방이 수락하면 자동으로 활성화됩니다."
+        ),
+    }
+
+
+def accept_subscription_request(user_id: str = "", subscription_id: str = "") -> dict:
+    """받은 정기배송 요청을 수락한다 (PENDING → ACTIVE).
+
+    - 요청자 본인은 수락 불가 (subscription_service 에서 403).
+    - status 가 PENDING 이 아니면 400.
+    - ACTIVE 전환 시 양 당사자 캘린더에 다음 배송 일정이 자동 등록된다.
+    """
+    user_clean = (user_id or "").strip()
+    sub_clean = (subscription_id or "").strip()
+
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id", "message": "현재 사용자 UUID 가 유효하지 않습니다."}
+    if not sub_clean or not _UUID_PATTERN.match(sub_clean):
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["subscription_id"],
+            "message": "수락할 정기배송 ID 를 알려주세요. (정기배송 목록에서 확인)",
+        }
+
+    from app.services.subscription_service import subscription_service
+    from uuid import UUID as _UUID
+
+    try:
+        sub = _run_async_in_thread(
+            lambda: subscription_service.accept_subscription(
+                subscription_id=_UUID(sub_clean), user_id=_UUID(user_clean)
+            )
+        )
+    except Exception as e:
+        return _service_error_payload(e)
+
+    return {
+        "success": True,
+        "subscription_id": sub.get("id") if isinstance(sub, dict) else sub_clean,
+        "status": sub.get("status") if isinstance(sub, dict) else "ACTIVE",
+        "next_delivery_date": sub.get("next_delivery_date") if isinstance(sub, dict) else None,
+        "message": "정기배송 요청을 수락했습니다. 캘린더에 다음 배송 일정이 자동 등록됩니다.",
+    }
+
+
+def reject_subscription_request(
+    user_id: str = "",
+    subscription_id: str = "",
+    reason: Optional[str] = None,
+) -> dict:
+    """받은 정기배송 요청을 거절한다 (PENDING → REJECTED).
+
+    - 요청자 본인은 거절 불가.
+    - reason 은 현재 DB 컬럼이 없어 응답 메시지에만 활용된다 (이력 보존은 status=REJECTED 로).
+    """
+    user_clean = (user_id or "").strip()
+    sub_clean = (subscription_id or "").strip()
+
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id", "message": "현재 사용자 UUID 가 유효하지 않습니다."}
+    if not sub_clean or not _UUID_PATTERN.match(sub_clean):
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["subscription_id"],
+            "message": "거절할 정기배송 ID 를 알려주세요.",
+        }
+
+    from app.services.subscription_service import subscription_service
+    from uuid import UUID as _UUID
+
+    try:
+        _run_async_in_thread(
+            lambda: subscription_service.reject_subscription(
+                subscription_id=_UUID(sub_clean), user_id=_UUID(user_clean)
+            )
+        )
+    except Exception as e:
+        return _service_error_payload(e)
+
+    msg = "정기배송 요청을 거절했습니다."
+    if reason:
+        msg = f"{msg} (사유: {reason})"
+    return {
+        "success": True,
+        "subscription_id": sub_clean,
+        "status": "REJECTED",
+        "reason": reason,
+        "message": msg,
+    }
+
+
+def create_subscription_from_order(
+    user_id: str = "",
+    order_id: str = "",
+    frequency: str = "",
+    start_date: str = "",
+    end_date: Optional[str] = None,
+) -> dict:
+    """기존 주문의 품목을 그대로 정기배송으로 전환 신청한다.
+
+    예: '망고 2kg 주문을 정기배송으로 전환해줘' → 해당 주문의 order_items 를
+        그대로 subscription_items 로 복제하고 PENDING 상태로 등록한다.
+    상대방이 수락하면 ACTIVE 로 전환된다.
+    """
+    user_clean = (user_id or "").strip()
+    order_clean = (order_id or "").strip()
+
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id", "message": "현재 사용자 UUID 가 유효하지 않습니다."}
+    if not order_clean or not _UUID_PATTERN.match(order_clean):
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["order_id"],
+            "message": "어떤 주문을 정기배송으로 전환할지 알려주세요. (주문 번호 또는 주문 ID)",
+        }
+
+    missing: list[str] = []
+    freq_norm = _normalize_frequency(frequency)
+    if not freq_norm:
+        missing.append("frequency")
+    start_norm = _normalize_iso_date(start_date)
+    if not start_norm:
+        missing.append("start_date")
+
+    end_norm = _normalize_iso_date(end_date) if end_date else None
+    if end_date and not end_norm:
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["end_date"],
+            "message": "end_date 는 YYYY-MM-DD 형식이어야 합니다.",
+        }
+
+    if missing:
+        msg_parts: list[str] = []
+        if "frequency" in missing:
+            msg_parts.append("배송 주기(매주/격주/매월)")
+        if "start_date" in missing:
+            msg_parts.append("시작 날짜(YYYY-MM-DD)")
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": missing,
+            "message": "정기배송 전환에 " + " 와 ".join(msg_parts) + " 가 필요합니다.",
+        }
+
+    try:
+        supabase = get_supabase_client()
+        order_result = (
+            supabase.table("orders")
+            .select("id, buyer_id, seller_id, delivery_address, notes, order_number, status")
+            .eq("id", order_clean)
+            .is_("deleted_at", None)
+            .limit(1)
+            .execute()
+        )
+        if not order_result.data:
+            return {"success": False, "error": "order_not_found", "message": "해당 주문을 찾을 수 없습니다."}
+        order = order_result.data[0]
+
+        if user_clean not in (order.get("buyer_id"), order.get("seller_id")):
+            return {
+                "success": False,
+                "error": "forbidden",
+                "message": "해당 주문의 당사자(구매자/판매자)만 정기배송으로 전환할 수 있습니다.",
+            }
+
+        items_result = (
+            supabase.table("order_items")
+            .select("product_id, quantity, unit_price, products(name, unit)")
+            .eq("order_id", order_clean)
+            .execute()
+        )
+        raw_items = items_result.data or []
+        if not raw_items:
+            return {
+                "success": False,
+                "error": "no_items",
+                "message": "해당 주문에 품목이 없어 정기배송으로 전환할 수 없습니다.",
+            }
+
+        sub_items: list[dict] = []
+        for it in raw_items:
+            product = it.get("products") or {}
+            unit_value = product.get("unit") if isinstance(product, dict) else None
+            try:
+                quantity = int(it.get("quantity"))
+                unit_price = int(it.get("unit_price"))
+            except (TypeError, ValueError):
+                continue
+            if not it.get("product_id") or quantity <= 0 or unit_price < 0 or not unit_value:
+                continue
+            sub_items.append({
+                "product_id": it["product_id"],
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "unit": unit_value,
+            })
+
+        if not sub_items:
+            return {
+                "success": False,
+                "error": "no_valid_items",
+                "message": "해당 주문에서 정기배송으로 변환 가능한 유효 품목을 찾지 못했습니다.",
+            }
+
+        payload = {
+            "seller_id": order["seller_id"],
+            "buyer_id": order["buyer_id"],
+            "frequency": freq_norm,
+            "start_date": start_norm,
+            "end_date": end_norm,
+            "delivery_address": order.get("delivery_address"),
+            "notes": order.get("notes"),
+            "items": sub_items,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+    from app.services.subscription_service import subscription_service
+    from uuid import UUID as _UUID
+
+    try:
+        sub = _run_async_in_thread(
+            lambda: subscription_service.create_subscription(
+                user_id=_UUID(user_clean), payload=payload
+            )
+        )
+    except Exception as e:
+        return _service_error_payload(e)
+
+    return {
+        "success": True,
+        "subscription_id": sub.get("id") if isinstance(sub, dict) else None,
+        "status": sub.get("status") if isinstance(sub, dict) else "PENDING",
+        "source_order_id": order_clean,
+        "source_order_number": order.get("order_number"),
+        "frequency": freq_norm,
+        "start_date": start_norm,
+        "end_date": end_norm,
+        "items_count": len(sub_items),
+        "message": (
+            f"주문 {order.get('order_number') or order_clean[:8]} 의 품목을 그대로 정기배송 요청으로 보냈습니다. "
+            f"(주기: {freq_norm}, 시작: {start_norm}) 상대방이 수락하면 자동 활성화됩니다."
+        ),
+    }
+
+
+# ─────────────────────────────────────────────
 # tool 이름 → 함수 매핑 테이블
 # ─────────────────────────────────────────────
 
@@ -2479,4 +3716,18 @@ TOOL_FUNCTION_MAP = {
     "delete_calendar_event": delete_calendar_event,
     "find_alternative_partners": find_alternative_partners,
     "get_user_profile": get_user_profile,
+    "request_partner_registration": request_partner_registration,
+    "request_partner_registration_by_name": request_partner_registration_by_name,
+    # 카운터오퍼 / 납품일 변경 — order_service async 메서드를 thread+loop 로 호출
+    "submit_counter_offer": submit_counter_offer,
+    "accept_counter_offer": accept_counter_offer,
+    "reject_counter_offer": reject_counter_offer,
+    "submit_delivery_date_change": submit_delivery_date_change,
+    "accept_delivery_date_change": accept_delivery_date_change,
+    "reject_delivery_date_change": reject_delivery_date_change,
+    # 정기배송(Subscription) — subscription_service async 메서드를 thread+loop 로 호출
+    "create_subscription_request": create_subscription_request,
+    "accept_subscription_request": accept_subscription_request,
+    "reject_subscription_request": reject_subscription_request,
+    "create_subscription_from_order": create_subscription_from_order,
 }

@@ -487,14 +487,28 @@ class AgentState(TypedDict):
 - 다른 노드(inventory_order/calendar_data/calendar_reason)는 모두 `state["history"]` 를 직접 사용 → 오염된 messages 를 다시 필터링할 필요 없음
 - `AgentOrchestrator.run()` 에서 `clean_history` 를 한 번만 만들어 `history` / `messages` 양쪽에 주입
 
-#### TOOL_FUNCTION_MAP 전체 목록 (18개)
+#### TOOL_FUNCTION_MAP 전체 목록 (36개, 2026-05-04 갱신)
 ```
+# 상품/재고
 get_products, check_stock, update_stock, create_product, delete_product, update_product,
-get_orders, get_order_detail, update_order_status, create_order, delete_order,
-find_sellers_by_product, find_buyers_by_product,
-open_chat_room, get_calendar_events, create_calendar_event,
-find_alternative_partners, get_user_profile
+# 주문
+get_orders, get_order_detail, update_order_status, update_order, create_order, delete_order,
+# 거래처/검색
+find_sellers_by_product, find_buyers_by_product, find_alternative_partners, get_user_profile,
+# 채팅
+open_chat_room, get_chat_rooms, get_chat_messages, send_chat_message,
+# 캘린더
+get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event,
+# 거래처 등록 (양방향 PENDING)
+request_partner_registration, request_partner_registration_by_name,
+# 카운터오퍼 / 납품일 변경 (2026-05-04 신규)
+submit_counter_offer, accept_counter_offer, reject_counter_offer,
+submit_delivery_date_change, accept_delivery_date_change, reject_delivery_date_change,
+# 정기배송 V1.6 양방향 승인 모델 (2026-05-04 신규, 테스터 피드백 #6)
+create_subscription_request, accept_subscription_request, reject_subscription_request,
+create_subscription_from_order,
 ```
+- TOOLS 리스트 (orchestrator.py inventory_order_node 노출용) 도 동일하게 30개 (carbon copy 가 아님 — `analyze_chat_consensus` / `_resolve_chat_room_candidates` / `_do_send_chat_message` 등 내부 헬퍼 6종은 제외).
 
 #### 시스템 프롬프트 고도화 패턴 (Phase 2)
 - 12가지 CASE 안내를 AGENT_SELLER_SYSTEM / AGENT_BUYER_SYSTEM에 명시 → LLM이 도구 선택 실수 감소
@@ -567,3 +581,11 @@ find_alternative_partners, get_user_profile
 - `analyze_chat_consensus` (chat_ws.py 안에서 호출) — 합의/거절 감지 시 **자동으로** 주문 INSERT + 캘린더 등록 + 시스템 메시지 broadcast.
 - `negotiation_detection_service` (chat.py 라우터에서 호출) — 단순 협상 의도 감지 + metadata 저장 + 본인에게만 알림 → **사용자 [등록] 클릭 시에만** propose_counter_offer 호출.
 - 두 흐름은 동시 동작 가능 (한 메시지가 협상 의도 + 합의 양쪽 트리거 가능). consensus 가 먼저 자동 주문을 만들어도 draft_negotiation 은 별도 metadata 키라 충돌 없음.
+
+#### Phase B 시스템 프롬프트 보강 (2026-05-04)
+- 새 도구 12개(submit/accept/reject_counter_offer, submit/accept/reject_delivery_date_change, request_partner_registration, request_partner_registration_by_name, create/accept/reject_subscription_request, create_subscription_from_order)에 대한 자연어 트리거 가이드 5종을 시스템 프롬프트에 분산 추가:
+  - `AGENT_BASE_SYSTEM` — [채팅 메시지 발송 확인 가이드] 직후·[주의사항] 직전에 (1) 자연어 → 카드 도구 자동 호출 핵심 매핑, (2) 자연어 → 카드 도구 안전장치, (3) 재고 검색 vs 대체 거래처 분리 원칙(환각 방지) 3개 섹션. SELLER/BUYER 합성본에 자동 반영.
+  - `chat_node` 시스템 프롬프트 — [needs_confirmation 응답 가이드] 직후에 (1) 자연어 협상/납품일 → 카드 도구 매핑, (2) 거래처 등록 / 정기배송 자연어 매핑, (3) 재고 vs 대체 분리 3개 섹션 직접 명시(chat intent 라우팅 시 가장 자주 호출되는 노드라 BASE 와 별도로 보강).
+- 핵심 안전장치: 가격/날짜/주기 같은 필수 정보가 발화에서 빠지면 도구 호출 X → 되묻기. 정보가 명확히 있으면 이중 confirmation 없이 즉시 호출(UX). 카드는 즉시 발송되어 채팅방에 PENDING 으로 노출되므로 도구 호출 직후 "○○으로 카드를 보냈습니다. 상대방이 수락/거절하면 알려드릴게요" 형식의 후속 흐름 안내 강조.
+- 환각 방지: "참치 찾아줘" → product_name='참치'만 정확 검색. 0건이라도 새우/연어 같은 다른 품목 추천 절대 금지. 사용자 명시 동의 후에만 find_alternative_partners 호출. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에 동시 호출 금지.
+- 도구 시그니처는 실제 함수 정의 그대로 매핑 (notes/proposed_total_amount/proposed_delivery_date/offer_id/change_id 등 실제 키 사용). placeholder 추가 없음 → KeyError 위험 0. AST OK, SELLER/BUYER 합성본 모두 _render_agent_system 통과 확인 완료.

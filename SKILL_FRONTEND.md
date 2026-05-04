@@ -372,7 +372,7 @@ content: [
 ### 판매자
 - [ ] dashboard — SummaryCard 4개, 최근 주문 테이블, 이번 주 출하 일정
 - [ ] calendar — 월간 달력, 이벤트 타입별 색상, 날짜 클릭 상세 패널
-- [x] partners — 거래처 테이블 (서버 사이드 필터), 즐겨찾기 토글, AddPartnerModal, 빠른 액션(채팅) — 주문 작성은 V1 숨김 (전용 새 페이지 미존재)
+- [x] partners — 거래처 테이블 (서버 사이드 필터), 즐겨찾기 토글, AddPartnerModal, 빠른 액션(채팅 / 정기배송 신청 — ACTIVE 만) — 주문 작성은 V1 숨김 (전용 새 페이지 미존재)
 - [x] members — 회원 검색 카드, 프로필 모달, 채팅 생성, 거래처 추가 버튼
 - [ ] products — 상품 목록, 상태 필터, 등록 모달 (React Hook Form)
 - [x] orders — 탭(견적/진행/완료), 상세 패널, 상태 변경 + 협상가 제시/수락/거절 + 취소
@@ -381,7 +381,7 @@ content: [
 ### 구매자
 - [ ] dashboard — SummaryCard 4개, 진행 주문 현황, 납품 예정
 - [ ] calendar — 판매자와 동일 패턴
-- [x] partners — 판매자와 동일 패턴 + 빠른 액션 "주문 작성" → /buyer/browse?seller_id=...
+- [x] partners — 판매자와 동일 패턴 + 빠른 액션 "주문 작성" → /buyer/browse?seller_id=... + 정기배송 신청(ACTIVE 만)
 - [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat) + 거래처 추가 버튼
 - [x] browse — 상품 카드 그리드, 카테고리/가격 필터, 견적 요청 버튼, ?seller_id= 쿼리로 판매자 필터
 - [x] orders — 견적 생성/수정/취소 모달 + 협상가 제시/수락/거절 + 상세 슬라이드
@@ -1092,6 +1092,35 @@ const { data } = usePartners();
 ```
 
 **주의 — React Query 캐시 분리**: queryKey 가 `['partners', filters]` 라서 `usePartners({ include_last_trade: true })` 와 `usePartners()` 는 별도 캐시 슬롯을 차지한다. 거래처 페이지(last_trade 포함)와 다른 페이지(last_trade 없음)가 같은 사용자 세션에서 두 번 fetch 되는 trade-off 가 발생하지만, 다른 페이지에서 불필요한 집계 비용을 피하는 설계 의도와 일치한다.
+
+#### 거래처 행 빠른 액션 — 정기배송 신청 진입점 (검증됨, 2026-05-04, 테스터 피드백 #6)
+
+거래처 목록 페이지에서 `PartnerDetailModal` 을 열지 않고도 정기배송 신청 모달을 직접 호출하는 빠른 액션 버튼. 발견성 ↑.
+
+- **노출 조건**: `item.status === 'ACTIVE'` 만 — `PENDING_*` / `INACTIVE` 거래처는 버튼 자체 미노출.
+- **상태 모델**: `useState<Partner | null>(subscriptionPartner)` 한 개로 모달 가시성과 prefill 대상 partner 를 동시에 관리.
+- **prefill 방식**: `SubscriptionFormModal` 은 별도의 prefill prop 이 없어도 `partner` prop 만으로 `seller_id` / `buyer_id` / `partner_id` 자동 매핑 (myRole 기준 분기). 추가 prop 신설 불필요.
+- **버튼 패턴** (양쪽 페이지 actions 컬럼 동일):
+
+```tsx
+{item.status === 'ACTIVE' && (
+  <button
+    onClick={(e) => {
+      e.stopPropagation();          // 행 onClick (PartnerDetailModal 열기) 차단 필수
+      setSubscriptionPartner(item);
+    }}
+    title="정기배송 신청"
+    className="inline-flex items-center gap-1 rounded-lg border border-primary-600 bg-white px-2.5 py-1 text-xs font-medium text-primary-700 hover:bg-primary-50"
+  >
+    <Repeat className="h-3.5 w-3.5" />
+    <span className="hidden sm:inline">정기배송</span>
+  </button>
+)}
+```
+
+- **모바일 대응**: 라벨 텍스트는 `hidden sm:inline` 으로 작은 화면(≤640px)에서 아이콘만 노출. actions 컨테이너는 `flex flex-wrap items-center justify-end gap-1` 로 폭이 부족할 때 줄바꿈. (기존 `채팅` / `주문 작성` 버튼도 같은 정책으로 통일했음)
+- **모달 렌더 위치**: 페이지 최하단 `PartnerDetailModal` 옆에 conditional 렌더 (`subscriptionPartner && <SubscriptionFormModal .../>`).
+- **아이콘 선택**: `Repeat` (lucide). 정기성/반복 의미가 가장 자연스러움. `RefreshCw` 는 새로고침과 혼동, `CalendarRange` 는 일정 의미가 강함.
 
 #### lib/api.ts 배열 query param 직렬화 (검증됨, 2026-04-27)
 
