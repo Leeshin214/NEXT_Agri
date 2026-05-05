@@ -1836,44 +1836,51 @@ async def response_node(state: AgentState) -> dict:
     # ── 주문 생성 / 납품일 변경 날조 최종 안전망 ────────────────────────
     # 각 도구가 실행되지 않았는데 완료 문구가 응답에 있으면 차단.
     # get_orders/get_order_detail 로 기존 주문을 조회해 보여주는 정상 케이스는 제외.
+    #
+    # ⚠️ intent 게이트 (regression fix, 2026-05-04):
+    # 이 fab 검사는 inventory_order_node (intent=INVENTORY/ORDER) 의 결과만 대상으로 한다.
+    # CALENDAR 응답은 calendar_events 가 임베딩한 order_number(ORD-XXXX) 를 자연어로 풀어
+    # 응답에 포함하므로 위 마커를 정상적으로 트리거한다 — 이 경우 fab 가 아님.
+    # CHAT / GENERAL 도 마찬가지로 다른 의미로 "ORD-" 토큰을 포함할 수 있으므로 제외.
     _final_resp = state.get("final_response", "")
     _query_tools_used = {"get_orders", "get_order_detail"} & set(tools_used)
 
-    _order_fab_markers = ["ORD-", "주문 번호는", "주문번호는", "접수되었습니다", "견적 요청으로 전달"]
-    if (any(m in _final_resp for m in _order_fab_markers)
-            and "create_order" not in tools_used
-            and not _query_tools_used):
-        return {
-            "final_response": (
-                "주문 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
-            )
-        }
+    if intent in ("INVENTORY", "ORDER"):
+        _order_fab_markers = ["ORD-", "주문 번호는", "주문번호는", "접수되었습니다", "견적 요청으로 전달"]
+        if (any(m in _final_resp for m in _order_fab_markers)
+                and "create_order" not in tools_used
+                and not _query_tools_used):
+            return {
+                "final_response": (
+                    "주문 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
+                )
+            }
 
-    _delivery_fab_markers = [
-        "판매자 확인을 기다리는 상태", "변경 요청을 보냈습니다",
-        "납품일 변경 요청이 전송", "변경 요청이 접수",
-    ]
-    if (any(m in _final_resp for m in _delivery_fab_markers)
-            and "submit_delivery_date_change" not in tools_used):
-        return {
-            "final_response": (
-                "납품일 변경 요청 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
-            )
-        }
+        _delivery_fab_markers = [
+            "판매자 확인을 기다리는 상태", "변경 요청을 보냈습니다",
+            "납품일 변경 요청이 전송", "변경 요청이 접수",
+        ]
+        if (any(m in _final_resp for m in _delivery_fab_markers)
+                and "submit_delivery_date_change" not in tools_used):
+            return {
+                "final_response": (
+                    "납품일 변경 요청 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
+                )
+            }
 
-    _counter_offer_fab_markers = [
-        "협상 요청을 진행하겠습니다", "가격 협상 요청을 하겠습니다",
-        "카운터오퍼를 보냈습니다", "협상가를 제시했습니다",
-        "협상 요청을 보내겠습니다", "협상가를 전달했습니다",
-        "가격 협상 요청이 전송", "협상 요청이 접수",
-    ]
-    if (any(m in _final_resp for m in _counter_offer_fab_markers)
-            and "submit_counter_offer" not in tools_used):
-        return {
-            "final_response": (
-                "협상가 제시 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
-            )
-        }
+        _counter_offer_fab_markers = [
+            "협상 요청을 진행하겠습니다", "가격 협상 요청을 하겠습니다",
+            "카운터오퍼를 보냈습니다", "협상가를 제시했습니다",
+            "협상 요청을 보내겠습니다", "협상가를 전달했습니다",
+            "가격 협상 요청이 전송", "협상 요청이 접수",
+        ]
+        if (any(m in _final_resp for m in _counter_offer_fab_markers)
+                and "submit_counter_offer" not in tools_used):
+            return {
+                "final_response": (
+                    "협상가 제시 처리 중 문제가 발생했습니다. 다시 말씀해 주시면 처리해 드리겠습니다."
+                )
+            }
     # ────────────────────────────────────────────────────────────────────
 
     # orchestrator_node 또는 inventory_order_node에서 이미 답변이 생성된 경우
