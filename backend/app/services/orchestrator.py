@@ -282,83 +282,13 @@ ORCHESTRATOR_ROUTER_SYSTEM = _build_router_system()
 # ─────────────────────────────────────────────
 # calendar_data_node 전용 TOOLS — 캘린더 조회/등록만 노출
 # (inventory_order_node TOOLS 에서 분리, ORDER 처리 중 캘린더 오용 방지)
+#
+# PR 2 — 4 개 schema 는 agent.tools.calendar 의 @tool 데코레이터에서 등록되어
+# ToolRegistry "calendar" 그룹으로 자동 노출. 여기서는 registry import 만.
 # ─────────────────────────────────────────────
 
-TOOLS_CALENDAR = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_calendar_events",
-            "description": "특정 연월의 캘린더 일정 목록을 조회한다. 해당 월 1일부터 말일까지의 일정을 반환한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string", "description": "조회할 사용자의 UUID"},
-                    "year": {"type": "integer", "description": "조회할 연도 (예: 2026)"},
-                    "month": {"type": "integer", "description": "조회할 월 (1~12)"},
-                },
-                "required": ["user_id", "year", "month"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_calendar_event",
-            "description": "캘린더에 새 일정을 등록한다. 호출 전 반드시 get_calendar_events로 동일 날짜 중복 여부를 확인한다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string", "description": "일정 소유자의 UUID"},
-                    "title": {"type": "string", "description": "일정 제목"},
-                    "event_date": {"type": "string", "description": "일정 날짜 (YYYY-MM-DD)"},
-                    "event_type": {
-                        "type": "string",
-                        "description": "일정 유형: SHIPMENT | DELIVERY | MEETING | QUOTE_DEADLINE | ORDER",
-                        "enum": ["SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER"]
-                    },
-                    "description": {"type": "string", "description": "상세 설명"},
-                    "order_id": {"type": "string", "description": "연관된 주문 UUID"},
-                },
-                "required": ["user_id", "title", "event_date", "event_type"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_calendar_event",
-            "description": "기존 캘린더 일정을 수정한다. 수정할 일정의 event_id와 변경할 내용만 전달한다. event_id를 모르면 먼저 get_calendar_events를 호출해서 찾아라.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string"},
-                    "event_id": {"type": "string", "description": "수정할 일정의 UUID"},
-                    "title": {"type": "string"},
-                    "event_date": {"type": "string", "description": "YYYY-MM-DD"},
-                    "event_type": {"type": "string"},
-                    "description": {"type": "string"},
-                },
-                "required": ["user_id", "event_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_calendar_event",
-            "description": "기존 캘린더 일정을 삭제한다. 삭제할 일정의 event_id가 필요하다. 모르면 먼저 get_calendar_events를 호출해서 찾아라.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string"},
-                    "event_id": {"type": "string", "description": "삭제할 일정의 UUID"},
-                },
-                "required": ["user_id", "event_id"],
-            },
-        },
-    },
-]
+from app.services.agent import TOOLS_CALENDAR as _REGISTRY_TOOLS_CALENDAR
+TOOLS_CALENDAR = _REGISTRY_TOOLS_CALENDAR
 
 TOOLS_CHAT = [
     {

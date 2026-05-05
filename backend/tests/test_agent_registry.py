@@ -107,36 +107,40 @@ def test_multi_group_registration():
 
 
 # ─────────────────────────────────────────────
-# PR 1 — 6 개 도메인 모듈 등록 검증
+# PR 1+2 — 7 개 도메인 모듈 등록 검증
 # (fixture 가 registry 를 비우므로, 별도 fixture 없이 직접 import 검증)
 # ─────────────────────────────────────────────
 
+# PR 2 시점에 등록되는 모든 도메인 모듈 — 재 import 시 sys.modules.pop() 대상.
+_PR2_DOMAIN_MODULES = [
+    "app.services.agent",
+    "app.services.agent.tools",
+    "app.services.agent.tools.product",
+    "app.services.agent.tools.order",
+    "app.services.agent.tools.partner",
+    "app.services.agent.tools.subscription",
+    "app.services.agent.tools.negotiation",
+    "app.services.agent.tools.user",
+    "app.services.agent.tools.calendar",
+]
 
-def test_domain_modules_register_33_tools(_reset_registry=None):  # noqa: ARG001
-    """PR 1: product/order/partner/subscription/negotiation/user 6 모듈 import 시 총 33 개 도구 등록."""
+
+def test_domain_modules_register_37_tools(_reset_registry=None):  # noqa: ARG001
+    """PR 1+2: 7 개 도메인 모듈 import 시 총 37 개 도구 등록 (33 inventory_order + 4 calendar)."""
     # 새로 import 하기 위해 sys.modules 초기화
     import importlib
     import sys
-    for mod in [
-        "app.services.agent",
-        "app.services.agent.tools",
-        "app.services.agent.tools.product",
-        "app.services.agent.tools.order",
-        "app.services.agent.tools.partner",
-        "app.services.agent.tools.subscription",
-        "app.services.agent.tools.negotiation",
-        "app.services.agent.tools.user",
-    ]:
+    for mod in _PR2_DOMAIN_MODULES:
         sys.modules.pop(mod, None)
 
     # registry 도 비워야 import 시 다시 등록됨
     ToolRegistry._items.clear()
 
     agent = importlib.import_module("app.services.agent")
-    assert len(agent.TOOL_FUNCTION_MAP) == 33
-    assert len(agent.TOOLS) == 33  # 모두 inventory_order 그룹
-    assert len(agent.TOOLS_CALENDAR) == 0  # PR 2
-    assert len(agent.TOOLS_CHAT) == 0  # PR 3
+    assert len(agent.TOOL_FUNCTION_MAP) == 37
+    assert len(agent.TOOLS) == 33  # inventory_order 그룹
+    assert len(agent.TOOLS_CALENDAR) == 4  # PR 2 — calendar 그룹
+    assert len(agent.TOOLS_CHAT) == 0  # PR 3 에서 채워짐
 
     # 도메인별 핵심 함수가 등록되어 있는지 sanity check
     expected = {
@@ -161,24 +165,39 @@ def test_domain_modules_register_33_tools(_reset_registry=None):  # noqa: ARG001
         # user
         "get_user_profile", "find_sellers_by_product",
         "find_buyers_by_product", "open_chat_room",
+        # calendar (PR 2)
+        "get_calendar_events", "create_calendar_event",
+        "update_calendar_event", "delete_calendar_event",
     }
     assert set(agent.TOOL_FUNCTION_MAP.keys()) == expected
 
 
-def test_domain_modules_int_fields_union(_reset_registry=None):  # noqa: ARG001
-    """PR 1: 도메인 모듈 등록 후 INT_FIELDS 합집합 검증."""
+def test_calendar_tools_in_calendar_group_only(_reset_registry=None):  # noqa: ARG001
+    """PR 2: calendar 도구 4 개는 'calendar' 그룹에만 속하고 'inventory_order' 에는 없어야 한다."""
     import importlib
     import sys
-    for mod in [
-        "app.services.agent",
-        "app.services.agent.tools",
-        "app.services.agent.tools.product",
-        "app.services.agent.tools.order",
-        "app.services.agent.tools.partner",
-        "app.services.agent.tools.subscription",
-        "app.services.agent.tools.negotiation",
-        "app.services.agent.tools.user",
-    ]:
+    for mod in _PR2_DOMAIN_MODULES:
+        sys.modules.pop(mod, None)
+    ToolRegistry._items.clear()
+
+    agent = importlib.import_module("app.services.agent")
+
+    inventory_order_names = {t["function"]["name"] for t in agent.TOOLS}
+    calendar_names = {t["function"]["name"] for t in agent.TOOLS_CALENDAR}
+
+    calendar_tools = {
+        "get_calendar_events", "create_calendar_event",
+        "update_calendar_event", "delete_calendar_event",
+    }
+    assert calendar_tools == calendar_names
+    assert calendar_tools.isdisjoint(inventory_order_names)
+
+
+def test_domain_modules_int_fields_union(_reset_registry=None):  # noqa: ARG001
+    """PR 1+2: 도메인 모듈 등록 후 INT_FIELDS 합집합 검증."""
+    import importlib
+    import sys
+    for mod in _PR2_DOMAIN_MODULES:
         sys.modules.pop(mod, None)
     ToolRegistry._items.clear()
 

@@ -5,16 +5,16 @@
 직접 import 해도 동일한 함수 객체를 가져올 수 있다 (re-export).
 
 남는 책임:
-1. 옮긴 33 개 도구 함수 re-export (chat_ws.py / 외부 호출 호환).
+1. 옮긴 37 개 도구 함수 re-export (chat_ws.py / 외부 호출 호환).
 2. 아직 도메인 모듈로 옮기지 않은 cross-domain helper 들의 단일 정의 위치.
    (`_UUID_PATTERN`, `_run_async_in_thread`, `_service_error_payload`,
     `_sync_calendar_events_for_order_id`, `_find_seller_by_name`,
     `_find_product_by_name`, `_deduct_seller_stock_for_order` 등)
-3. 아직 옮기지 않은 8 개 도구 (chat 3 + calendar 4 + subscription 1) 의 본문.
+3. 아직 옮기지 않은 4 개 도구 (chat 3 + subscription 1) 의 본문.
 4. `analyze_chat_consensus` (chat_ws.py 가 직접 import; TOOL_FUNCTION_MAP 미등록).
-5. `TOOL_FUNCTION_MAP` — registry + 잔존 8개 통합본 (orchestrator import 호환).
+5. `TOOL_FUNCTION_MAP` — registry + 잔존 4개 통합본 (orchestrator import 호환).
 
-PR 2/3 에서 chat / calendar 도메인 모듈을 신설해 잔존 8개를 마저 옮긴 뒤,
+PR 3 에서 chat 도메인 모듈을 신설해 잔존 4개를 마저 옮긴 뒤,
 PR 4 에서 이 파일과 cross-domain helper 를 `agent/_shared.py` 로 이동하고
 shim 자체를 제거할 예정이다.
 """
@@ -22,14 +22,13 @@ shim 자체를 제거할 예정이다.
 import asyncio
 import json
 import re
-from calendar import monthrange
 from datetime import datetime, timezone
 from typing import Optional
 
 from app.core.supabase import get_supabase_client
 
 # ─────────────────────────────────────────────
-# (1) 옮긴 33개 도구 함수 re-export
+# (1) 옮긴 37개 도구 함수 re-export
 # ─────────────────────────────────────────────
 # 외부 코드(chat_ws.py / 옛 import)가 `from app.services.agent_tools import
 # <name>` 형태로 사용하던 함수들을 동일 위치에서 노출한다. 도메인 모듈에서
@@ -80,6 +79,12 @@ from app.services.agent.tools.user import (  # noqa: F401
     find_sellers_by_product,
     find_buyers_by_product,
     open_chat_room,
+)
+from app.services.agent.tools.calendar import (  # noqa: F401
+    get_calendar_events,
+    create_calendar_event,
+    update_calendar_event,
+    delete_calendar_event,
 )
 
 
@@ -805,245 +810,12 @@ def _do_send_chat_message(
 
 
 # ─────────────────────────────────────────────
-# (4) 캘린더 도구 — PR 2 에서 calendar 도메인 모듈로 이동 예정
+# (4) 캘린더 도구 — PR 2 에서 agent.tools.calendar 로 이동 완료
 # ─────────────────────────────────────────────
-
-def get_calendar_events(user_id: str, year: int, month: int) -> dict:
-    """해당 월의 캘린더 일정을 조회한다.
-    날짜 범위: YYYY-MM-01 ~ YYYY-MM-{말일}
-    deleted_at IS NULL 조건 적용 (BUG-1 패턴: .is_("deleted_at", None) 사용)
-
-    응답 평탄화 (응답 우선순위 정책 — 상품명·거래처명·날짜·상태 메인):
-    - product_name: 첫 활성 상품명 또는 "{첫 상품명} 외 N건"
-    - order_number, order_status
-    - buyer_name, buyer_company, seller_name, seller_company
-    임베딩 객체(orders 등)는 응답에서 제거 — LLM 토큰 낭비 방지.
-    반환: {success, events, count}
-    """
-    try:
-        year_str = re.sub(r'\D', '', str(year))
-        month_str = re.sub(r'\D', '', str(month))
-
-        year = int(year_str) if year_str else datetime.now().year
-        month = int(month_str) if month_str else datetime.now().month
-        supabase = get_supabase_client()
-
-        last_day = monthrange(year, month)[1]
-        date_from = f"{year:04d}-{month:02d}-01"
-        date_to = f"{year:04d}-{month:02d}-{last_day:02d}"
-
-        result = (
-            supabase.table("calendar_events")
-            .select(
-                "id, title, event_type, event_date, description, order_id, created_at, "
-                "orders(order_number, status, "
-                "buyer:users!buyer_id(name,company_name), "
-                "seller:users!seller_id(name,company_name), "
-                "order_items(quantity, products(name)))"
-            )
-            .eq("user_id", user_id)
-            .gte("event_date", date_from)
-            .lte("event_date", date_to)
-            .is_("deleted_at", None)
-            .order("event_date")
-            .execute()
-        )
-
-        rows = result.data or []
-        flattened: list[dict] = []
-        for row in rows:
-            order_payload = row.pop("orders", None)
-
-            # 기본값
-            row["order_number"] = None
-            row["order_status"] = None
-            row["product_name"] = None
-            row["buyer_name"] = None
-            row["buyer_company"] = None
-            row["seller_name"] = None
-            row["seller_company"] = None
-
-            if isinstance(order_payload, dict):
-                row["order_number"] = order_payload.get("order_number")
-                row["order_status"] = order_payload.get("status")
-
-                buyer = order_payload.get("buyer") or {}
-                seller = order_payload.get("seller") or {}
-                row["buyer_name"] = buyer.get("name")
-                row["buyer_company"] = buyer.get("company_name")
-                row["seller_name"] = seller.get("name")
-                row["seller_company"] = seller.get("company_name")
-
-                items = order_payload.get("order_items") or []
-                product_names: list[str] = []
-                for item in items:
-                    product = item.get("products") if isinstance(item, dict) else None
-                    if not product:
-                        continue
-                    name = product.get("name")
-                    if name:
-                        product_names.append(name)
-                if product_names:
-                    if len(product_names) == 1:
-                        row["product_name"] = product_names[0]
-                    else:
-                        row["product_name"] = f"{product_names[0]} 외 {len(product_names) - 1}건"
-
-            flattened.append(row)
-
-        return {
-            "success": True,
-            "events": flattened,
-            "count": len(flattened),
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e), "events": [], "count": 0}
-
-
-def create_calendar_event(
-    user_id: str,
-    title: str,
-    event_date: str,
-    event_type: str,
-    description: str = "",
-    order_id: str = "",
-) -> dict:
-    """캘린더 일정을 등록한다.
-    event_type: SHIPMENT | DELIVERY | MEETING | QUOTE_DEADLINE | ORDER | OTHER
-    event_date: "YYYY-MM-DD" 형식
-    order_id가 빈 문자열이면 NULL로 저장한다.
-    반환: {success, event_id, title}
-    """
-    # 1. 유효성 검사 (기존과 동일)
-    VALID_EVENT_TYPES = {"SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER", "OTHER"}
-    if event_type not in VALID_EVENT_TYPES:
-        return {
-            "success": False,
-            "error": f"유효하지 않은 event_type입니다. 허용값: {', '.join(sorted(VALID_EVENT_TYPES))}",
-        }
-
-    try:
-        supabase = get_supabase_client()
-
-        # order_id가 있다면 기존 일정이 있는지 확인하되, "event_type"도 같은지 확인
-        if order_id:
-            existing = (
-                supabase.table("calendar_events")
-                .select("id")
-                .eq("order_id", order_id)
-                .eq("event_type", event_type)
-                .eq("user_id", user_id)
-                .is_("deleted_at", None)  # 삭제되지 않은 것 중
-                .execute()
-            )
-
-            # 같은 주문의 "같은 유형"의 일정이 이미 존재한다면? 새로 만들지 말고 업데이트!
-            if existing.data:
-                existing_event_id = existing.data[0]["id"]
-                print(f"🕵️‍♂️ [System] 중복 일정 발견(ID: {existing_event_id}, 유형: {event_type}). 업데이트로 전환합니다.")
-
-                return update_calendar_event(
-                    user_id=user_id,
-                    event_id=existing_event_id,
-                    title=title,
-                    event_date=event_date,
-                    event_type=event_type,
-                    description=description
-                )
-
-        # 2. 신규 등록 로직 (주문은 같아도 '배송', '출하' 등 유형이 다르면 이쪽으로 빠져서 새로 생성됨)
-        payload: dict = {
-            "user_id": user_id,
-            "title": title,
-            "event_date": event_date,
-            "event_type": event_type,
-            "description": description or None,
-            "order_id": order_id if order_id else None,
-        }
-
-        result = supabase.table("calendar_events").insert(payload).execute()
-
-        if not result.data:
-            return {"success": False, "error": "일정 생성에 실패했습니다."}
-
-        event = result.data[0]
-        return {
-            "success": True,
-            "event_id": event["id"],
-            "title": event.get("title", title),
-            "message": "새로운 일정이 등록되었습니다."
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-def update_calendar_event(
-    user_id: str,
-    event_id: str,
-    title: Optional[str] = None,
-    event_date: Optional[str] = None,
-    event_type: Optional[str] = None,
-    description: Optional[str] = None,
-) -> dict:
-    """캘린더 일정을 수정한다."""
-    VALID_EVENT_TYPES = {"SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER", "OTHER"}
-    if event_type and event_type not in VALID_EVENT_TYPES:
-        return {"success": False, "error": f"유효하지 않은 event_type입니다."}
-
-    try:
-        supabase = get_supabase_client()
-        check = (
-            supabase.table("calendar_events")
-            .select("id, user_id, title, event_type, order_id")
-            .eq("id", event_id)
-            .is_("deleted_at", None)
-            .execute()
-        )
-        if not check.data:
-            return {"success": False, "error": "해당 일정을 찾을 수 없습니다."}
-        if check.data[0]["user_id"] != user_id:
-            return {"success": False, "error": "권한 없음: 본인의 일정만 수정할 수 있습니다."}
-
-        # 주문 상태(ORDER) 이벤트는 시스템 동기화 대상이므로, 날짜/타입을 바꿔치기하는 업데이트를 금지한다.
-        # (배송/납품 일정은 별도의 DELIVERY/SHIPMENT 이벤트로 새로 등록해야 함)
-        existing = check.data[0]
-        if existing.get("order_id") and existing.get("event_type") == "ORDER":
-            if event_date is not None or (event_type is not None and event_type != "ORDER"):
-                return {
-                    "success": False,
-                    "error": "주문 상태(ORDER) 일정은 날짜/유형을 변경할 수 없습니다. 배송 일정은 새 일정으로 등록하세요.",
-                }
-
-        update_data: dict = {}
-        if title is not None: update_data["title"] = title
-        if event_date is not None: update_data["event_date"] = event_date
-        if event_type is not None: update_data["event_type"] = event_type
-        if description is not None: update_data["description"] = description
-
-        if not update_data:
-            return {"success": False, "error": "수정할 내용이 없습니다."}
-
-        supabase.table("calendar_events").update(update_data).eq("id", event_id).execute()
-        return {"success": True, "event_id": event_id, "message": f"일정 '{existing['title']}'이(가) 수정되었습니다."}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-def delete_calendar_event(user_id: str, event_id: str) -> dict:
-    """캘린더 일정을 삭제한다 (soft delete)."""
-    try:
-        supabase = get_supabase_client()
-        check = supabase.table("calendar_events").select("id, user_id, title").eq("id", event_id).is_("deleted_at", None).execute()
-        if not check.data:
-            return {"success": False, "error": "해당 일정을 찾을 수 없습니다."}
-        if check.data[0]["user_id"] != user_id:
-            return {"success": False, "error": "권한 없음: 본인의 일정만 삭제할 수 있습니다."}
-
-        now_utc = datetime.now(timezone.utc).isoformat()
-        supabase.table("calendar_events").update({"deleted_at": now_utc}).eq("id", event_id).execute()
-        return {"success": True, "event_id": event_id, "message": f"일정 '{check.data[0]['title']}'이(가) 삭제되었습니다."}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+# 4 개 함수 (get/create/update/delete_calendar_event) 의 본문은
+# `app.services.agent.tools.calendar` 모듈로 이동했다. 이 파일 상단의
+# `from ...calendar import ...` re-export 로 backward compat 유지.
+# ToolRegistry 가 자동으로 TOOL_FUNCTION_MAP / TOOLS_CALENDAR 에 노출.
 
 
 # ─────────────────────────────────────────────
@@ -1286,11 +1058,11 @@ def get_incoming_subscription_requests(user_id: str) -> dict:
 
 
 # ─────────────────────────────────────────────
-# (7) TOOL_FUNCTION_MAP — registry + 잔존 8개 통합본
+# (7) TOOL_FUNCTION_MAP — registry + 잔존 4개 통합본
 # ─────────────────────────────────────────────
 # orchestrator 의 `from app.services.agent_tools import TOOL_FUNCTION_MAP` 호환.
-# registry (33) + 이 파일에 남은 chat 3 + calendar 4 + subscription 1 = 41.
-# 옮긴 33 개는 registry 에서 자동으로 가져오고, 잔존 8 개만 직접 추가.
+# registry (33+4=37) + 이 파일에 남은 chat 3 + subscription 1 = 41.
+# 옮긴 37 개는 registry 에서 자동으로 가져오고, 잔존 4 개만 직접 추가.
 
 from app.services.agent import (
     TOOL_FUNCTION_MAP as _REGISTRY_MAP,
@@ -1301,29 +1073,24 @@ from app.services.agent import (
 )
 
 TOOL_FUNCTION_MAP: dict = {
-    **_REGISTRY_MAP,  # 33개 — 도메인 모듈에서 @tool 등록
+    **_REGISTRY_MAP,  # 37개 — 도메인 모듈에서 @tool 등록 (33 inventory_order + 4 calendar)
     # chat 3 (PR 3 에서 chat 도메인 모듈로 이동)
     "get_chat_rooms": get_chat_rooms,
     "get_chat_messages": get_chat_messages,
     "send_chat_message": send_chat_message,
-    # calendar 4 (PR 2 에서 calendar 도메인 모듈로 이동)
-    "get_calendar_events": get_calendar_events,
-    "create_calendar_event": create_calendar_event,
-    "update_calendar_event": update_calendar_event,
-    "delete_calendar_event": delete_calendar_event,
-    # subscription 1 (PR 2/3 에서 subscription 도메인 모듈로 이동)
+    # subscription 1 (PR 3 이후 subscription 도메인 모듈로 이동)
     "get_incoming_subscription_requests": get_incoming_subscription_requests,
 }
 
 # OpenAI tool calling schema 재노출 — 외부 호환용.
-# 옮긴 33 개 스키마는 ToolRegistry 가 자동 노출. 잔존 chat/calendar/sub 스키마는
-# orchestrator.py 에 그대로 남아있고, PR 2/3 에서 도메인 모듈로 이동 시
-# agent.TOOLS_CALENDAR / agent.TOOLS_CHAT 가 그 책임을 넘겨받는다.
+# 옮긴 37 개 스키마는 ToolRegistry 가 자동 노출 (inventory_order 33 + calendar 4).
+# 잔존 chat 스키마는 orchestrator.py 에 그대로 남아있고, PR 3 에서 도메인 모듈로
+# 이동 시 agent.TOOLS_CHAT 가 그 책임을 넘겨받는다.
 #
-# 단계 2 시점 기대 값 (PR 1 검증 스펙):
+# PR 2 시점 기대 값:
 # - TOOLS:           33 (registry, "inventory_order" 그룹)
-# - TOOLS_CALENDAR:  0 (PR 2 에서 채워짐 — 현재는 orchestrator.py 가 보유)
-# - TOOLS_CHAT:      0 (PR 3 에서 채워짐 — 현재는 orchestrator.py 가 보유)
+# - TOOLS_CALENDAR:  4  (PR 2 에서 채워짐 — registry "calendar" 그룹)
+# - TOOLS_CHAT:      0  (PR 3 에서 채워짐 — 현재는 orchestrator.py 가 보유)
 TOOLS = _REGISTRY_TOOLS
 TOOLS_CALENDAR = _REGISTRY_TOOLS_CALENDAR
 TOOLS_CHAT = _REGISTRY_TOOLS_CHAT

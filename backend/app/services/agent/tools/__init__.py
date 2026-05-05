@@ -14,9 +14,11 @@ PR 1 — 6 개 도메인 모듈 (33 개 도구):
 - negotiation   (6): submit/accept/reject_counter_offer, submit/accept/reject_delivery_date_change
 - user          (4): get_user_profile, find_sellers_by_product, find_buyers_by_product, open_chat_room
 
+PR 2 — calendar 도메인 모듈 (4 개 도구):
+- calendar      (4): get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event
+
 다음 PR 에서 추가 예정:
 - chat       (3): get_chat_rooms, get_chat_messages, send_chat_message
-- calendar   (4): get/create/update/delete_calendar_event
 - subscription 보강 (1): get_incoming_subscription_requests
 """
 from . import product       # noqa: F401
@@ -25,3 +27,4 @@ from . import partner       # noqa: F401
 from . import subscription  # noqa: F401
 from . import negotiation   # noqa: F401
 from . import user          # noqa: F401
+from . import calendar      # noqa: F401
