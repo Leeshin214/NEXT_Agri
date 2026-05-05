@@ -27,6 +27,9 @@ class ChatRoomResponse(BaseModel):
     partner_name: Optional[str] = None
     partner_company: Optional[str] = None
     unread_count: int = 0
+    # 채팅방 목록 표시용 — 어떤 주문/상품에 대한 채팅인지 식별
+    order_number: Optional[str] = None
+    first_product_name: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

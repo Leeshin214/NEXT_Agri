@@ -1632,6 +1632,26 @@ class OrderService:
                 f"{type(e).__name__}: {e}"
             )
 
+        # 연결된 채팅방 soft-delete (취소된 거래 정리)
+        # 주문 취소 흐름은 cancel_order 한 곳을 거치므로
+        # respond_cancel_request(approve) 경로도 자동 커버됨.
+        try:
+            chat_room_result = await asyncio.to_thread(
+                lambda: self.client.table("chat_rooms")
+                .select("id")
+                .eq("order_id", str(order_id))
+                .is_("deleted_at", None)
+                .execute()
+            )
+            for room in (chat_room_result.data or []):
+                await chat_service.delete_room(room["id"])
+        except Exception as e:
+            # 채팅방 삭제 실패는 취소 트랜잭션에 영향 없음
+            print(
+                f"[order_service.cancel_order] chat room soft-delete 실패 (무시): "
+                f"{type(e).__name__}: {e}"
+            )
+
         return updated_order
 
     # ===========================================

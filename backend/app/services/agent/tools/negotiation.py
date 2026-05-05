@@ -30,7 +30,13 @@ from .._registry import tool
         "'좀 더 싸게 안 돼?', '단가 협상하고 싶어', '가격 제시할게' 같이 가격 협상을 시도하면 "
         "평문 채팅 메시지(send_chat_message)가 아니라 반드시 이 도구로 호출하라. "
         "발송 즉시 상대방 채팅창에 수락/거절 버튼이 있는 PENDING 카드가 노출된다. "
-        "상태 확인 없이 즉시 호출하라 — 허용 여부는 서버가 검증하며, 불가한 경우 서버가 에러를 반환한다. "
+        "⚠️ 호출 전 필수 확인: 사용자가 특정 품목명을 언급한 경우, "
+        "먼저 get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING']) 로 "
+        "전체 활성 주문을 조회한 뒤, 사용자 언급 품목명(공백 무시: '테스트관리'='테스트 관리')으로 필터하고 "
+        "그 중 QUOTE_REQUESTED/NEGOTIATING 상태만 실제 협상 후보로 추려라. "
+        "품목이 CONFIRMED/PREPARING/SHIPPING 상태에만 매칭되면 (협상 불가) "
+        "이 도구를 절대 호출하지 말고 텍스트로 '해당 주문은 협상 불가 상태입니다'라고 안내하라. "
+        "어떤 경우에도 사용자가 언급하지 않은 다른 품목의 order_id 로 이 도구를 호출하는 것은 절대 금지다. "
         "이전 PENDING 카운터오퍼는 자동으로 SUPERSEDED 처리되므로 안전하게 새로 제시 가능."
     ),
     parameters={
@@ -45,9 +51,13 @@ from .._registry import tool
                 "description": (
                     "협상가 제시 대상 주문의 UUID. status 가 QUOTE_REQUESTED 또는 NEGOTIATING 인 주문만 가능 — "
                     "CONFIRMED 이후 상태는 백엔드가 거절한다. "
-                    "사용자 발화로 어떤 주문인지 모호하면 먼저 get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING']) 로 후보를 추출한 뒤, "
+                    "get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING']) 로 "
+                    "전체 활성 주문을 조회한 뒤, 공백·대소문자를 무시하고 사용자가 언급한 품목명과 매칭되는 주문만 후보로 추려라. "
+                    "그 중 QUOTE_REQUESTED/NEGOTIATING 상태만 실제 협상 가능 후보다. "
                     "후보가 정확히 1개면 그 id 를 그대로 사용하고, 2개 이상이면 사용자에게 어느 주문인지 되물은 뒤 사용. "
-                    "0개면 '협상 가능한 주문이 없습니다' 안내. 절대 사용자에게 UUID 를 직접 묻거나 임의로 한 후보를 추측 선택하지 마라."
+                    "⚠️ 후보가 0개면 — 이 도구 자체를 호출하지 마라. 이 파라미터를 채울 필요가 없다. "
+                    "텍스트로 '해당 품목의 협상 가능한 주문이 없습니다 (이미 확정 이후 단계)'라고만 안내하라. "
+                    "사용자가 언급한 품목 이외의 다른 품목 order_id 를 절대 이 파라미터에 넣지 마라."
                 ),
             },
             "proposed_total_amount": {
@@ -300,9 +310,12 @@ def reject_counter_offer(
                 "description": (
                     "납품일 변경 대상 주문의 UUID. status 가 QUOTE_REQUESTED, NEGOTIATING, CONFIRMED 인 주문만 가능 — "
                     "PREPARING 이후 상태는 출하 준비 단계라 백엔드가 거절한다. "
-                    "사용자 발화로 어떤 주문인지 모호하면 먼저 get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED']) 로 후보를 추출한 뒤, "
+                    "사용자 발화로 어떤 주문인지 모호하면 먼저 get_orders(status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING']) 로 "
+                    "전체 활성 주문을 조회한 뒤, 공백·대소문자를 무시하고 사용자가 언급한 품목명과 매칭되는 주문만 후보로 추려라. "
+                    "그 중 QUOTE_REQUESTED/NEGOTIATING/CONFIRMED 상태만 실제 납품일 변경 가능 후보다. "
                     "후보가 정확히 1개면 그 id 를 그대로 사용하고, 2개 이상이면 사용자에게 어느 주문인지 되물은 뒤 사용. "
-                    "0개면 '납품일 변경 가능한 주문이 없습니다' 안내. 절대 사용자에게 UUID 를 직접 묻거나 임의로 한 후보를 추측 선택하지 마라."
+                    "0개면 (이미 PREPARING 이후 상태이거나 해당 품목 주문 없음) '납품일 변경 가능한 주문이 없습니다' 안내. "
+                    "절대 사용자에게 UUID 를 직접 묻거나 임의로 다른 품목 주문을 선택하지 마라."
                 ),
             },
             "proposed_delivery_date": {

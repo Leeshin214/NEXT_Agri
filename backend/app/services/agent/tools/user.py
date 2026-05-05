@@ -66,20 +66,7 @@ def get_user_profile(
     try:
         supabase = get_supabase_client()
 
-        # 1순위: user_id로 직접 조회
-        if user_id:
-            result = (
-                supabase.table("users")
-                .select(COLUMNS)
-                .eq("id", user_id)
-                .eq("is_active", True)
-                .is_("deleted_at", None)
-                .execute()
-            )
-            if result.data:
-                return {"success": True, "user": result.data[0]}
-
-        # 2순위: username(name 컬럼) 검색
+        # 1순위: username(name 컬럼) 검색 — 이름으로 찾을 때 user_id보다 우선
         if username:
             result = (
                 supabase.table("users")
@@ -87,13 +74,13 @@ def get_user_profile(
                 .ilike("name", f"%{username}%")
                 .eq("is_active", True)
                 .is_("deleted_at", None)
-                .limit(1)
+                .limit(5)
                 .execute()
             )
             if result.data:
                 return {"success": True, "user": result.data[0]}
 
-        # 3순위: company_name 검색
+        # 2순위: company_name 검색
         if company_name:
             result = (
                 supabase.table("users")
@@ -101,7 +88,20 @@ def get_user_profile(
                 .ilike("company_name", f"%{company_name}%")
                 .eq("is_active", True)
                 .is_("deleted_at", None)
-                .limit(1)
+                .limit(5)
+                .execute()
+            )
+            if result.data:
+                return {"success": True, "user": result.data[0]}
+
+        # 3순위: username/company_name 모두 없을 때만 user_id로 직접 조회
+        if user_id and not username and not company_name:
+            result = (
+                supabase.table("users")
+                .select(COLUMNS)
+                .eq("id", user_id)
+                .eq("is_active", True)
+                .is_("deleted_at", None)
                 .execute()
             )
             if result.data:
@@ -138,81 +138,108 @@ def get_user_profile(
     groups=("inventory_order",),
 )
 def find_sellers_by_product(category: str, product_name: Optional[str] = None) -> dict:
-    """특정 카테고리를 판매 중인 판매자 목록을 넓게 조회한다. 세부 필터링은 LLM이 담당."""
+    """users 테이블 기준으로 판매자를 조회하고, products 테이블을 부가적으로 조인한다."""
     try:
         supabase = get_supabase_client()
 
-        # 기본 쿼리 세팅 (카테고리 정보도 같이 가져옴)
-        query = (
-            supabase.table("products")
-            .select("seller_id, name, price_per_unit, stock_quantity, unit, origin, spec, status, category")
-        )
-
-        # 'ALL'이 아니면 해당 카테고리로만 필터링
-        if category and category.upper() != "ALL":
-            query = query.eq("category", category.upper())
-
-        # 상품명으로 추가 필터링
-        if product_name:
-            query = query.ilike("name", f"%{product_name}%")
-
-        # 재고가 있고 삭제되지 않은 상품만 조회
-        result = (
-            query
-            .gt("stock_quantity", 0)
+        # 1단계: users 테이블에서 SELLER 전체 조회
+        sellers_result = (
+            supabase.table("users")
+            .select("id, name, company_name, phone")
+            .eq("role", "SELLER")
+            .eq("is_active", True)
             .is_("deleted_at", None)
             .execute()
         )
+        all_sellers = sellers_result.data or []
 
-        products = result.data or []
+        if not all_sellers:
+            return {
+                "success": True,
+                "seller_count": 0,
+                "sellers": [],
+            }
 
-        # 결과가 없고 category가 ALL이 아니면 ALL로 재시도 (LLM이 잘못된 category를 추론한 경우 대비)
+        seller_ids = [s["id"] for s in all_sellers]
+        seller_map = {s["id"]: s for s in all_sellers}
+
+        # 2단계: products 테이블에서 해당 판매자들의 상품 조회
+        products_query = (
+            supabase.table("products")
+            .select("seller_id, name, price_per_unit, stock_quantity, unit, origin, spec, status, category")
+            .in_("seller_id", seller_ids)
+            .gt("stock_quantity", 0)
+            .is_("deleted_at", None)
+        )
+
+        if category and category.upper() != "ALL":
+            products_query = products_query.eq("category", category.upper())
+
+        if product_name:
+            products_query = products_query.ilike("name", f"%{product_name}%")
+
+        products_result = products_query.execute()
+        products = products_result.data or []
+
+        # category 필터 결과가 없으면 ALL로 재시도
         if not products and category and category.upper() != "ALL":
             fallback_query = (
                 supabase.table("products")
                 .select("seller_id, name, price_per_unit, stock_quantity, unit, origin, spec, status, category")
+                .in_("seller_id", seller_ids)
+                .gt("stock_quantity", 0)
+                .is_("deleted_at", None)
             )
             if product_name:
                 fallback_query = fallback_query.ilike("name", f"%{product_name}%")
-            result = (
-                fallback_query
-                .gt("stock_quantity", 0)
-                .is_("deleted_at", None)
-                .execute()
-            )
-            products = result.data or []
+            products_result = fallback_query.execute()
+            products = products_result.data or []
 
-        # seller_id 목록으로 users 테이블 조회
-        seller_ids = list({p["seller_id"] for p in products if p.get("seller_id")})
-        seller_map = {}
-        if seller_ids:
-            users_result = (
-                supabase.table("users")
-                .select("id, name, company_name, phone")
-                .in_("id", seller_ids)
-                .execute()
-            )
-            for u in (users_result.data or []):
-                seller_map[u["id"]] = u
-
-        # 상품 데이터에 판매자 정보 합치기
-        enriched = []
+        # 3단계: 판매자별로 상품 그룹화
+        from collections import defaultdict
+        products_by_seller: dict = defaultdict(list)
         for p in products:
-            seller_info = seller_map.get(p.get("seller_id"), {})
-            enriched.append({
-                **p,
+            sid = p.get("seller_id")
+            if sid:
+                products_by_seller[sid].append({
+                    "name": p.get("name"),
+                    "price_per_unit": p.get("price_per_unit"),
+                    "stock_quantity": p.get("stock_quantity"),
+                    "unit": p.get("unit"),
+                    "origin": p.get("origin"),
+                    "spec": p.get("spec"),
+                    "status": p.get("status"),
+                    "category": p.get("category"),
+                })
+
+        sellers_with_products = []
+        for sid in seller_ids:
+            seller_products = products_by_seller.get(sid, [])
+            if not seller_products:
+                continue
+            seller_info = seller_map[sid]
+            sellers_with_products.append({
+                "seller_id": sid,
                 "seller_name": seller_info.get("name", "알 수 없음"),
                 "seller_company": seller_info.get("company_name", ""),
                 "seller_phone": seller_info.get("phone", ""),
+                "products": seller_products,
             })
 
         return {
             "success": True,
-            "sellers": enriched,
-            "count": len(enriched),
+            "seller_count": len(sellers_with_products),
+            "sellers": sellers_with_products,
+            "_response_guide": (
+                "seller_count가 실제 판매자 수입니다. 첫 문장에 전체 판매자 수(seller_count)를 안내하세요. "
+                "반드시 상위 5개 판매자를 1. 2. 3. 4. 5. 번호를 붙여 표시하세요. 판매자가 5개 미만이면 전체를 번호와 함께 표시하세요. "
+                "각 판매자 아래에 products 배열의 상품들을 들여쓰기로 나열하세요. "
+                "나머지 판매자는 '외 N개 판매처가 더 있습니다'로 요약하세요. "
+                "상품별로 가격, 재고, 원산지(있으면)를 간결하게 표시하세요."
+            ),
         }
     except Exception as e:
-        return {"success": False, "error": str(e), "sellers": [], "count": 0}
+        return {"success": False, "error": str(e), "sellers": [], "seller_count": 0}
 
 
 @tool(
@@ -272,7 +299,17 @@ def find_buyers_by_product(category: str) -> dict:
 
         buyers = sorted(buyer_stats.values(), key=lambda x: x["total_quantity"], reverse=True)
 
-        return {"success": True, "buyers": buyers, "count": len(buyers)}
+        return {
+            "success": True,
+            "buyers": buyers,
+            "count": len(buyers),
+            "_response_guide": (
+                "반드시 상위 5개 구매자를 1. 2. 3. 4. 5. 번호를 붙여 표시하세요. 구매자가 5개 미만이면 전체를 번호와 함께 표시하세요. "
+                "나머지는 '외 N명이 더 있습니다'로 요약하세요. "
+                "전체 구매자 수는 첫 문장에 안내하세요. "
+                "각 구매자의 거래 건수와 총 구매량을 간결하게 표시하세요."
+            ),
+        }
     except Exception as e:
         return {"success": False, "error": str(e), "buyers": [], "count": 0}
 

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections import Counter
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
@@ -48,6 +49,7 @@ class ChatService:
 
     async def list_rooms(self, user_id: UUID, role: str) -> list[dict]:
         # 임베디드 조인으로 seller/buyer 정보를 한 번에 조회 (N+1 제거)
+        # soft-deleted 채팅방 제외 (.is_("deleted_at", None)) — 주문 취소 시 정리됨
         if role == "SELLER":
             result = await asyncio.to_thread(
                 lambda: self.rooms.select(
@@ -55,6 +57,7 @@ class ChatService:
                     " buyer:users!buyer_id(name, company_name)"
                 )
                 .eq("seller_id", str(user_id))
+                .is_("deleted_at", None)
                 .order("last_message_at", desc=True, nullsfirst=False)
                 .execute()
             )
@@ -65,6 +68,7 @@ class ChatService:
                     " buyer:users!buyer_id(name, company_name)"
                 )
                 .eq("buyer_id", str(user_id))
+                .is_("deleted_at", None)
                 .order("last_message_at", desc=True, nullsfirst=False)
                 .execute()
             )
@@ -72,6 +76,25 @@ class ChatService:
         rooms = result.data
         if not rooms:
             return []
+
+        # 연결된 주문이 soft-deleted 인 채팅방은 목록에서 제외 (orders.deleted_at IS NOT NULL)
+        # chat_rooms.deleted_at 필터만으로는 "주문이 soft-delete 됐지만 채팅방은 살아있는"
+        # 고아 채팅방을 막을 수 없으므로 orders 테이블을 batch 조회하여 검증한다.
+        # SELLER/BUYER 양 분기에서 모인 rooms 에 공통 적용.
+        order_ids_for_filter = list({r["order_id"] for r in rooms if r.get("order_id")})
+        if order_ids_for_filter:
+            deleted_orders_result = await asyncio.to_thread(
+                lambda: self.client.table("orders")
+                .select("id")
+                .in_("id", order_ids_for_filter)
+                .not_.is_("deleted_at", None)
+                .execute()
+            )
+            deleted_order_ids = {o["id"] for o in (deleted_orders_result.data or [])}
+            if deleted_order_ids:
+                rooms = [r for r in rooms if r.get("order_id") not in deleted_order_ids]
+                if not rooms:
+                    return []
 
         # 상대방 user 가 soft-deleted 인 방은 list 에서 제외 (정책: 가장 단순한 옵션)
         # 임베디드 조인은 deleted_at 자동 필터링하지 않으므로 별도 조회로 검증.
@@ -119,6 +142,53 @@ class ChatService:
 
         for room in rooms:
             room["unread_count"] = unread_counts.get(room["id"], 0)
+
+        # order_id 가 있는 채팅방의 주문번호·첫 상품명 조회
+        # order_items 에는 product_name 컬럼이 없으므로 products(name) FK 임베딩으로 조회한다.
+        order_ids = [r["order_id"] for r in rooms if r.get("order_id")]
+        if order_ids:
+            orders_result = await asyncio.to_thread(
+                lambda: self.client.table("orders")
+                .select("id, order_number")
+                .in_("id", order_ids)
+                .execute()
+            )
+            order_map = {o["id"]: o for o in (orders_result.data or [])}
+
+            # order_items 의 product_id 로 products.name 을 임베딩 조회
+            items_result = await asyncio.to_thread(
+                lambda: self.client.table("order_items")
+                .select("order_id, created_at, product:products(name, deleted_at)")
+                .in_("order_id", order_ids)
+                .order("created_at", desc=False)
+                .execute()
+            )
+            # 주문별 첫 번째 상품명만 취함 (created_at ASC 정렬이라 가장 먼저 추가된 라인)
+            first_item_map: dict[str, str] = {}
+            for item in (items_result.data or []):
+                oid = item.get("order_id")
+                if not oid or oid in first_item_map:
+                    continue
+                product = item.get("product") or {}
+                # soft-deleted 상품은 스킵 (다음 라인에서 채워짐)
+                if product.get("deleted_at"):
+                    continue
+                name = product.get("name")
+                if name:
+                    first_item_map[oid] = name
+
+            for room in rooms:
+                oid = room.get("order_id")
+                if oid and oid in order_map:
+                    room["order_number"] = order_map[oid].get("order_number")
+                    room["first_product_name"] = first_item_map.get(oid)
+                else:
+                    room["order_number"] = None
+                    room["first_product_name"] = None
+        else:
+            for room in rooms:
+                room["order_number"] = None
+                room["first_product_name"] = None
 
         return rooms
 
@@ -412,6 +482,21 @@ class ChatService:
             .neq("sender_id", str(user_id))
             .eq("is_read", False)
             .is_("deleted_at", None)
+            .execute()
+        )
+
+    async def delete_room(self, room_id: UUID | str) -> None:
+        """채팅방을 soft-delete 한다.
+
+        주문 취소 시 `order_service.cancel_order` 가 호출 — 취소된 거래의 채팅방을
+        목록에서 숨겨 정리. messages 는 이력 보존을 위해 그대로 둔다.
+        멱등성: 이미 deleted_at 이 set 된 row 는 update 가 적용되지만 결과는 동일.
+        """
+        deleted_at = datetime.now(timezone.utc).isoformat()
+        await asyncio.to_thread(
+            lambda: self.rooms
+            .update({"deleted_at": deleted_at})
+            .eq("id", str(room_id))
             .execute()
         )
 

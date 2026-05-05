@@ -798,7 +798,6 @@ def create_subscription_from_order(
         "사용자 본인의 정기배송 목록을 status 별로 조회한다.\n\n"
         "자연어 트리거:\n"
         "- '정기배송 목록', '내 정기배송', '정기배송 보여줘', '정기배송 현황'\n"
-        "- '거래처 중 정기배송 있는 곳' (이 경우 status='ACTIVE' 만 조회)\n"
         "- '진행 중인 정기배송', '활성 정기배송' → status='ACTIVE'\n"
         "- '보낸 정기배송 신청' → status='PENDING_OUTGOING' "
         "(DB 의 status='PENDING' 중 created_by == 본인 인 행만)\n"

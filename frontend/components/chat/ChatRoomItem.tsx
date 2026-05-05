@@ -26,7 +26,9 @@ export default function ChatRoomItem({
 }: ChatRoomItemProps) {
   const isOrderRoom = !!room.order_id;
   const Icon = isOrderRoom ? Package : MessageSquare;
-  const subLabel = isOrderRoom ? '주문 채팅' : '일반 대화';
+  const subLabel = isOrderRoom
+    ? (room.first_product_name ?? room.order_number ?? '주문 채팅')
+    : '일반 대화';
 
   return (
     <button
