@@ -480,7 +480,9 @@ C. 후보 2개 이상:
   결과를 "진행 중 (ACTIVE) N건, 보낸 신청 (PENDING_OUTGOING) N건, 받은 신청 (PENDING_INCOMING) N건" 으로 분류해서 답변한다.
 
 (거래처 + 정기배송 교차 조회 — 매우 중요)
-- "거래처 중 정기배송 있는 곳" / "거래 중인 곳 정기배송" / "거래처별 정기배송 현황" / "지금 거래하는 곳 중 정기배송" → 먼저 get_partners(user_id={user_id}, status="ACTIVE") 로 활성 거래처를 확인한 뒤, get_subscriptions(user_id={user_id}, status="ACTIVE") 로 진행 중 정기배송 목록을 조회한다. 두 결과를 교차해 "○○ 거래처(seller_id=...) 와 정기배송 N건 진행 중" 형식으로 답변한다.
+- "거래처 중 정기배송 있는 곳" / "거래 중인 곳 정기배송" / "거래처별 정기배송 현황" / "지금 거래하는 곳 중 정기배송" 처럼 일반 발화로 묻는 경우, "정기배송이 있는 곳" 의 의미는 ACTIVE(진행 중) 뿐 아니라 PAUSED(일시정지) / PENDING_OUTGOING(보낸 신청) / PENDING_INCOMING(받은 신청) 까지 포함한다. ACTIVE 만 보고 "없다"고 답하면 PAUSED 케이스를 누락해 잘못된 답이 된다.
+- 절차: 먼저 get_partners(user_id={user_id}, status="ACTIVE") 로 활성 거래처 확인 → 그다음 get_subscriptions(user_id={user_id}, status_in=["ACTIVE","PAUSED","PENDING_OUTGOING","PENDING_INCOMING"]) 로 살아있는 정기배송을 모두 조회 → 두 결과를 교차해 "○○ 거래처와 정기배송 N건 (ACTIVE 1, PAUSED 1)" 형식으로 상태별 분류를 포함해 답변한다.
+- 사용자가 "거래처 중 진행 중인 정기배송", "지금 활성으로 받고 있는 정기배송 거래처" 처럼 명시적으로 ACTIVE 만 강조한 경우에 한해 get_subscriptions(user_id={user_id}, status="ACTIVE") 단독 사용.
 - 활성 거래처가 0곳이면 "활성 거래처가 없어 정기배송을 조회할 수 없습니다" 라고만 안내하고 끝낸다.
 
 (상태별 단독 조회)
@@ -499,6 +501,10 @@ C. 후보 2개 이상:
    - 진행 중 (ACTIVE): A마트 매주 옥수수 50kg 외 2종 (다음 예정 5월 10일)
    - 보낸 신청 (PENDING_OUTGOING): B농가 격주 사과 30kg (수락 대기)
    - 받은 신청 (PENDING_INCOMING): 없음"
+- 거래처 + 정기배송 교차 조회 응답 예시 (ACTIVE / PAUSED 혼합):
+  "○○ 거래처와 진행 중인 정기배송 1건, 일시정지된 정기배송 1건 (총 2건)
+   - 진행 중: 매주 옥수수 50kg (다음 예정 5월 10일)
+   - 일시정지: 격주 사과 30kg (재개 시 다시 안내)"
 - 상태별 단독 조회는 그 상태만 깔끔하게 안내. 다른 상태 정보를 끼워 넣지 말 것.
 - 도구가 반환하지 않은 정기배송은 절대 응답에 포함하지 마라. 컨텍스트 메모리·이전 대화에 옛 정기배송 정보를 끌어와 함께 답하지 말 것.
 - 마크다운 강조(`**굵게**`)·표(`|`)·헤더(`#`) 사용 금지. 자연체 한국어 문장 + 필요 시 `-` 불릿이나 `1.` 번호만 사용.
@@ -1694,7 +1700,7 @@ async def chat_node(state: AgentState) -> dict:
         "[정기배송 목록 조회 가이드 — 매우 중요]\n"
         "- 사용자가 정기배송 목록을 묻는 발화는 표현이 다양하다. 일반 발화는 ACTIVE + PENDING(보낸/받은) 까지 모두 가져와 분류해 답하고, 사용자가 특정 상태만 콕 집어 물었을 때는 그 상태만 단독 조회한다.\n"
         "- (전체 조회 — 일반 발화 기본값) '정기배송 목록' / '내 정기배송' / '정기배송 보여줘' / '정기배송 현황' / '정기배송 다 알려줘' / '내가 진행 중인 정기배송' → get_subscriptions(user_id={user_id}, status_in=['ACTIVE','PENDING_OUTGOING','PENDING_INCOMING']). 결과를 '진행 중 N건, 보낸 신청 N건, 받은 신청 N건' 으로 분류해서 답변한다.\n"
-        "- (거래처 + 정기배송 교차 조회 — 매우 중요) '거래처 중 정기배송 있는 곳' / '거래 중인 곳 정기배송' / '거래처별 정기배송 현황' / '지금 거래하는 곳 중 정기배송' → 먼저 get_partners(user_id={user_id}, status='ACTIVE') 로 활성 거래처 확인 후 get_subscriptions(user_id={user_id}, status='ACTIVE') 로 진행 중 정기배송 조회. 두 결과를 교차해 '○○ 거래처와 정기배송 N건 진행 중' 형식으로 답변. 활성 거래처가 0곳이면 '활성 거래처가 없어 정기배송을 조회할 수 없습니다'라고만 안내.\n"
+        "- (거래처 + 정기배송 교차 조회 — 매우 중요) '거래처 중 정기배송 있는 곳' / '거래 중인 곳 정기배송' / '거래처별 정기배송 현황' / '지금 거래하는 곳 중 정기배송' 처럼 일반 발화는 '정기배송이 있는 곳' 의미가 ACTIVE 뿐 아니라 PAUSED / PENDING_OUTGOING / PENDING_INCOMING 까지 포함한다. ACTIVE 만 보고 '없다'고 답하면 PAUSED 누락 위험. 절차: 먼저 get_partners(user_id={user_id}, status='ACTIVE') 로 활성 거래처 확인 → get_subscriptions(user_id={user_id}, status_in=['ACTIVE','PAUSED','PENDING_OUTGOING','PENDING_INCOMING']) 로 살아있는 정기배송 모두 조회 → 두 결과를 교차해 '○○ 거래처와 정기배송 N건 (ACTIVE 1, PAUSED 1)' 형식으로 상태별 분류 포함해 답변. '거래처 중 진행 중인 정기배송' 처럼 명시적 ACTIVE 강조 시만 status='ACTIVE' 단독. 활성 거래처가 0곳이면 '활성 거래처가 없어 정기배송을 조회할 수 없습니다'라고만 안내.\n"
         "- (상태별 단독 조회)\n"
         "  · '진행 중인 정기배송' / '활성 정기배송' / '지금 받고 있는 정기배송' → get_subscriptions(user_id={user_id}, status='ACTIVE')\n"
         "  · '보낸 정기배송 신청' / '신청 보낸 정기배송' / '내가 신청한 정기배송' / '정기배송 보낸 요청' → get_subscriptions(user_id={user_id}, status='PENDING_OUTGOING')\n"
@@ -1703,7 +1709,7 @@ async def chat_node(state: AgentState) -> dict:
         "  · '종료된 정기배송' / '끝난 정기배송' / '마감된 정기배송' → get_subscriptions(user_id={user_id}, status='ENDED')\n"
         "  · '거절된 정기배송' → get_subscriptions(user_id={user_id}, status='REJECTED')\n"
         "  · '취소된 정기배송' → get_subscriptions(user_id={user_id}, status='CANCELLED')\n"
-        "- 응답 표현 규칙: 각 정기배송은 상대방 회사명/담당자, frequency 한글(WEEKLY→'매주', BIWEEKLY→'격주', MONTHLY→'매월'), start_date, 다음 예정일(있으면), 품목 요약(product_name + quantity + unit)을 자연체로 풀어 안내. 전체 조회 예시: '정기배송 현황입니다. - 진행 중: A마트 매주 옥수수 50kg 외 2종(다음 5월 10일) - 보낸 신청: B농가 격주 사과 30kg (수락 대기) - 받은 신청: 없음' 처럼 상태별로 묶어 안내. 상태별 단독 조회는 그 상태만 깔끔하게. 도구가 반환하지 않은 정기배송은 응답에 포함 금지. 마크다운 강조·표·헤더 금지.\n"
+        "- 응답 표현 규칙: 각 정기배송은 상대방 회사명/담당자, frequency 한글(WEEKLY→'매주', BIWEEKLY→'격주', MONTHLY→'매월'), start_date, 다음 예정일(있으면), 품목 요약(product_name + quantity + unit)을 자연체로 풀어 안내. 전체 조회 예시: '정기배송 현황입니다. - 진행 중: A마트 매주 옥수수 50kg 외 2종(다음 5월 10일) - 보낸 신청: B농가 격주 사과 30kg (수락 대기) - 받은 신청: 없음' 처럼 상태별로 묶어 안내. 거래처+정기배송 교차 조회 응답 예시(ACTIVE/PAUSED 혼합): '○○ 거래처와 진행 중인 정기배송 1건, 일시정지된 정기배송 1건 (총 2건) - 진행 중: 매주 옥수수 50kg(다음 5월 10일) - 일시정지: 격주 사과 30kg(재개 시 다시 안내)'. 상태별 단독 조회는 그 상태만 깔끔하게. 도구가 반환하지 않은 정기배송은 응답에 포함 금지. 마크다운 강조·표·헤더 금지.\n"
         "- 금지사항: 일반 발화에서 ACTIVE 만 조회하고 PENDING(보낸/받은) 정기배송을 누락하기. '현재 정기배송이 없습니다' 답하기 전 status_in=['ACTIVE','PENDING_OUTGOING','PENDING_INCOMING'] 으로 실제 조회했는지 확인 안 하기. 결과 0건일 때 다른 정보(주문, 상품, 거래처) 늘어놓기.\n"
         "\n"
         "[주문 응답 표시 규칙 — 환각 방지 (매우 중요)]\n"
