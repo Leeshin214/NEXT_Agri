@@ -1,13 +1,10 @@
 """거래처(Partner) 관련 도구.
 
-원본: backend/app/services/agent_tools.py 의 partner 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
-
 도메인 helper:
 - _build_partner_response : partner_user 임베딩을 평탄화한 응답 빌더.
 
-Cross-domain 의존:
-- _UUID_PATTERN : agent_tools.py 의 cross-domain helper (단계 2 에서 _shared.py 로 이동 예정).
+Cross-domain 의존 (agent/_shared.py 에서 lazy import):
+- _UUID_PATTERN
 """
 from __future__ import annotations
 
@@ -325,7 +322,7 @@ def request_partner_registration(
       - 이미 등록됨/요청 중: {"success": False, "error": "already_partner", ...}
       - 상대방 없음: {"success": False, "error": "user_not_found", ...}
     """
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
 
     # 입력 검증
     user_id_str = (user_id or "").strip()
@@ -546,7 +543,7 @@ def request_partner_registration_by_name(
       - 0건: {"success": False, "error": "no_match", "detail": "○○ 님을 찾을 수 없습니다"}
       - 자기 자신 매칭: {"success": False, "error": "self_registration_not_allowed", ...}
     """
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
 
     user_id_str = (user_id or "").strip()
     query_str = (target_name_or_company or "").strip()
@@ -697,7 +694,7 @@ def get_partners(
        partner_name, partner_company, partner_role, partner_phone,
        created_at, updated_at, ...}
     """
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
 
     user_clean = (user_id or "").strip()
     if not user_clean or not _UUID_PATTERN.match(user_clean):
@@ -784,7 +781,7 @@ def get_partners(
 )
 def get_incoming_partner_requests(user_id: str) -> dict:
     """내게 들어온 PENDING_INCOMING 거래처 등록 요청 목록을 반환한다."""
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
 
     user_clean = (user_id or "").strip()
     if not user_clean or not _UUID_PATTERN.match(user_clean):
@@ -832,7 +829,7 @@ def get_incoming_partner_requests(user_id: str) -> dict:
 )
 def accept_partner_request(user_id: str, partner_id: str) -> dict:
     """들어온 거래처 등록 요청을 수락한다. partner_id는 partners 테이블 row UUID."""
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
 
     user_clean = (user_id or "").strip()
     partner_clean = (partner_id or "").strip()
@@ -876,7 +873,7 @@ def accept_partner_request(user_id: str, partner_id: str) -> dict:
 )
 def reject_partner_request(user_id: str, partner_id: str) -> dict:
     """들어온 거래처 등록 요청을 거절한다. partner_id는 partners 테이블 row UUID."""
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
 
     user_clean = (user_id or "").strip()
     partner_clean = (partner_id or "").strip()

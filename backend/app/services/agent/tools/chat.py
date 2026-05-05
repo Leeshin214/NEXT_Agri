@@ -1,19 +1,17 @@
 """채팅방 / 메시지 관련 도구.
 
-원본: backend/app/services/agent_tools.py 의 chat 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
-
 도메인 helper:
 - _resolve_chat_room_candidates : sender↔partner 사이 활성 채팅방 후보 탐색 (send_chat_message 가 사용).
 - _do_send_chat_message         : 단일 채팅방에 INSERT + chat_rooms.last_message 갱신.
 
 LLM 도구 외 함수:
-- analyze_chat_consensus : chat_ws.py 가 직접 import 해서 호출하는 함수. ToolRegistry 미등록.
+- analyze_chat_consensus : chat_ws.py 가 `from app.services.agent.tools.chat import
+  analyze_chat_consensus` 로 직접 import 해서 호출하는 함수. ToolRegistry 미등록.
 
-Cross-domain helper:
-- _UUID_PATTERN : agent_tools.py 의 cross-domain helper (단계 2 에서 _shared.py 로 이동 예정).
+Cross-domain helper (agent/_shared.py 에서 lazy import):
+- _UUID_PATTERN
 
-PR 3 — chat 도메인 3 개 도구 등록 (groups=("chat",)):
+chat 도메인 3 개 도구 (groups=("chat",)):
 - get_chat_rooms
 - get_chat_messages
 - send_chat_message
@@ -392,8 +390,8 @@ def send_chat_message(
       - 0건 + 일반 방 없음: {success: False, error: "no_chat_room", ...}
       - 검증 실패: {success: False, error: ...}
     """
-    # cross-domain helper — agent_tools.py 가 _shared.py 로 통합되기 전까지 lazy import
-    from app.services.agent_tools import _UUID_PATTERN
+    # cross-domain helper (agent/_shared.py)
+    from .._shared import _UUID_PATTERN
 
     # message 가 우선, 없으면 content (legacy)
     body_text = (message or content or "").strip()
@@ -550,8 +548,9 @@ def _do_send_chat_message(
 # ─────────────────────────────────────────────
 # LLM 도구 외 함수 (chat_ws 가 직접 호출)
 # ─────────────────────────────────────────────
-# analyze_chat_consensus 는 chat_ws.py 가 `from app.services.agent_tools import
-# analyze_chat_consensus` 로 직접 import 해서 호출하는 함수이다.
+# analyze_chat_consensus 는 chat_ws.py 가
+# `from app.services.agent.tools.chat import analyze_chat_consensus` 로
+# 직접 import 해서 호출하는 함수이다.
 # LLM 의 tool calling 으로 노출하지 않기 위해 ToolRegistry 등록(@tool 데코레이터)
 # 을 의도적으로 생략한다 — TOOL_FUNCTION_MAP 에서도 빠진다.
 

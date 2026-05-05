@@ -270,11 +270,9 @@ async def _handle_consensus(room_id: str, result: dict) -> bool:
     반환: 합의 처리 성공 시 True (호출처에서 consensus_handled=True 마킹용).
     검증 실패/중복/오류 시 False.
     """
-    from app.services.agent_tools import (
-        create_calendar_event,
-        create_order,
-        _find_product_by_name,
-    )
+    from app.services.agent.tools.calendar import create_calendar_event
+    from app.services.agent.tools.order import create_order
+    from app.services.agent.tools.product import _find_product_by_name
 
     extracted = result.get("extracted") or {}
     buyer_id: str = extracted.get("buyer_id", "")
@@ -429,7 +427,7 @@ async def _handle_rejected(room_id: str, result: dict) -> None:
     - 채팅방에는 시스템 메시지 broadcast (DB INSERT 포함)
     - buyer/seller 각자에게 send_private_message 로 대체 거래처 제안
     """
-    from app.services.agent_tools import find_alternative_partners
+    from app.services.agent.tools.partner import find_alternative_partners
 
     extracted = result.get("extracted") or {}
     buyer_id: str = extracted.get("buyer_id", "")
@@ -647,7 +645,7 @@ async def websocket_chat(websocket: WebSocket, room_id: str):
                         await asyncio.to_thread(
                             lambda oid=order["id"]: supabase.table("orders").update({"status": "NEGOTIATING"}).eq("id", oid).execute()
                         )
-                        from app.services.agent_tools import _sync_calendar_events_for_order_id
+                        from app.services.agent._shared import _sync_calendar_events_for_order_id
                         await asyncio.to_thread(_sync_calendar_events_for_order_id, order["id"])
                 except Exception as _e:
                     print(f"[WS] 자동 NEGOTIATING 실패: {_e}")
@@ -655,7 +653,7 @@ async def websocket_chat(websocket: WebSocket, room_id: str):
             # 8. 합의 감지 백그라운드 실행 (쿨다운 적용)
             if should_analyze(room_id):
                 try:
-                    from app.services.agent_tools import analyze_chat_consensus
+                    from app.services.agent.tools.chat import analyze_chat_consensus
 
                     # caller_user_id 전달 — analyze_chat_consensus 내부에서 권한 검증
                     result = await asyncio.to_thread(

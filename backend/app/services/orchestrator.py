@@ -36,7 +36,7 @@ from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional
 
 from app.core.llm import get_openai_client
-from app.services.agent_tools import TOOL_FUNCTION_MAP
+from app.services.agent import TOOL_FUNCTION_MAP
 from app.services.agent import TOOLS as _REGISTRY_INVENTORY_ORDER_TOOLS
 from app.services.schedule_agent import schedule_agent
 
@@ -786,7 +786,7 @@ AGENT_BUYER_SYSTEM = (
 
 def _execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
     """
-    tool 이름과 입력값으로 agent_tools.py의 실제 함수를 실행한다.
+    tool 이름과 입력값으로 ToolRegistry 에 등록된 실제 함수를 실행한다.
     결과는 JSON 문자열로 반환한다.
     """
     func = TOOL_FUNCTION_MAP.get(tool_name)

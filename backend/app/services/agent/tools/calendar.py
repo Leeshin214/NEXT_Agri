@@ -1,12 +1,8 @@
 """캘린더 일정 관련 도구.
 
-원본: backend/app/services/agent_tools.py 의 calendar 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
+Cross-domain 의존: 없음 (calendar 도메인은 외부 helper 에 의존하지 않음).
 
-Cross-domain 의존:
-- 없음 (calendar 도메인은 외부 helper 에 의존하지 않음).
-
-PR 2 — calendar 도메인 4 개 도구 등록 (groups=("calendar",)):
+calendar 도메인 4 개 도구 (groups=("calendar",)):
 - get_calendar_events
 - create_calendar_event
 - update_calendar_event

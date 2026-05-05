@@ -152,7 +152,7 @@ class OrderService:
         return self.client.table("calendar_events")
 
     def _generate_order_number(self) -> str:
-        # ORD-{YYYYMMDD}-{4자리 랜덤} — agent_tools.create_order 패턴과 통일.
+        # ORD-{YYYYMMDD}-{4자리 랜덤} — agent.tools.order.create_order 패턴과 통일.
         # 동시 합의 자동 주문에서 같은 초에 두 요청이 들어와도 충돌 가능성을 1/10000 로 낮춘다.
         # 23505 발생 시 호출처에서 재시도하므로 실질적으로 0 으로 수렴.
         date_str = datetime.now().strftime("%Y%m%d")
@@ -721,7 +721,7 @@ class OrderService:
           - False (CreateOrderModal / POST /orders 라우터): QUOTE_REQUESTED INSERT +
             "새 견적 요청" SYSTEM 메시지. 협상이 필요하면 사용자가 수동으로 counter offer
             를 보낸다.
-          - True (AI 도구 흐름 — agent_tools.create_order): 단가 비교 후 자동 분기.
+          - True (AI 도구 흐름 — agent.tools.order.create_order): 단가 비교 후 자동 분기.
               * 모든 라인 unit_price >= price_per_unit → QUOTE_REQUESTED INSERT +
                 "주문 견적 도착" SYSTEM 메시지 (상품/단가/납품일 정리). 판매자 수락 대기.
                 재고 차감은 update_status(CONFIRMED) 시점에 일어난다.
@@ -729,7 +729,7 @@ class OrderService:
                 즉시 자동 counter offer 발사 (submit_counter_offer 가 NEGOTIATING 자동
                 전환 + 채팅방 PENDING 카드 노출).
 
-        delivery_date 는 모든 흐름에서 필수 (OrderCreate 스키마 + agent_tools 입력 모두 강제).
+        delivery_date 는 모든 흐름에서 필수 (OrderCreate 스키마 + agent.tools.order 입력 모두 강제).
         """
         items_data = data.pop("items", [])
 

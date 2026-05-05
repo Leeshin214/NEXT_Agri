@@ -1,8 +1,5 @@
 """카운터오퍼 / 납품일 변경 (Negotiation) 도구.
 
-원본: backend/app/services/agent_tools.py 의 negotiation 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
-
 모든 도구는 동기(sync) 함수이며, 내부적으로 별도 thread + 새 event loop 를
 만들어 order_service 의 async 메서드를 호출한다 (orchestrator._execute_tool 이
 이미 async 컨텍스트 안에서 sync 호출되기 때문에 asyncio.run() 직접 사용 시
@@ -10,13 +7,12 @@ RuntimeError 위험 — concurrent.futures + asyncio.new_event_loop 패턴이 �
 
 service 메서드가 HTTPException 등을 raise 하면 도구는
 {"success": False, "error": ..., "code": <status>} 형태로 반환하여
-다른 agent_tools 함수와 일관된 에러 포맷 유지.
+다른 도구 함수와 일관된 에러 포맷 유지.
 
 user 인자는 {"id": <user_uuid>} dict 만 만들어 넘긴다 (service 가 user["id"] 만 사용).
 
-Cross-domain 의존:
+Cross-domain 의존 (agent/_shared.py 에서 lazy import):
 - _UUID_PATTERN, _run_async_in_thread, _service_error_payload
-  : agent_tools.py 의 cross-domain helper (단계 2 에서 _shared.py 로 이동 예정).
 """
 from __future__ import annotations
 
@@ -93,7 +89,7 @@ def submit_counter_offer(
       성공: {success: True, offer: {...negotiation_history row...}}
       실패: {success: False, error: ..., code: <http_status>}
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -179,7 +175,7 @@ def accept_counter_offer(
       성공: {success: True, offer: {...accepted negotiation_history row...}}
       실패: {success: False, error: ..., code: <http_status>}
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -253,7 +249,7 @@ def reject_counter_offer(
       성공: {success: True, offer: {...rejected negotiation_history row...}}
       실패: {success: False, error: ..., code: <http_status>}
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -348,7 +344,7 @@ def submit_delivery_date_change(
       성공: {success: True, change: {...delivery_date_change_history row...}}
       실패: {success: False, error: ..., code: <http_status>}
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -448,7 +444,7 @@ def accept_delivery_date_change(
       성공: {success: True, change: {...accepted delivery_date_change row...}}
       실패: {success: False, error: ..., code: <http_status>}
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -521,7 +517,7 @@ def reject_delivery_date_change(
       성공: {success: True, change: {...rejected delivery_date_change row...}}
       실패: {success: False, error: ..., code: <http_status>}
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,

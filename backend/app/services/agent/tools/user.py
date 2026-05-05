@@ -1,16 +1,13 @@
 """사용자 / 판매자·구매자 탐색 / 채팅방 개설 도구.
 
-원본: backend/app/services/agent_tools.py 의 user 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
-
 도구 4 종:
 - get_user_profile         : 사용자 프로필 조회 (id/이름/회사명)
 - find_sellers_by_product  : 카테고리별 판매자 + 상품 목록
 - find_buyers_by_product   : 카테고리별 구매 이력 보유 바이어 목록
 - open_chat_room           : 두 사용자 간 채팅방 조회/생성
 
-Cross-domain 의존:
-- _UUID_PATTERN : agent_tools.py 의 cross-domain helper (단계 2 에서 _shared.py 로 이동 예정).
+Cross-domain 의존 (agent/_shared.py 에서 lazy import):
+- _UUID_PATTERN
 """
 from __future__ import annotations
 
@@ -327,7 +324,7 @@ def open_chat_room(user_id: str, partner_user_id: str, order_id: Optional[str] =
     - 기존 일반 채팅방이나 다른 주문 채팅방에 order_id를 덮어쓰지 않는다.
     반환: {success, room_id, is_new, partner_name} 또는 {success: False, error, message?}
     """
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
 
     # partner_user_id가 UUID가 아니면 이름/회사명으로 자동 검색
     if not _UUID_PATTERN.match(str(partner_user_id)):

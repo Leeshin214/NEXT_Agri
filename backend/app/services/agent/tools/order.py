@@ -1,13 +1,9 @@
 """주문 관련 도구.
 
-원본: backend/app/services/agent_tools.py 의 order 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
-
-Cross-domain 의존:
+Cross-domain 의존 (agent/_shared.py 에서 lazy import):
 - _UUID_PATTERN, _run_async_in_thread, _service_error_payload, _find_seller_by_name,
-  _sync_calendar_events_for_order_id : agent_tools.py 의 cross-domain helper.
-  단계 1 에서는 lazy import (단계 2 에서 _shared.py 로 이동 예정).
-- _find_product_by_name : product.py 의 도메인 helper.
+  _sync_calendar_events_for_order_id, _deduct_seller_stock_for_order
+- _find_product_by_name : product.py 의 도메인 helper (lazy import).
 """
 from __future__ import annotations
 
@@ -118,7 +114,7 @@ def get_orders(
             }
 
         from app.services.order_service import order_service
-        from app.services.agent_tools import _run_async_in_thread
+        from .._shared import _run_async_in_thread
 
         # order_service.list_orders 위임 — deleted_at IS NULL + status_in 일관 처리
         # status_in 이 있으면 list_orders 가 우선 적용, 없으면 단일 status fallback
@@ -317,7 +313,7 @@ def update_order_status(
     order_number: str = "",
 ) -> dict:
     """주문의 상태를 변경한다. 유효한 상태값인지 먼저 검증한다."""
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _sync_calendar_events_for_order_id,
         _deduct_seller_stock_for_order,
@@ -469,7 +465,7 @@ def update_order(
     order_id가 없으면 buyer_id + order_number로 검색.
     order_items의 subtotal과 orders의 total_amount도 자동 재계산.
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _sync_calendar_events_for_order_id,
     )
@@ -618,7 +614,7 @@ def create_order(
     delivery_date 는 필수 (V2, 2026-05-04). YYYY-MM-DD ISO 형식 문자열.
     product_id 가 UUID 가 아닌 상품명으로 들어온 경우 자동으로 이름 검색해 UUID 로 변환한다.
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -805,7 +801,7 @@ def create_order(
 )
 def delete_order(order_id: str, user_id: str) -> dict:
     """주문을 삭제한다. buyer_id 또는 seller_id가 일치하는 경우만 가능."""
-    from app.services.agent_tools import _sync_calendar_events_for_order_id
+    from .._shared import _sync_calendar_events_for_order_id
 
     try:
         supabase = get_supabase_client()
@@ -847,7 +843,7 @@ def delete_order(order_id: str, user_id: str) -> dict:
             _sync_calendar_events_for_order_id(order_id)
         except Exception as sync_err:
             print(
-                f"[agent_tools.delete_order] calendar sync 실패 (무시): "
+                f"[agent.tools.order.delete_order] calendar sync 실패 (무시): "
                 f"order_id={order_id}, error={type(sync_err).__name__}: {sync_err}"
             )
 

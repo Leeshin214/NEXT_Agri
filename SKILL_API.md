@@ -701,21 +701,25 @@ pytest-cov==6.0.0
   )
   ```
 
-- **AI 도구 모듈화 — `agent/tools/<domain>.py` + ToolRegistry 자동 등록 (PR 0/1/2, 2026-05-05)**: 기존 `agent_tools.py` 단일 파일에 41 개 LLM 도구가 누적되어 한 도구 수정 시 다른 도구의 hunk 충돌이 빈번했다. 도메인별 분리 + `@tool` 데코레이터 자동 등록 인프라 도입.
+- **AI 도구 모듈화 완료 — `agent/tools/<domain>.py` + ToolRegistry 자동 등록 (PR 0/1/2/3/4, 2026-05-05)**: 기존 `agent_tools.py` 단일 파일에 41 개 LLM 도구가 누적되어 한 도구 수정 시 다른 도구의 hunk 충돌이 빈번했다. 도메인별 분리 + `@tool` 데코레이터 자동 등록 인프라 도입 → PR 4 에서 `agent_tools.py` 완전 제거.
   ```
   backend/app/services/agent/
   ├── __init__.py        # TOOL_FUNCTION_MAP, TOOLS, TOOLS_CALENDAR, TOOLS_CHAT, INT_FIELDS 노출
   ├── _registry.py       # ToolRegistry (싱글톤), @tool 데코레이터, ToolEntry dataclass
-  ├── _shared.py         # cross-domain 공통 헬퍼 자리 (PR 4)
+  ├── _shared.py         # cross-domain 공통 helper (PR 4 완성)
+  │                      # _UUID_PATTERN, _run_async_in_thread, _service_error_payload,
+  │                      # _sync_calendar_events_for_order_id, _find_seller_by_name,
+  │                      # _find_product_by_name, _deduct_seller_stock_for_order
   └── tools/
       ├── __init__.py    # 모든 도메인 모듈 import → @tool 등록 트리거
       ├── product.py     # 6 개 (inventory_order)
       ├── order.py       # 6 개 (inventory_order)
       ├── partner.py     # 7 개 (inventory_order)
-      ├── subscription.py# 4 개 (inventory_order)
+      ├── subscription.py# 5 개 (inventory_order) — PR 4 에서 get_incoming_subscription_requests 통합
       ├── negotiation.py # 6 개 (inventory_order)
       ├── user.py        # 4 개 (inventory_order)
-      └── calendar.py    # 4 개 (calendar) — PR 2
+      ├── calendar.py    # 4 개 (calendar)
+      └── chat.py        # 3 개 (chat) + analyze_chat_consensus (LLM 도구 외)
   ```
   - 데코레이터 사용:
     ```python
@@ -731,13 +735,16 @@ pytest-cov==6.0.0
   - `ToolRegistry.schemas_for("calendar")` → OpenAI tool calling schema 리스트 (그룹별).
   - `ToolRegistry.function_map()` → name→callable 딕셔너리 (orchestrator `_execute_tool` 에서 사용).
   - 같은 이름 중복 등록 시 `RuntimeError("ToolRegistry 중복 등록 시도")` — 모듈 import 시점에 검증.
-  - `agent_tools.py` 는 backward-compat shim 으로 축소 — 옮긴 함수 re-export + 잔존 chat 3 개 + subscription 1 개 + cross-domain helper. `chat_ws.py` 의 `from app.services.agent_tools import create_calendar_event` 같은 옛 import 경로는 그대로 동작.
-  - LangGraph 노드 분리: `inventory_order_node` 는 `TOOLS` (33 + 옛 잔존 2 = 35), `calendar_data_node` 는 `TOOLS_CALENDAR` (4), `chat_node` 는 `TOOLS_CHAT` (3, 아직 orchestrator.py 로컬). 노드별 도구 격리로 `tool_choice="auto"` 단계에서 부적절한 도구 호출 방지.
-  - **검증 명령**: `python3 -c "from app.services.agent import TOOL_FUNCTION_MAP, TOOLS, TOOLS_CALENDAR; print(len(TOOL_FUNCTION_MAP), len(TOOLS), len(TOOLS_CALENDAR))"` — 기대값 `37 33 4` (PR 2 시점).
-  - **계속 남은 PR**: PR 3 (chat 3 개 도구 이동), PR 4 (cross-domain helper `_UUID_PATTERN`/`_run_async_in_thread`/`_sync_calendar_events_for_order_id` 등을 `_shared.py` 로 이동 후 shim 제거).
-  - **신규 도구 추가 패턴 (PR 2 이후)**: agent_tools.py 직접 수정 ❌ → (1) 적절한 도메인 모듈 (`tools/<domain>.py`) 에 `@tool` 데코레이터 함수 추가, (2) `tools/__init__.py` 에 import 한 줄 추가 (도메인 모듈 신설 시), (3) 검증 — `python3 -m pytest tests/test_agent_registry.py`. orchestrator.py 의 `TOOLS = ...` / `TOOLS_CALENDAR = ...` 는 자동 갱신.
+  - LangGraph 노드 분리: `inventory_order_node` 는 `TOOLS` (34), `calendar_data_node` 는 `TOOLS_CALENDAR` (4), `chat_node` 는 `TOOLS_CHAT` (3). 노드별 도구 격리로 `tool_choice="auto"` 단계에서 부적절한 도구 호출 방지.
+  - **검증 명령**: `python3 -c "from app.services.agent import TOOL_FUNCTION_MAP, TOOLS, TOOLS_CALENDAR, TOOLS_CHAT; print(len(TOOL_FUNCTION_MAP), len(TOOLS), len(TOOLS_CALENDAR), len(TOOLS_CHAT))"` — 기대값 `41 34 4 3`.
+  - **외부 import 경로**:
+    - LLM 도구 호출은 `orchestrator` 가 `TOOL_FUNCTION_MAP` 으로 해결 → 직접 import 불필요.
+    - `chat_ws.py` 의 직접 호출은 `from app.services.agent.tools.<domain> import <fn>` 사용 (예: `from app.services.agent.tools.calendar import create_calendar_event`).
+    - cross-domain helper 직접 호출은 `from app.services.agent._shared import _UUID_PATTERN` 등.
+    - **금지**: `from app.services.agent_tools import ...` (PR 4 이후 모듈 자체 부재 → ImportError).
+  - **신규 도구 추가 패턴**: (1) 적절한 도메인 모듈 (`tools/<domain>.py`) 에 `@tool` 데코레이터 함수 추가, (2) cross-domain helper 가 필요하면 `from .._shared import ...` 로 lazy import (또는 module-level), (3) 신규 도메인 모듈 신설 시 `tools/__init__.py` 에 import 한 줄 추가, (4) 검증 — `python3 -m pytest tests/test_agent_registry.py`. orchestrator.py 의 `TOOLS = ...` / `TOOLS_CALENDAR = ...` 는 자동 갱신.
 
-- **agent_tools 도구는 항상 sync — async service 호출 시 sync 재구현 (2026-05-04 partner 거래처 등록 도구 추가)**: `orchestrator._execute_tool` 은 `func(**tool_input)` 패턴으로 도구 함수를 호출한다 (await 없음). 따라서 `agent_tools.py` 의 모든 도구는 동기 함수여야 한다. 만약 호출하고 싶은 비즈니스 로직이 `partner_service.create_partner` 처럼 `async def` 라면, 그 안의 핵심 로직(자기 자신 차단, 양방향 PENDING 두 row INSERT, 23505 처리, partner_user 임베딩)을 supabase 클라이언트 동기 호출 패턴으로 재구현한다. 검증된 패턴:
+- **agent 도구는 항상 sync — async service 호출 시 sync 재구현 (2026-05-04 partner 거래처 등록 도구 추가)**: `orchestrator._execute_tool` 은 `func(**tool_input)` 패턴으로 도구 함수를 호출한다 (await 없음). 따라서 `agent/tools/<domain>.py` 의 모든 도구는 동기 함수여야 한다. 만약 호출하고 싶은 비즈니스 로직이 `partner_service.create_partner` 처럼 `async def` 라면, 그 안의 핵심 로직(자기 자신 차단, 양방향 PENDING 두 row INSERT, 23505 처리, partner_user 임베딩)을 supabase 클라이언트 동기 호출 패턴으로 재구현하거나 `agent._shared._run_async_in_thread(coro_fn)` 으로 별도 thread 에서 실행한다. 검증된 패턴:
   ```python
   def request_partner_registration(user_id: str, target_user_id: str, note: Optional[str] = None) -> dict:
       # 1) 입력 검증 — UUID 형식 + 자기 자신 차단
@@ -751,7 +758,6 @@ pytest-cov==6.0.0
   ```
   - 다중 매칭 시 confirmation 응답: `{"success": False, "needs_confirmation": True, "candidates": [{user_id, name, company_name, role}, ...]}` — `send_chat_message` 의 needs_confirmation 패턴과 일관. LLM 이 후보 리스트를 사용자에게 안내하고 사용자 응답 후 UUID 기반 도구로 다시 호출하도록 유도.
   - `_fix_id_params` 는 `user_id` 를 자동 강제 주입하므로 LLM 이 user_id 를 빠뜨려도 안전. `target_user_id` 는 LLM 이 보낸 값 보존 → 도구 내부 검증으로 invalid UUID/self/missing 을 각각 다른 error code 로 반환.
-  - **(2026-05-05 이후 deprecated)** 위 "신규 도구 추가 패턴" 항목 참고 — `tools/<domain>.py` 의 `@tool` 데코레이터로 등록하는 새 패턴을 사용한다. agent_tools.py 직접 수정은 chat 3 + subscription 1 (PR 3 까지 잔존) 외에는 금지.
 
 - **LangGraph 노드별 TOOLS 분리 시 시스템 프롬프트 동기화 필수 (2026-04-29 검증)**: 한 노드가 보유하던 도구를 별도 노드로 옮길 때(예: `inventory_order_node` 의 캘린더 도구 2개를 `calendar_data_node` 의 `TOOLS_CALENDAR` 로 이동), 도구 정의만 옮기고 원래 노드의 시스템 프롬프트를 그대로 두면 LLM 이 존재하지 않는 도구를 호출 시도해서 OpenAI API 가 tool 이름을 모른다고 거부하거나, 가이드와 실제 도구 노출이 어긋나 답변이 어색해진다. 반드시 다음 4 영역을 동시에 정리한다.
   - 시스템 프롬프트 안의 `[사용 가능한 도구]` 목록에서 옮긴 도구 이름 삭제

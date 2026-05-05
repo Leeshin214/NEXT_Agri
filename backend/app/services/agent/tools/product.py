@@ -1,13 +1,10 @@
 """상품/재고 관련 도구.
 
-원본: backend/app/services/agent_tools.py 의 product 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
-
 도메인 helper:
 - _find_product_by_name : 이름 기반 상품 검색 (fuzzy fallback). order/subscription 모듈에서도 lazy import.
 
-Cross-domain helper:
-- _UUID_PATTERN : agent_tools.py 에 정의 (단계 2 에서 _shared.py 로 이동 예정).
+Cross-domain helper (agent/_shared.py):
+- _UUID_PATTERN
 """
 from __future__ import annotations
 
@@ -484,7 +481,7 @@ def delete_product(product_id: str, seller_id: str, name: Optional[str] = None) 
         "상품 정보를 수정한다. 전달된 필드만 업데이트된다. "
         "seller_id가 일치해야만 수정 가능하다. "
         "수정 가능 필드: name, price_per_unit, category, origin, spec, description. "
-        "중요: product_id를 몰라도 product_name에 상품명을 넣으면 agent_tools.update_product가 해당 판매자의 상품을 이름으로 찾아 수정한다. "
+        "중요: product_id를 몰라도 product_name에 상품명을 넣으면 update_product가 해당 판매자의 상품을 이름으로 찾아 수정한다. "
         "따라서 '감자 단가 2700원으로 바꿔줘'처럼 상품명과 변경값이 있으면 확인 질문 없이 즉시 update_product를 호출하라."
     ),
     parameters={

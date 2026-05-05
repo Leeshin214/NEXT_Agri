@@ -1,15 +1,11 @@
 """정기배송(Subscription) 관련 도구.
 
-원본: backend/app/services/agent_tools.py 의 subscription 섹션 (단계 1: 본문 그대로 복사 + @tool 데코레이터 추가).
-agent_tools.py 의 함수는 단계 2 에서 shim 으로 변환된다.
-
 도메인 helper:
 - _normalize_frequency, _normalize_iso_date, _resolve_subscription_items
   : 정기배송 입력 정규화 (자연어 친화).
 
-Cross-domain 의존:
+Cross-domain 의존 (agent/_shared.py 에서 lazy import):
 - _UUID_PATTERN, _run_async_in_thread, _service_error_payload
-  : agent_tools.py 의 cross-domain helper (단계 2 에서 _shared.py 로 이동 예정).
 - _find_product_by_name : product.py 의 도메인 helper (lazy import).
 
 참고:
@@ -88,7 +84,7 @@ def _resolve_subscription_items(
     반환: (정규화된 items 리스트, 에러 메시지 리스트)
       에러가 있으면 호출 측에서 needs_clarification 응답 구성에 사용.
     """
-    from app.services.agent_tools import _UUID_PATTERN
+    from .._shared import _UUID_PATTERN
     from .product import _find_product_by_name
 
     resolved: list[dict] = []
@@ -281,7 +277,7 @@ def create_subscription_request(
       검증 실패: {success: False, needs_clarification: True, missing: [...], message}
       서비스 실패: {success: False, error, message}
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -475,7 +471,7 @@ def accept_subscription_request(user_id: str = "", subscription_id: str = "") ->
     - status 가 PENDING 이 아니면 400.
     - ACTIVE 전환 시 양 당사자 캘린더에 다음 배송 일정이 자동 등록된다.
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -552,7 +548,7 @@ def reject_subscription_request(
     - 요청자 본인은 거절 불가.
     - reason 은 현재 DB 컬럼이 없어 응답 메시지에만 활용된다 (이력 보존은 status=REJECTED 로).
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -645,7 +641,7 @@ def create_subscription_from_order(
         그대로 subscription_items 로 복제하고 PENDING 상태로 등록한다.
     상대방이 수락하면 ACTIVE 로 전환된다.
     """
-    from app.services.agent_tools import (
+    from .._shared import (
         _UUID_PATTERN,
         _run_async_in_thread,
         _service_error_payload,
@@ -794,3 +790,70 @@ def create_subscription_from_order(
             f"(주기: {freq_norm}, 시작: {start_norm}) 상대방이 수락하면 자동 활성화됩니다."
         ),
     }
+
+
+@tool(
+    name="get_incoming_subscription_requests",
+    description=(
+        "내게 들어온 PENDING 정기배송 요청 목록을 반환한다. "
+        "내가 만들지 않은 (created_by != 내 ID) PENDING 상태 정기배송만 포함한다. "
+        "사용자가 '들어온 정기배송 요청', '받은 정기배송' 등을 묻거나 "
+        "정기배송 수락/거절을 검토하려 할 때 호출."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string", "description": "조회할 사용자의 UUID"},
+        },
+        "required": ["user_id"],
+    },
+    groups=("inventory_order",),
+)
+def get_incoming_subscription_requests(user_id: str) -> dict:
+    """내게 들어온 PENDING 정기배송 요청 목록을 반환한다 (내가 만들지 않은 것)."""
+    from .._shared import _UUID_PATTERN
+
+    user_clean = (user_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id"}
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table("subscriptions") \
+            .select("id, seller_id, buyer_id, created_by, frequency, start_date, status, notes, subscription_items(product_id, quantity, unit_price, unit)") \
+            .eq("status", "PENDING") \
+            .neq("created_by", user_clean) \
+            .is_("deleted_at", None) \
+            .or_(f"seller_id.eq.{user_clean},buyer_id.eq.{user_clean}") \
+            .execute()
+        requests = []
+        for row in (result.data or []):
+            counterpart_id = row["buyer_id"] if row["seller_id"] == user_clean else row["seller_id"]
+            raw_items = row.get("subscription_items", []) or []
+            enriched_items = []
+            for item in raw_items:
+                pid = item.get("product_id")
+                product_name = None
+                if pid:
+                    try:
+                        pr = supabase.table("products").select("name").eq("id", pid).single().execute()
+                        product_name = (pr.data or {}).get("name")
+                    except Exception:
+                        pass
+                enriched_items.append({
+                    "product_id": pid,
+                    "product_name": product_name or pid,
+                    "quantity": item.get("quantity"),
+                    "unit_price": item.get("unit_price"),
+                    "unit": item.get("unit"),
+                })
+            requests.append({
+                "subscription_id": row["id"],
+                "from_user_id": counterpart_id,
+                "frequency": row.get("frequency", ""),
+                "start_date": row.get("start_date", ""),
+                "notes": row.get("notes", ""),
+                "items": enriched_items,
+            })
+        return {"success": True, "requests": requests, "count": len(requests)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
