@@ -107,12 +107,12 @@ def test_multi_group_registration():
 
 
 # ─────────────────────────────────────────────
-# PR 1+2 — 7 개 도메인 모듈 등록 검증
+# PR 1+2+3 — 8 개 도메인 모듈 등록 검증
 # (fixture 가 registry 를 비우므로, 별도 fixture 없이 직접 import 검증)
 # ─────────────────────────────────────────────
 
-# PR 2 시점에 등록되는 모든 도메인 모듈 — 재 import 시 sys.modules.pop() 대상.
-_PR2_DOMAIN_MODULES = [
+# PR 3 시점에 등록되는 모든 도메인 모듈 — 재 import 시 sys.modules.pop() 대상.
+_PR3_DOMAIN_MODULES = [
     "app.services.agent",
     "app.services.agent.tools",
     "app.services.agent.tools.product",
@@ -122,25 +122,26 @@ _PR2_DOMAIN_MODULES = [
     "app.services.agent.tools.negotiation",
     "app.services.agent.tools.user",
     "app.services.agent.tools.calendar",
+    "app.services.agent.tools.chat",
 ]
 
 
-def test_domain_modules_register_37_tools(_reset_registry=None):  # noqa: ARG001
-    """PR 1+2: 7 개 도메인 모듈 import 시 총 37 개 도구 등록 (33 inventory_order + 4 calendar)."""
+def test_domain_modules_register_40_tools(_reset_registry=None):  # noqa: ARG001
+    """PR 1+2+3: 8 개 도메인 모듈 import 시 총 40 개 도구 등록 (33 inventory_order + 4 calendar + 3 chat)."""
     # 새로 import 하기 위해 sys.modules 초기화
     import importlib
     import sys
-    for mod in _PR2_DOMAIN_MODULES:
+    for mod in _PR3_DOMAIN_MODULES:
         sys.modules.pop(mod, None)
 
     # registry 도 비워야 import 시 다시 등록됨
     ToolRegistry._items.clear()
 
     agent = importlib.import_module("app.services.agent")
-    assert len(agent.TOOL_FUNCTION_MAP) == 37
+    assert len(agent.TOOL_FUNCTION_MAP) == 40
     assert len(agent.TOOLS) == 33  # inventory_order 그룹
     assert len(agent.TOOLS_CALENDAR) == 4  # PR 2 — calendar 그룹
-    assert len(agent.TOOLS_CHAT) == 0  # PR 3 에서 채워짐
+    assert len(agent.TOOLS_CHAT) == 3  # PR 3 — chat 그룹
 
     # 도메인별 핵심 함수가 등록되어 있는지 sanity check
     expected = {
@@ -168,6 +169,8 @@ def test_domain_modules_register_37_tools(_reset_registry=None):  # noqa: ARG001
         # calendar (PR 2)
         "get_calendar_events", "create_calendar_event",
         "update_calendar_event", "delete_calendar_event",
+        # chat (PR 3)
+        "get_chat_rooms", "get_chat_messages", "send_chat_message",
     }
     assert set(agent.TOOL_FUNCTION_MAP.keys()) == expected
 
@@ -176,7 +179,7 @@ def test_calendar_tools_in_calendar_group_only(_reset_registry=None):  # noqa: A
     """PR 2: calendar 도구 4 개는 'calendar' 그룹에만 속하고 'inventory_order' 에는 없어야 한다."""
     import importlib
     import sys
-    for mod in _PR2_DOMAIN_MODULES:
+    for mod in _PR3_DOMAIN_MODULES:
         sys.modules.pop(mod, None)
     ToolRegistry._items.clear()
 
@@ -193,11 +196,49 @@ def test_calendar_tools_in_calendar_group_only(_reset_registry=None):  # noqa: A
     assert calendar_tools.isdisjoint(inventory_order_names)
 
 
-def test_domain_modules_int_fields_union(_reset_registry=None):  # noqa: ARG001
-    """PR 1+2: 도메인 모듈 등록 후 INT_FIELDS 합집합 검증."""
+def test_chat_tools_in_chat_group_only(_reset_registry=None):  # noqa: ARG001
+    """PR 3: chat 도구 3 개는 'chat' 그룹에만 속하고 'inventory_order'/'calendar' 에는 없어야 한다."""
     import importlib
     import sys
-    for mod in _PR2_DOMAIN_MODULES:
+    for mod in _PR3_DOMAIN_MODULES:
+        sys.modules.pop(mod, None)
+    ToolRegistry._items.clear()
+
+    agent = importlib.import_module("app.services.agent")
+
+    inventory_order_names = {t["function"]["name"] for t in agent.TOOLS}
+    calendar_names = {t["function"]["name"] for t in agent.TOOLS_CALENDAR}
+    chat_names = {t["function"]["name"] for t in agent.TOOLS_CHAT}
+
+    chat_tools = {"get_chat_rooms", "get_chat_messages", "send_chat_message"}
+    assert chat_tools == chat_names
+    assert chat_tools.isdisjoint(inventory_order_names)
+    assert chat_tools.isdisjoint(calendar_names)
+
+
+def test_analyze_chat_consensus_not_registered(_reset_registry=None):  # noqa: ARG001
+    """PR 3: analyze_chat_consensus 는 LLM 도구가 아니므로 ToolRegistry 에 등록되지 않아야 한다.
+    chat_ws.py 가 직접 import 해서 호출하는 함수.
+    """
+    import importlib
+    import sys
+    for mod in _PR3_DOMAIN_MODULES:
+        sys.modules.pop(mod, None)
+    ToolRegistry._items.clear()
+
+    agent = importlib.import_module("app.services.agent")
+    assert "analyze_chat_consensus" not in agent.TOOL_FUNCTION_MAP
+
+    # 단, 같은 모듈에서 callable 로 import 가능해야 한다
+    chat_module = importlib.import_module("app.services.agent.tools.chat")
+    assert callable(chat_module.analyze_chat_consensus)
+
+
+def test_domain_modules_int_fields_union(_reset_registry=None):  # noqa: ARG001
+    """PR 1+2+3: 도메인 모듈 등록 후 INT_FIELDS 합집합 검증."""
+    import importlib
+    import sys
+    for mod in _PR3_DOMAIN_MODULES:
         sys.modules.pop(mod, None)
     ToolRegistry._items.clear()
 

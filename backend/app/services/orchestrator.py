@@ -290,92 +290,15 @@ ORCHESTRATOR_ROUTER_SYSTEM = _build_router_system()
 from app.services.agent import TOOLS_CALENDAR as _REGISTRY_TOOLS_CALENDAR
 TOOLS_CALENDAR = _REGISTRY_TOOLS_CALENDAR
 
-TOOLS_CHAT = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_chat_rooms",
-            "description": "현재 사용자가 참여하고 있는 모든 채팅방 목록을 가져온다.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string", "description": "사용자 UUID"}
-                },
-                "required": ["user_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_chat_messages",
-            "description": "특정 채팅방의 상세 대화 내역을 조회한다. room_id를 모르면 먼저 get_chat_rooms를 호출하라.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "room_id": {"type": "string", "description": "채팅방 UUID"},
-                    "limit": {"type": "integer", "description": "가져올 메시지 수 (기본 20)"}
-                },
-                "required": ["room_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "send_chat_message",
-            "description": (
-                "채팅방에 메시지를 보낸다. 답장할 때 사용하라. "
-                "room_id 를 이미 알면 그대로 지정하고, 모르면 partner_user_id 와 "
-                "order_hint(품목/수량/상태) 로 후보 방을 자동 매칭한다. "
-                "후보가 2개 이상이면 needs_confirmation=true 가 반환되며 절대 발송되지 않는다 — "
-                "이 경우 후보 리스트를 사용자에게 안내하고 어느 방으로 보낼지 확인받은 뒤 "
-                "room_id 를 직접 지정해 다시 호출해야 한다. "
-                "예: '옥수수 50kg 배송 완료' 같은 발화면 product_name='옥수수', quantity=50, "
-                "status='SHIPPING' 또는 'COMPLETED' 를 함께 넣어 정확한 주문방을 좁힌다."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "partner_user_id": {
-                        "type": "string",
-                        "description": "메시지를 보낼 거래처(상대방) 사용자 UUID. room_id 모를 때 필수.",
-                    },
-                    "order_hint": {
-                        "type": "object",
-                        "description": "어느 주문 채팅방에 보낼지 좁히기 위한 힌트 (선택).",
-                        "properties": {
-                            "product_name": {"type": "string", "description": "상품명 부분 일치 (예: 옥수수)"},
-                            "quantity": {"type": "integer", "description": "주문 수량 정확 일치"},
-                            "status": {
-                                "type": "string",
-                                "description": "주문 상태 (QUOTE_REQUESTED, NEGOTIATING, CONFIRMED, PREPARING, SHIPPING, COMPLETED 중 하나)",
-                            },
-                            "recent": {
-                                "type": "boolean",
-                                "description": "true 면 가장 최근 활성 주문방 1개만 선택 (기본 false)",
-                            },
-                        },
-                    },
-                    "message": {"type": "string", "description": "보낼 메시지 본문"},
-                    "room_id": {
-                        "type": "string",
-                        "description": "(legacy) 채팅방 UUID. 직접 지정 시 hint 무시하고 그대로 전송.",
-                    },
-                    "sender_id": {
-                        "type": "string",
-                        "description": "(legacy) 보내는 사람 UUID. 서버에서 현재 user_id 로 강제 주입됨.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "(legacy) 메시지 본문. message 와 동일 — message 가 우선.",
-                    },
-                },
-                "required": ["message"],
-            },
-        },
-    }
-]
+# ─────────────────────────────────────────────
+# 채팅 노드 전용 도구 — TOOLS_CHAT
+#
+# PR 3 — 3 개 schema 는 agent.tools.chat 의 @tool 데코레이터에서 등록되어
+# ToolRegistry "chat" 그룹으로 자동 노출. 여기서는 registry import 만.
+# ─────────────────────────────────────────────
+
+from app.services.agent import TOOLS_CHAT as _REGISTRY_TOOLS_CHAT
+TOOLS_CHAT = _REGISTRY_TOOLS_CHAT
 
 # ─────────────────────────────────────────────
 # inventory_order_node 전용 시스템 프롬프트 (REFACTOR 2: 자연스러운 대화형 AI)

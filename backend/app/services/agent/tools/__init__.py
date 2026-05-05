@@ -17,8 +17,11 @@ PR 1 — 6 개 도메인 모듈 (33 개 도구):
 PR 2 — calendar 도메인 모듈 (4 개 도구):
 - calendar      (4): get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event
 
+PR 3 — chat 도메인 모듈 (3 개 도구 + 1 개 LLM 외 함수):
+- chat          (3): get_chat_rooms, get_chat_messages, send_chat_message
+- chat (외부)    (1): analyze_chat_consensus — chat_ws.py 직접 호출, ToolRegistry 미등록
+
 다음 PR 에서 추가 예정:
-- chat       (3): get_chat_rooms, get_chat_messages, send_chat_message
 - subscription 보강 (1): get_incoming_subscription_requests
 """
 from . import product       # noqa: F401
@@ -28,3 +31,4 @@ from . import subscription  # noqa: F401
 from . import negotiation   # noqa: F401
 from . import user          # noqa: F401
 from . import calendar      # noqa: F401
+from . import chat          # noqa: F401

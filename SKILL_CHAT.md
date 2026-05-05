@@ -444,6 +444,8 @@ await manager.broadcast(room_id, payload)
 
 `analyze_chat_consensus(room_id, last_n_messages, caller_user_id)` 의 `caller_user_id` 가 chat_room 의 buyer_id/seller_id 와 일치하지 않으면 fallback `{"status": "general", ...}` 반환. WebSocket 핸들러에서 caller_user_id 를 항상 전달하도록 `analyze_chat_consensus(room_id, 10, user_id)` 호출.
 
+> **모듈 위치 (PR 3, 2026-05-04)**: `analyze_chat_consensus` 의 본문은 `backend/app/services/agent/tools/chat.py` 로 이동했다. `@tool` 데코레이터 미부착 → ToolRegistry 미등록 (LLM 도구 아님). chat_ws.py 호환을 위해 `from app.services.agent_tools import analyze_chat_consensus` 는 re-export shim 으로 그대로 동작. 마찬가지로 `get_chat_rooms` / `get_chat_messages` / `send_chat_message` (3 LLM 도구) 도 같은 모듈로 이동 + `@tool(groups=("chat",))` 등록 → orchestrator 의 `TOOLS_CHAT` 은 registry import.
+
 ### 대체 거래처 제안 (alternative_partners_suggestion) 풀 페이로드 패턴 (검증됨)
 
 백엔드 `chat_ws.py _handle_rejected` 가 보내는 payload 전체를 프론트에서 사용한다:
