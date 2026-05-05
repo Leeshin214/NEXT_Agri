@@ -14,8 +14,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '@/components/common/PageHeader';
 import SearchFilterBar from '@/components/common/SearchFilterBar';
-import Modal from '@/components/common/Modal';
-import { useMembers, useMemberProfile } from '@/hooks/useMembers';
+import { useMembers } from '@/hooks/useMembers';
 import { useCreateChatRoom } from '@/hooks/useChat';
 import {
   useAcceptPartner,
@@ -24,6 +23,7 @@ import {
   usePartners,
 } from '@/hooks/usePartners';
 import { useAuthStore } from '@/store/authStore';
+import { cn } from '@/lib/utils';
 import type { PartnerStatus, UserPublicProfile, UserRole } from '@/types';
 
 type SearchRole = 'BUYER' | 'SELLER';
@@ -89,7 +89,8 @@ interface MemberCardProps {
   partnerStatus: PartnerStatus | undefined;
   /** PENDING_INCOMING 일 때 수락에 필요한 partner row id */
   partnerId: string | undefined;
-  onCardClick: (userId: string) => void;
+  /** SELLER 카드일 때만 — 클릭하면 상세 페이지로 이동. BUYER 카드는 비활성. */
+  onCardClick?: (userId: string) => void;
   onChat: (userId: string) => void;
   onAddPartner: (userId: string) => void;
   onAcceptPartner: (partnerId: string) => void;
@@ -113,11 +114,29 @@ function MemberCard({
 }: MemberCardProps) {
   // 본인과 같은 역할 또는 ADMIN 인 경우 거래처 액션 자체를 숨김
   const canAddPartner = member.role !== myRole && member.role !== 'ADMIN';
+  const isClickable = !!onCardClick;
 
   return (
     <div
-      onClick={() => onCardClick(member.id)}
-      className="flex cursor-pointer flex-col gap-4 rounded-xl bg-white p-5 shadow-sm transition-shadow hover:shadow-md"
+      onClick={isClickable ? () => onCardClick!(member.id) : undefined}
+      role={isClickable ? 'button' : undefined}
+      tabIndex={isClickable ? 0 : undefined}
+      onKeyDown={
+        isClickable
+          ? (e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onCardClick!(member.id);
+              }
+            }
+          : undefined
+      }
+      className={cn(
+        'flex flex-col gap-4 rounded-xl bg-white p-5 shadow-sm transition-shadow',
+        isClickable
+          ? 'cursor-pointer hover:shadow-md focus:outline-none focus:ring-2 focus:ring-primary-500'
+          : 'cursor-default'
+      )}
     >
       {/* 상단: 아바타 + 이름 + 역할 배지 */}
       <div className="flex items-center gap-3">
@@ -244,94 +263,6 @@ function MemberCard({
   );
 }
 
-// ─── 프로필 모달 내용 ───
-
-function ProfileModalContent({
-  userId,
-  onChat,
-  isChatPending,
-}: {
-  userId: string;
-  onChat: (userId: string) => void;
-  isChatPending: boolean;
-}) {
-  const { data, isLoading } = useMemberProfile(userId);
-  const profile = data?.data;
-
-  if (isLoading) {
-    return (
-      <div className="py-8 text-center text-sm text-gray-400">로딩 중...</div>
-    );
-  }
-
-  if (!profile) {
-    return (
-      <div className="py-8 text-center text-sm text-gray-400">
-        프로필을 불러올 수 없습니다.
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-5">
-      {/* 프로필 이미지 + 이름 */}
-      <div className="flex flex-col items-center gap-3">
-        {profile.profile_image ? (
-          <img
-            src={profile.profile_image}
-            alt={profile.name}
-            className="h-20 w-20 rounded-full object-cover"
-          />
-        ) : (
-          <div className="flex h-20 w-20 items-center justify-center rounded-full bg-primary-100 text-primary-700 text-3xl font-semibold">
-            {profile.name.charAt(0)}
-          </div>
-        )}
-        <div className="text-center">
-          <p className="text-lg font-semibold text-gray-900">{profile.name}</p>
-          <span
-            className={`mt-1 inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${ROLE_BADGE_CLASS[profile.role] ?? 'bg-gray-100 text-gray-700'}`}
-          >
-            {ROLE_LABEL[profile.role] ?? profile.role}
-          </span>
-        </div>
-      </div>
-
-      {/* 상세 정보 (이메일 제외) */}
-      <dl className="divide-y divide-gray-100 rounded-lg border border-gray-200">
-        {profile.company_name && (
-          <div className="flex px-4 py-3">
-            <dt className="w-24 flex-shrink-0 text-sm text-gray-500">업체명</dt>
-            <dd className="text-sm font-medium text-gray-900">
-              {profile.company_name}
-            </dd>
-          </div>
-        )}
-        {profile.phone && (
-          <div className="flex px-4 py-3">
-            <dt className="w-24 flex-shrink-0 text-sm text-gray-500">연락처</dt>
-            <dd className="text-sm text-gray-900">{profile.phone}</dd>
-          </div>
-        )}
-        <div className="flex px-4 py-3">
-          <dt className="w-24 flex-shrink-0 text-sm text-gray-500">가입일</dt>
-          <dd className="text-sm text-gray-900">{formatDate(profile.created_at)}</dd>
-        </div>
-      </dl>
-
-      {/* 채팅하기 버튼 */}
-      <button
-        onClick={() => onChat(profile.id)}
-        disabled={isChatPending}
-        className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50 transition-colors"
-      >
-        <MessageCircle className="h-4 w-4" />
-        {isChatPending ? '채팅방 생성 중...' : '채팅하기'}
-      </button>
-    </div>
-  );
-}
-
 // ─── 페이지 ───
 
 export default function SellerMembersPage() {
@@ -340,7 +271,6 @@ export default function SellerMembersPage() {
   const myRole: UserRole = user?.role ?? 'SELLER';
   const [search, setSearch] = useState('');
   const [selectedRole, setSelectedRole] = useState<SearchRole>('BUYER');
-  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [addingPartnerId, setAddingPartnerId] = useState<string | null>(null);
   const [acceptingPartnerId, setAcceptingPartnerId] = useState<string | null>(
     null
@@ -368,12 +298,15 @@ export default function SellerMembersPage() {
     return m;
   })();
 
+  const handleSellerDetail = (userId: string) => {
+    router.push(`/seller/members/${userId}`);
+  };
+
   const handleChat = (userId: string) => {
     createChatRoom.mutate(
       { partner_user_id: userId },
       {
         onSuccess: () => {
-          setSelectedUserId(null);
           router.push('/seller/chat');
         },
       }
@@ -427,6 +360,9 @@ export default function SellerMembersPage() {
           {members.map((member) => {
             const partnerStatus = partnerStatusMap.get(member.id);
             const partnerId = partnerIdByUserId.get(member.id);
+            // 판매자 카드만 상세 페이지 라우팅. 구매자 카드는 클릭 비활성.
+            const onCardClick =
+              member.role === 'SELLER' ? handleSellerDetail : undefined;
             return (
               <MemberCard
                 key={member.id}
@@ -434,7 +370,7 @@ export default function SellerMembersPage() {
                 myRole={myRole}
                 partnerStatus={partnerStatus}
                 partnerId={partnerId}
-                onCardClick={setSelectedUserId}
+                onCardClick={onCardClick}
                 onChat={handleChat}
                 onAddPartner={handleAddPartner}
                 onAcceptPartner={handleAcceptPartner}
@@ -448,22 +384,6 @@ export default function SellerMembersPage() {
           })}
         </div>
       )}
-
-      {/* 프로필 상세 모달 */}
-      <Modal
-        isOpen={!!selectedUserId}
-        onClose={() => setSelectedUserId(null)}
-        title="회원 프로필"
-        size="sm"
-      >
-        {selectedUserId && (
-          <ProfileModalContent
-            userId={selectedUserId}
-            onChat={handleChat}
-            isChatPending={createChatRoom.isPending}
-          />
-        )}
-      </Modal>
     </div>
   );
 }

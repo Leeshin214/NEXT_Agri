@@ -420,7 +420,8 @@ content: [
 - [ ] dashboard — SummaryCard 4개, 최근 주문 테이블, 이번 주 출하 일정
 - [ ] calendar — 월간 달력, 이벤트 타입별 색상, 날짜 클릭 상세 패널
 - [x] partners — 거래처 테이블 (서버 사이드 필터), 즐겨찾기 토글, AddPartnerModal, 빠른 액션(채팅 / 정기배송 신청 — ACTIVE 만) — 주문 작성은 V1 숨김 (전용 새 페이지 미존재)
-- [x] members — 회원 검색 카드, 프로필 모달, 채팅 생성, 거래처 추가 버튼
+- [x] members — 회원 검색 카드(SELLER 클릭 시 `/seller/members/[userId]` 상세 페이지로 라우팅, BUYER 카드는 클릭 비활성), 채팅 생성, 거래처 추가 버튼
+- [x] members/[userId] — 판매자 상세 페이지 (공통 `SellerProfileView` 컴포넌트). 헤더(프로필+회사명+거래처 상태+채팅/거래처 액션) + 회사 정보 카드 + 카테고리 필터 가능한 판매 상품 그리드
 - [ ] products — 상품 목록, 상태 필터, 등록 모달 (React Hook Form)
 - [x] orders — 탭(견적/진행/완료), 상세 패널, 상태 변경 + 협상가 제시/수락/거절 + 취소
 - [x] orders/[id] — 동적 라우트 주문 상세 페이지 (캘린더/알림에서 진입) — `OrderDetailView` 공통 컴포넌트 재사용
@@ -430,7 +431,8 @@ content: [
 - [ ] dashboard — SummaryCard 4개, 진행 주문 현황, 납품 예정
 - [ ] calendar — 판매자와 동일 패턴
 - [x] partners — 판매자와 동일 패턴 + 빠른 액션 "주문 작성" → /buyer/browse?seller_id=... + 정기배송 신청(ACTIVE 만)
-- [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat) + 거래처 추가 버튼
+- [x] members — 판매자와 동일 패턴 (채팅 이동: /buyer/chat) + 거래처 추가 버튼 + SELLER 카드 클릭 시 `/buyer/members/[userId]` 상세 페이지로 라우팅
+- [x] members/[userId] — 판매자 상세 페이지. `SellerProfileView` 공통 컴포넌트를 `basePath="/buyer"` 로 재사용. 상품 카드 클릭은 `/buyer/browse/[productId]` 상세로 이어짐
 - [x] browse — 상품 카드 그리드, 카테고리/가격 필터, 견적 요청 버튼, ?seller_id= 쿼리로 판매자 필터
 - [x] orders — 견적 생성/수정/취소 모달 + 협상가 제시/수락/거절 + 상세 슬라이드
 - [x] orders/[id] — 동적 라우트 주문 상세 페이지 (캘린더/알림에서 진입) — `OrderDetailView` 공통 컴포넌트 재사용
@@ -829,9 +831,9 @@ export type { User, UserRole, UserPublicProfile } from './user';
 //                             ^^^^^^^^^^^^^^^^^ 누락하면 컴파일 오류
 ```
 
-#### 회원 검색 페이지 패턴 (검증됨)
+#### 회원 검색 페이지 패턴 (검증됨, 2026-05-06 갱신)
 
-`useMembers` + 탭바 + 카드 그리드 + 프로필 모달 + `useCreateChatRoom` 흐름:
+`useMembers` + 탭바 + 카드 그리드 + **SELLER 카드 클릭 시 상세 페이지 라우팅** + `useCreateChatRoom` 흐름. 기존에는 모든 카드 클릭이 동일한 프로필 모달을 열었으나, 시중 농산물 B2B 사이트(비셀러·farmtc365 등) 패턴에 맞춰 **판매자 카드만 별도 상세 페이지로 분리**하고 모달은 제거됐다. 구매자 카드는 클릭 자체를 비활성화(액션 버튼은 유지).
 
 ```typescript
 // hooks/useMembers.ts
@@ -871,11 +873,14 @@ const handleRoleChange = (role: SearchRole) => {
 
 카드 그리드 패턴:
 ```tsx
-// 이메일 표시 안 함 — 카드에도, 모달에도 이메일 항목 없음
-// 아바타: 이미지 없으면 이름 첫 글자 원형 (bg-primary-100 text-primary-700)
-// 카드 클릭 → 모달, 채팅하기 버튼 클릭 → e.stopPropagation() 후 채팅방 생성
+// 카드 자체 클릭: SELLER 카드만 상세 페이지(`{basePath}/members/[userId]`)로 라우팅.
+// BUYER 카드는 onCardClick 미전달 → cursor-default + 키보드 포커스 비활성.
+// 채팅하기/거래처 추가 버튼은 카드 클릭과 충돌하지 않도록 e.stopPropagation() 사용.
 <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-  {members.map((member) => <MemberCard key={member.id} ... />)}
+  {members.map((member) => {
+    const onCardClick = member.role === 'SELLER' ? handleSellerDetail : undefined;
+    return <MemberCard key={member.id} onCardClick={onCardClick} ... />;
+  })}
 </div>
 ```
 
@@ -883,9 +888,25 @@ const handleRoleChange = (role: SearchRole) => {
 ```typescript
 createChatRoom.mutate(
   { partner_user_id: userId },
-  { onSuccess: () => { setSelectedUserId(null); router.push('/seller/chat'); } }
+  { onSuccess: () => router.push('/seller/chat') }
 );
 ```
+
+##### 판매자 상세 페이지 — `components/members/SellerProfileView.tsx` (검증됨, 2026-05-06)
+
+판매자 카드 클릭 시 진입하는 상세 페이지. seller/buyer 양쪽 라우트(`/{role}/members/[userId]`)가 동일 컴포넌트를 `basePath` prop 으로 분기 재사용 — 주문 상세(`OrderDetailView`)와 동일한 "공통 뷰 + 얇은 페이지 래퍼" 패턴.
+
+구성 (시중 농산물 B2B 사이트 패턴 채택):
+1. **헤더**: 큰 프로필 이미지(또는 이름 첫글자 fallback) + 역할 배지 + 거래처 상태 배지 + 회사명/담당자 + 등록 상품 수/가입일 요약 + 채팅하기·거래처 액션 버튼
+2. **회사 정보 카드**: 업체명/담당자/연락처/이메일/가입일/등록 상품 수 (아이콘 + 라벨/값 그리드)
+3. **판매 상품 섹션**: 카테고리 필터 칩 + `useProducts({ seller_id })` 그리드. 카드 클릭은 `basePath === '/buyer'` 일 때만 `/buyer/browse/[productId]` 상세로 라우팅(seller 시점에선 비활성).
+
+데이터 소스:
+- `useMemberProfile(userId)` — `/users/{id}/profile`
+- `useProducts({ seller_id: userId, category })` — 백엔드 `GET /products` 는 SELLER 호출 시 `seller_id` 미지정만 자기 자신으로 강제, 명시적 `seller_id` 는 그대로 적용되므로 양쪽 시점 모두 정상 동작
+- `usePartnerStatusMap()` + `usePartners()` — 거래처 상태 배지 + PENDING_INCOMING 시 `partner.id` 매핑
+
+거래처 액션 권한: `member.role !== myRole && member.role !== 'ADMIN'` 일 때만 거래처 버튼 노출 (회원 카드와 동일 규칙).
 
 백엔드 `GET /users/search` — `role` 쿼리 파라미터:
 - role 명시 시: 해당 역할(SELLER|BUYER)로 검색

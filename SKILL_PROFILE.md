@@ -131,3 +131,8 @@ async def update_me(
 - `email` 수정은 Supabase Auth를 통해야 함 — PATCH /users/me에서 제외
 - RLS: `users` 테이블에서 `auth.uid() = supabase_uid` 조건 필수
 - 이미지 업로드 시 파일 크기 제한 5MB, 형식: jpg/png/webp
+
+---
+
+## 다른 사용자의 공개 프로필 조회 (V1, 2026-05-06)
+회원 검색 카드에서 SELLER 카드를 클릭하면 `/{role}/members/[userId]` 상세 페이지로 이동한다. 이 페이지는 `GET /users/{id}/profile` (`UserPublicProfile`) + `GET /products?seller_id=...` 를 결합해 판매자 정보 + 판매 상품 목록을 한 화면에 표시한다. 구현 상세와 컴포넌트 구조는 SKILL_FRONTEND.md "회원 검색 페이지 패턴" / "판매자 상세 페이지" 섹션 참고.
