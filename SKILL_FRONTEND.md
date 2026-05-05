@@ -62,7 +62,7 @@ frontend/
 ├── store/
 │   ├── authStore.ts                ← user, setSession, logout (탭별 격리 persist)
 │   ├── aiChatStore.ts              ← AI 대화 turns(최대 100), localStorage persist (글로벌)
-│   └── uiStore.ts                  ← aiPanelOpen, toggleAIPanel (사이드바 state 없음 — 호버 전용)
+│   └── uiStore.ts                  ← aiPanelOpen(초기값 true, persist 미사용), toggleAIPanel (사이드바 state 없음 — 호버 전용)
 ├── types/
 │   ├── user.ts                     ← User, UserRole
 │   └── api.ts                      ← SuccessResponse<T>, ErrorResponse
@@ -356,6 +356,8 @@ useEffect(() => {
 **"맨 밑으로 내리기" 동그란 버튼** — 입력창 영역(`relative`) 안에 `absolute -top-5 left-1/2 -translate-x-1/2` 로 입력창 바로 위 중앙에 배치. `isAtBottom || turns.length === 0` 일 때 `pointer-events-none opacity-0` 으로 숨김, 그 외에는 `opacity-100` + `transition-opacity duration-200` 로 부드럽게 노출. 스타일: `h-9 w-9 rounded-full border border-gray-200 bg-white text-gray-600 shadow-md hover:bg-gray-50 hover:text-primary-600`. 아이콘은 `lucide-react` 의 `ChevronDown h-4 w-4`.
 
 **페이지 전환 시 위치 유지**: AppLayout 이 `(dashboard)/layout.tsx` 에 마운트되어 있어 AIChatPanel 은 (dashboard) 그룹 내 라우트 변경에서 unmount 되지 않는다. 즉 컴포넌트 자체가 영속이며, 위 effect 들은 마운트가 아닌 `aiPanelOpen` 토글이나 turns 변화에만 반응한다. `messagesContainerRef.scrollTop` 자체도 라우트 전환 사이에 보존된다 — 별도의 store 저장 불필요.
+
+**기본 펼침 상태 (검증됨, 2026-05-04)**: `uiStore.ts` 의 `aiPanelOpen` 초기값은 `true`. 새로고침 / 첫 진입 시 항상 펼쳐진 상태로 시작한다. uiStore 는 zustand persist 를 사용하지 않으므로 매 새로고침마다 이 초기값으로 reset 된다. 사용자가 명시적으로 접더라도 새로고침 후에는 다시 펼쳐진다. 만약 향후 persist 를 도입한다면 `aiPanelOpen` 은 partialize 에서 제외해야 동일한 동작을 보장한다.
 
 ---
 

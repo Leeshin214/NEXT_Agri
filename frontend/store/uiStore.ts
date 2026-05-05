@@ -22,7 +22,9 @@ interface UIState {
 }
 
 export const useUIStore = create<UIState>()((set) => ({
-  aiPanelOpen: false,
+  // 페이지 새로고침 / 첫 진입 시 항상 펼쳐진 상태로 시작.
+  // (persist 를 사용하지 않으므로 매 새로고침마다 이 초기값으로 reset 된다.)
+  aiPanelOpen: true,
   toggleAIPanel: () => set((state) => ({ aiPanelOpen: !state.aiPanelOpen })),
   setAIPanelOpen: (aiPanelOpen) => set({ aiPanelOpen }),
 
