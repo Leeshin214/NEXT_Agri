@@ -178,9 +178,14 @@ CREATE TABLE chat_rooms (
   last_message TEXT,
   last_message_at TIMESTAMPTZ,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at   TIMESTAMPTZ DEFAULT NULL  -- 2026-05-06 추가 (마이그레이션 20260506000001)
 );
 ```
+- 주문 취소 시 `order_service.cancel_order` 가 연결된 chat_rooms 를 soft-delete (`deleted_at = NOW()`).
+  `cancel_order` 한 경로에서만 처리하므로 `respond_cancel_request(approve)` 도 자동 커버.
+- `list_rooms` 쿼리는 `.is_("deleted_at", None)` 필터를 SELLER/BUYER 양쪽 분기에 적용 — 취소된 채팅방은 목록에 노출되지 않는다.
+- messages 는 이력 보존을 위해 그대로 유지 (별도 cascade 없음).
 
 ### messages 테이블
 ```sql
@@ -516,7 +521,7 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 
 ### 주의사항 & 함정
 
-- **deleted_at 컬럼 없는 테이블에 필터 적용 금지**: `order_items, chat_rooms, ai_conversations` 3개 테이블은 운영 DB에 `deleted_at` 컬럼이 없다. `.is_("deleted_at", None)` 적용 시 PostgREST 가 `column does not exist` 오류를 던진다. order_items 는 부모 orders 의 soft delete 로 간접 차단된다.
+- **deleted_at 컬럼 없는 테이블에 필터 적용 금지** (2026-05-06 갱신, chat_rooms 는 더 이상 해당 안 됨): `order_items, ai_conversations` 등 일부 테이블은 운영 DB에 `deleted_at` 컬럼이 없다. `.is_("deleted_at", None)` 적용 시 PostgREST 가 `column does not exist` 오류를 던진다. order_items 는 부모 orders 의 soft delete 로 간접 차단된다. chat_rooms 는 2026-05-06 마이그레이션으로 `deleted_at` 추가 — 이제 필터 사용 가능.
 
 - **JSONB 부분 업데이트용 SECURITY DEFINER 함수 (검증됨, 2026-04-27)**: `messages.metadata` 같은 JSONB 컬럼의 특정 키만 갱신해야 할 때, `jsonb_set()` 을 호출하는 RPC 함수를 마이그레이션으로 등록하면 한 번의 UPDATE 로 처리된다. fetch → mutate → update 패턴 (3 round-trip) 보다 훨씬 빠르고 race-free. SECURITY DEFINER 로 작성해 service_role 호출 시 RLS 우회.
   ```sql
@@ -688,6 +693,31 @@ INSERT INTO products (seller_id, name, category, origin, spec, unit, price_per_u
 - **service-role-only INSERT 테이블 패턴 (notifications, 2026-04-29)**: 서버 내부에서만 emit 하고 클라이언트 직접 INSERT 를 차단하려면 RLS 에서 INSERT 정책 자체를 정의하지 않으면 된다 (SELECT/UPDATE 만 정의). PostgreSQL 의 RLS 는 화이트리스트 모델이라 정책이 없으면 anon/authenticated 는 INSERT 불가, service_role 은 RLS 우회로 INSERT 가능. notifications 테이블이 이 패턴의 첫 적용 사례 — 알림 INSERT 는 항상 백엔드 서비스(`notification_service.emit`)를 거치고 외부 노출 엔드포인트(`POST /notifications`) 를 두지 않는다. SELECT 는 본인만 (`user_id IN (SELECT id FROM users WHERE supabase_uid = auth.uid())`), UPDATE 도 동일.
 
 - **soft delete 컬럼 보유 테이블 갱신 (2026-04-29)**: `deleted_at` 보유 = `users, products, partners, orders, calendar_events, messages, subscriptions` (7개). `deleted_at` 미보유 = `order_items, chat_rooms, ai_conversations, subscription_items, negotiation_history, delivery_date_change_history, notifications`. 알림은 일시성 데이터라 soft delete 미적용 — 향후 TTL/archive 정책 추가 시 재검토.
+
+- **soft delete 컬럼 보유 테이블 갱신 (2026-05-06, chat_rooms 추가)**: 마이그레이션 `20260506000001_add_deleted_at_to_chat_rooms.sql` 로 `chat_rooms.deleted_at` 추가. 갱신된 분류 — `deleted_at` 보유 = `users, products, partners, orders, calendar_events, messages, subscriptions, chat_rooms` (8개). `deleted_at` 미보유 = `order_items, ai_conversations, subscription_items, negotiation_history, delivery_date_change_history, notifications, order_cancel_requests`. 이전 함정 ("chat_rooms 에 deleted_at 컬럼 없음 → 필터 적용 금지") 은 무효화됨 — 이제 `chat_rooms` 도 `.is_("deleted_at", None)` 필터 정상 동작.
+  - 주문 취소 시 cascade soft-delete 흐름: `order_service.cancel_order` → DB UPDATE → `_sync_calendar_events_for_order` → 채팅 ORDER_CANCELLED 메시지 emit → 연결된 chat_rooms soft-delete.
+  - `respond_cancel_request(approve)` 는 내부에서 `cancel_order` 를 호출하므로 추가 작업 불필요.
+  - 채팅방 soft-delete 실패는 best-effort (try/except + print log) — 취소 트랜잭션 자체는 성공.
+  - `_ensure_chat_room_for_order` 의 채팅방 검색 로직은 chat_rooms.deleted_at 필터 미적용 — 시스템 메시지(ORDER_CANCELLED) 발송 후 같은 트랜잭션 내에서 soft-delete 하기 때문에 의도된 순서. messages 자체는 chat_rooms.deleted_at 와 무관하게 보존.
+
+- **고아 chat_rooms 방어 — orders.deleted_at 가 set 됐지만 chat_rooms.deleted_at 가 NULL 인 경우 (2026-05-05 chat_service.list_rooms 패치)**: `order_service.cancel_order` 가 chat_rooms 까지 cascade soft-delete 하지만 실패는 best-effort 라 try/except 로 묵살된다. 또한 향후 다른 경로(예: 운영 스크립트 / 직접 SQL)로 orders 만 soft-delete 되는 케이스도 있어, chat_rooms 만 보고 목록을 만들면 "주문은 사라졌는데 채팅방은 남아있는" 고아 row 가 채팅 목록에 노출된다. 해결: `chat_service.list_rooms` 에서 1차 필터(`chat_rooms.deleted_at IS NULL`)를 통과한 rooms 의 `order_id` 를 모아 `orders` 테이블을 batch 조회 후 `deleted_at IS NOT NULL` 인 주문과 연결된 방을 메모리에서 제외.
+  ```python
+  order_ids_for_filter = list({r["order_id"] for r in rooms if r.get("order_id")})
+  if order_ids_for_filter:
+      deleted_orders_result = await asyncio.to_thread(
+          lambda: self.client.table("orders")
+          .select("id")
+          .in_("id", order_ids_for_filter)
+          .not_.is_("deleted_at", None)   # PostgREST: NOT IS NULL
+          .execute()
+      )
+      deleted_order_ids = {o["id"] for o in (deleted_orders_result.data or [])}
+      rooms = [r for r in rooms if r.get("order_id") not in deleted_order_ids]
+  ```
+  - SELLER/BUYER 분기의 fetch 결과가 모두 동일 `rooms` 변수로 합류하는 지점에 한 번만 적용 — 양 분기에 중복 코드 둘 필요 없음.
+  - PostgREST `not_.is_("deleted_at", None)` = `deleted_at IS NOT NULL` (Python 클라이언트의 `.not_` 체이닝).
+  - `order_id` 가 NULL 인 채팅방(상품 문의 등 주문 미연결)은 set comprehension 단계에서 제외 → orders 조회 자체에 포함 안 됨.
+  - 동일 패턴 적용 후보: 다른 도메인 리스트 응답에서 부모 row 가 soft-delete 됐는데 자식은 살아있는 경우 (예: subscriptions 가 soft-delete 됐을 때 관련 calendar_events / orders 노출). 향후 cascade 보강 누락 가능성 대비 방어층으로 사용.
 
 - **LLM 추론 category ↔ DB 저장 category 불일치 fallback 패턴 (2026-05-02, agent_tools.find_sellers_by_product 버그 수정)**: AI 도우미 도구가 `category` 인자를 받아 PostgREST 쿼리에 `eq("category", ...)` 로 박을 때, LLM 이 사용자 발화("옥수수 판매자 찾아줘")에서 추론한 카테고리(예: `GRAIN`)와 실제 DB 에 저장된 카테고리(예: `VEGETABLE`)가 어긋나면 결과가 0건이 되어 LLM 이 "판매자 없음"으로 잘못 응답한다. CHECK 제약이 13종으로 넓고(`fruit/vegetable/grain/...` 외 한국어 카테고리 포함), 동일 품목도 판매자별로 다른 카테고리로 등록될 수 있어 발생. 검증된 fallback 패턴 — 1차 조회 결과가 비어있고 category 가 `ALL` 이 아니면 category 필터만 제거하고 `product_name ilike` + `stock>0` + `deleted_at IS NULL` 로 2차 조회.
   ```python

@@ -784,7 +784,7 @@ pytest-cov==6.0.0
   - `CalendarEventResponse` — `updated_at`, `deleted_at` 추가 (calendar_events 에 deleted_at 컬럼이 마이그레이션으로 추가됨)
   - `CalendarEventResponse` — `order_number: Optional[str]`, `product_name: Optional[str]`, `order_status: Optional[str]` 추가 (2026-04-27). DB 컬럼이 아니라 orders/products 임베딩 결과를 flatten 한 파생 필드. order_id 가 None 이거나 주문이 soft-delete 된 경우 세 필드 모두 None. `order_status` 는 calendar_events.event_type 이 ORDER 로 고정되어 프론트가 색상 구분을 못 하던 문제를 해결하기 위해 orders.status 값을 그대로 노출.
   - `OrderResponse`, `ProductResponse`, `PartnerResponse`, `MessageResponse` — `deleted_at` 추가
-  - `ChatRoomResponse` — `updated_at` 추가 (chat_rooms 는 deleted_at 없음 — 스펙)
+  - `ChatRoomResponse` — `updated_at` 추가. **2026-05-06 갱신**: 마이그레이션 `20260506000001_add_deleted_at_to_chat_rooms.sql` 로 `chat_rooms.deleted_at` 추가됨 → `ChatRoomResponse` 에도 `deleted_at: Optional[datetime] = None` 추가 권장 (현재 미적용 — `list_rooms` 가 이미 필터링해서 None 만 반환하므로 외부 노출은 무해하지만 정합 보강 시 추가).
   - `OrderItemResponse`, `AIConversationResponse` — updated_at/deleted_at 모두 없음 (운영 DB와 정합 — 변경 불필요)
 
 - **Calendar list_events backfill 호출 절대 금지 — mutation 시점 sync 만 사용 (2026-04-27 N+1 폭주 수정)**: 한때 `list_events` 첫 줄에서 `_ensure_order_events_for_user(user_id)` 를 호출해 user 의 모든 주문에 대해 `order_service.sync_calendar_events_for_order_id` 를 순차 실행하는 backfill 패턴이 있었다. 결과:
@@ -1117,7 +1117,8 @@ pytest-cov==6.0.0
   - `order_service.update_status` — 추가 완료
   - `chat_service.list_messages` — 추가 완료
   - `chat_service.mark_as_read` — 추가 완료
-  - `chat_service.list_rooms` — 상대방 user 의 deleted_at 별도 조회로 필터링 (임베디드 조인 deleted_at 자동 적용 안 함)
+  - `chat_service.list_rooms` — 상대방 user 의 deleted_at 별도 조회로 필터링 (임베디드 조인 deleted_at 자동 적용 안 함). 2026-05-06 부터 `chat_rooms.deleted_at` 자체 필터도 SELLER/BUYER 양쪽 분기에 추가됨 (주문 취소 시 cascade soft-delete 와 정합).
+  - `chat_service.delete_room(room_id)` — 신규 메서드 (2026-05-06). `order_service.cancel_order` 에서 호출되어 취소된 주문의 채팅방을 soft-delete.
   - `ai_context.build_seller_context` / `build_buyer_context` — calendar_events 조회 추가 완료
 
 - **calendar_events 동기화 — order×user 당 active 1개 불변 보장 (2026-04-27 중복 누적 버그 수정)**: `order_service._sync_calendar_events_for_order_sync` 의 기존 구현은 user_id 단위로 매번 서브쿼리를 돌렸지만, 같은 (order_id, user_id) 안에서 event_date 가 다른 잔존 row 를 정리하지 못했고 race condition 에도 취약했다. DB 의 partial unique index `uniq_calendar_events_active_order_user_date` (SKILL_DB.md 참조) 와 함께 동작하도록 다음 패턴으로 견고화한다.

@@ -6,9 +6,12 @@ export interface ChatRoom {
   last_message: string | null;
   last_message_at: string | null;
   created_at: string;
+  updated_at: string;
   partner_name: string | null;
   partner_company: string | null;
   unread_count: number;
+  order_number?: string | null;
+  first_product_name?: string | null;
 }
 
 /**

@@ -535,7 +535,7 @@ def send_chat_message(
 5. 후보 0개 → `order_id IS NULL` 일반 채팅방 fallback. 그것도 없으면 `{success: False, error: "no_chat_room"}` (open_chat_room 으로 먼저 만들라는 안내)
 
 후보 검색 (`_resolve_chat_room_candidates`):
-- `chat_rooms` 에는 `deleted_at` 컬럼이 없다 — `deleted_at IS NULL` 필터 금지 (PostgREST `column does not exist` 에러)
+- `chat_rooms.deleted_at` 컬럼은 2026-05-06 마이그레이션으로 추가됨. 후보 검색 쿼리에는 `.is_("deleted_at", None)` 필터를 추가해 주문 취소된 방을 제외하는 것이 권장된다 (필터 누락 시 LLM 이 취소된 거래의 옛 채팅방을 후보로 제시할 수 있음).
 - 양방향 매칭: `or_("and(seller_id.eq.A,buyer_id.eq.B),and(seller_id.eq.B,buyer_id.eq.A)")` UUID 만 들어가므로 인용 불필요
 - orders 임베딩으로 status / order_items / products(name, unit) 조회
 - `orders.deleted_at IS NOT NULL` 또는 `status='CANCELLED'` 인 방은 주문 정보 무시 (일반방으로 격하)
@@ -1009,6 +1009,7 @@ const rooms = roomsData?.data ?? [];
 - `ChatRoomList.tsx` — 검색 인풋 + 미읽 필터 토글 + 그룹 목록. 양쪽 페이지에서 공통 사용
 - `ChatRoomGroup.tsx` — 거래처 단위 그룹 헤더 (펼침/접힘 토글, 펼침 기본값 true) + 하위 방
 - `ChatRoomItem.tsx` — 단일 방 카드. order_id 유무로 Package(주문 채팅) / MessageSquare(일반 대화) 아이콘 분기. nested=true 면 좌측 보더 + 들여쓰기
+  - **subLabel 결정 (2026-05-05)**: 주문방이면 `room.first_product_name ?? room.order_number ?? '주문 채팅'` 순으로 fallback. 같은 거래처 내 여러 주문방을 한눈에 구분하기 위함. 백엔드 `/chat/rooms` 응답이 `order_number`, `first_product_name` 을 포함해야 동작 (둘 다 `ChatRoom` 인터페이스에서 optional `string | null`).
 
 #### 그룹핑 로직 (frontend/lib/chatGrouping.ts)
 순수 함수 `groupChatRoomsByPartner(rooms, myRole)` 가 백엔드 호출 없이 클라이언트에서 묶는다.
@@ -1276,7 +1277,7 @@ StatusBadge + ChevronDown 버튼으로 표시되고, 클릭 시 다음으로 전
 
 #### 컨텍스트 빌드 흐름 (draft_service.generate_chat_draft)
 
-1. `_fetch_chat_room(room_id)` — chat_rooms 단건 조회 (chat_rooms 에 `deleted_at` 컬럼 없음, 필터 금지)
+1. `_fetch_chat_room(room_id)` — chat_rooms 단건 조회. 2026-05-06 부터 `chat_rooms.deleted_at` 존재. 권한 검증 진입 자체를 차단하려면 `.is_("deleted_at", None)` 필터를 추가해 취소된 방으로의 답장 초안 생성을 막는 것이 권장된다.
 2. 권한 검증 — `user_id` 가 seller_id/buyer_id 둘 중 하나여야 함
 3. 병렬 fetch (`asyncio.gather`):
    - `_fetch_user(my_id)` — 본인 이름/회사명/역할
@@ -1298,7 +1299,7 @@ StatusBadge + ChevronDown 버튼으로 표시되고, 클릭 시 다음으로 전
 
 #### 주의사항 & 함정
 
-- **chat_rooms.deleted_at 필터 금지** — 운영 DB 정합 (SKILL_DB.md 검증 패턴). `_fetch_chat_room` 에서는 `.is_("deleted_at", None)` 적용 안 함, `_fetch_user`/`_fetch_recent_messages`/`_fetch_order_summary` 에는 적용.
+- **chat_rooms.deleted_at 처리 (2026-05-06 갱신)** — 마이그레이션 `20260506000001_add_deleted_at_to_chat_rooms.sql` 로 컬럼 추가됨. 이전의 "필터 금지" 가이드는 무효. `_fetch_chat_room` / `list_rooms` / chat 도구 후보 검색 모두 `.is_("deleted_at", None)` 필터 적용 가능. 주문 취소(`order_service.cancel_order`) 시 연결된 chat_rooms 가 자동 soft-delete 된다.
 - **order_id 가 None 인 일반 채팅방도 동작해야 함** — `asyncio.ensure_future(asyncio.sleep(0, result=None))` 로 placeholder Future 를 만들어 gather 시그니처 통일.
 - **메시지 테이블 INSERT 절대 안 함** — 사용자가 검토 후 직접 발송하는 흐름이라 send_message 호출 금지. 향후 "초안 자동 발송" 기능을 추가하더라도 별도 엔드포인트로 분리할 것.
 - **OpenAI 호출 실패 시 502 + type(e).__name__** — RTT 초과 / 네트워크 에러 / 환각으로 빈 텍스트 반환은 모두 502 로 통일하여 프론트에서 "AI 응답 실패" UX 단일화.
@@ -1363,8 +1364,8 @@ export function useGenerateChatDraft() {
 
 ## 작업 체크리스트
 
-- [ ] FastAPI chat 라우터 (rooms, messages CRUD)
-- [ ] SQLAlchemy ChatRoom, Message 모델
+- [x] FastAPI chat 라우터 (rooms, messages CRUD)
+- [x] SQLAlchemy ChatRoom, Message 모델
 - [ ] Supabase Realtime publication 설정
 - [x] useWebSocketChat 훅 (WS 연결, 재연결, 송수신)
 - [x] useChat 훅 (useChatRooms, useMessagesWithWebSocket 등)
@@ -1374,3 +1375,99 @@ export function useGenerateChatDraft() {
 - [x] 안읽은 메시지 수 뱃지
 - [x] AI 요약 버튼 연동
 - [x] AI 답장 초안 (POST /chat/draft) 백엔드
+
+---
+
+## 실전 발견 사항
+
+### ChatRoom 타입 — 백엔드 ChatRoomResponse 와 1:1 동기화 (2026-05-05)
+
+`frontend/types/chat.ts` 의 `ChatRoom` 인터페이스는 백엔드 `schemas/chat.py` 의 `ChatRoomResponse` 와 필드 단위로 정확히 일치해야 한다. 누락 시 TS 컴파일은 통과하지만 런타임에 `room.updated_at` 등을 참조하는 코드가 `undefined` 를 받는다.
+
+**현재 필수 필드** (백엔드 기준):
+```ts
+id, order_id, seller_id, buyer_id,
+last_message, last_message_at,
+created_at, updated_at,                  // updated_at 누락 빈번 — 주의
+partner_name, partner_company, unread_count,
+order_number?, first_product_name?       // 2026-05-05 추가 (둘 다 optional)
+```
+
+**검증 패턴**: 백엔드 `ChatRoomResponse` 를 수정할 때마다 `frontend/types/chat.ts` 도 같이 본다. validator-agent 가 잡아주지만, 작업 시 항상 양쪽을 같이 열어 diff 비교가 가장 안전하다.
+
+### ChatRoomResponse — 주문 식별 필드 (2026-05-05)
+
+채팅방 목록 화면에서 "주문 채팅" 으로만 표시되어 어떤 주문/상품에 대한 채팅인지 구분이 안 되는 UX 문제 해결을 위해 `ChatRoomResponse` 에 두 필드 추가:
+```python
+order_number: Optional[str] = None         # orders.order_number (예: ORD-20260505-001)
+first_product_name: Optional[str] = None   # 해당 주문의 첫 라인 상품명
+```
+
+**`chat_service.list_rooms` 의 채워넣기 로직 — N+1 회피 패턴**:
+1. `room.order_id` 가 있는 방 목록 수집 (set)
+2. `orders` 한 번에 IN 절로 조회 → `{id: order_number}` 맵 작성
+3. `order_items` 한 번에 IN 절로 조회 + **`product:products(name, deleted_at)` FK 임베딩** + `order("created_at", desc=False)` — 첫 라인 추출용
+4. 메모리에서 order_id 별 첫 라인의 product.name 만 픽업 (이미 ASC 정렬이라 `if oid not in first_item_map:` 체크로 충분)
+5. soft-deleted 상품은 스킵 → 다음 라인이 채워짐
+
+```python
+items_result = await asyncio.to_thread(
+    lambda: self.client.table("order_items")
+    .select("order_id, created_at, product:products(name, deleted_at)")
+    .in_("order_id", order_ids)
+    .order("created_at", desc=False)
+    .execute()
+)
+first_item_map: dict[str, str] = {}
+for item in (items_result.data or []):
+    oid = item.get("order_id")
+    if not oid or oid in first_item_map:
+        continue
+    product = item.get("product") or {}
+    if product.get("deleted_at"):
+        continue
+    name = product.get("name")
+    if name:
+        first_item_map[oid] = name
+```
+
+**핵심 함정**: `order_items` 테이블에는 `product_name` 컬럼이 없다 (SKILL_DB.md 의 schema 참조 — `product_id` FK 만 존재). 처음 작업 지시에 `select("order_id, product_name")` 같은 잘못된 컬럼이 들어있어도 그대로 적용하면 PostgREST 가 `column does not exist` 오류를 던진다. **반드시 마이그레이션 / SQLAlchemy 모델로 컬럼 존재 여부를 사전 확인**한 뒤 FK 임베딩 패턴(`product:products(name)`)으로 우회한다.
+
+### 주문 취소 → 채팅방 cascade soft-delete (2026-05-06, 마이그레이션 20260506000001)
+
+주문 취소 시 연결된 채팅방을 자동으로 정리해 활성 거래만 채팅 목록에 노출하기 위한 흐름.
+
+**마이그레이션**: `chat_rooms` 에 `deleted_at TIMESTAMPTZ DEFAULT NULL` 컬럼 추가.
+
+**호출 경로 (단일 진입점)**:
+- `order_service.cancel_order(order_id, reason, user)` 한 곳에서만 처리.
+- `respond_cancel_request(approve)` 는 내부에서 `cancel_order` 를 호출 → 자동 커버.
+- 따라서 cancel_order 한 곳에 cascade soft-delete 로직 추가만으로 두 경로 모두 처리됨.
+
+**cancel_order 내부 순서** (중요 — ORDER_CANCELLED 메시지 발송이 채팅방 soft-delete 보다 먼저):
+1. orders.status = 'CANCELLED' UPDATE
+2. `_sync_calendar_events_for_order` — 캘린더 일정 정리
+3. `_emit_chat_event(message_type="ORDER_CANCELLED")` — 채팅에 시스템 메시지 발송 (사용자가 마지막 상태를 볼 수 있도록)
+4. `chat_rooms` 조회 (`order_id == cancelled_order` AND `deleted_at IS NULL`) → 각각 `chat_service.delete_room(id)` 호출
+
+**`chat_service.delete_room(room_id)`**:
+```python
+async def delete_room(self, room_id: UUID | str) -> None:
+    deleted_at = datetime.now(timezone.utc).isoformat()
+    await asyncio.to_thread(
+        lambda: self.rooms.update({"deleted_at": deleted_at})
+        .eq("id", str(room_id)).execute()
+    )
+```
+- 멱등성: 이미 삭제된 row 도 timestamp 가 갱신될 뿐 동작 자체는 안전.
+- 실패는 best-effort (try/except + print log) — 취소 트랜잭션 자체에 영향 없음.
+
+**`list_rooms` 필터**: SELLER/BUYER 양쪽 분기 모두 `.is_("deleted_at", None)` 추가 → 취소된 방은 목록에서 즉시 사라짐.
+
+**messages 보존**: 채팅방 soft-delete 시 messages 는 그대로 둔다 (이력 보존). 메시지 단건 직접 조회는 여전히 가능 — 단, list_messages 진입 자체가 채팅방 목록을 거치지 않으므로 별도 cascade 불필요.
+
+**기존 채팅방 검색 패턴 영향**:
+- `_resolve_chat_room_candidates` (LLM 도구) — 취소된 방을 제외하려면 `.is_("deleted_at", None)` 필터 추가 권장.
+- `get_or_create_room` — 양 당사자가 같은 (seller_id, buyer_id, order_id) 조합으로 다시 채팅 시작하면 soft-deleted 방이 검색에 잡혀 그대로 반환될 수 있음. 새 방을 만들고 싶으면 `.is_("deleted_at", None)` 필터를 select 단에 추가해야 함 (현재는 아직 미적용 — 주문 취소 후 같은 order_id 에 대해 재채팅하는 케이스가 거의 없어 후속 과제로 분리).
+
+`order_items` 는 `deleted_at` 컬럼이 없으므로 (SKILL_DB.md 의 "deleted_at 컬럼 없는 테이블에 필터 적용 금지" 함정 참조), 임베딩한 자식 테이블 `products` 의 `deleted_at` 만 명시적으로 검사한다.

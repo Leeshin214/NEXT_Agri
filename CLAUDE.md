@@ -2,31 +2,8 @@
 
 ## 작업 처리 원칙
 
-- **코드 수정/구현 요청**: 복잡도/난이도 무관하게 무조건 sub-agent에 위임 (frontend-agent, backend-agent, ai-agent)
-- **일반 질문**: Claude가 직접 처리 (코드 설명, 구조 질문, 상태 확인 등)
-- 단 한 줄 수정이라도 코드를 건드리면 agent를 호출한다
-
-### 코드 검증 워크플로우 (필수)
-
-**코드를 수정하는 모든 작업에서 아래 흐름을 반드시 따른다.**
-
-```
-1. 개발 agent 실행 (frontend-agent / backend-agent / ai-agent)
-   ↓
-2. validator-agent 실행 (개발 agent 완료 직후 항상 실행)
-   ↓
-3A. VALIDATION_PASSED → 사용자에게 결과 답변
-3B. VALIDATION_FAILED → 리포트의 "수정 필요 agent 목록" 을 보고
-                        해당 agent에 수정 지시 → 2번으로 돌아감
-                        (최대 3회 재시도, 이후에도 실패 시 사용자에게 오류 상황 보고)
-```
-
-- validator-agent는 TypeScript 컴파일, Python 문법, 프론트↔백 API 계약 불일치, 타입 불일치를 검사한다
-- 사용자에게 답변할 때는 반드시 `VALIDATION_PASSED` 상태에서만 답변한다
-
-### PM 분석 / 작업 후보 정리
-
-사용자가 "지금 뭐 만들면 좋을까", "X 기능 검토해줘", "사용자 입장에서 부족한 부분", "신규 기능 추천" 같은 PM 성격 요청을 할 때는 `pm-agent` sub-agent 를 호출한다. PM agent 는 코드를 작성하지 않고 진단·계획만 제공하며, README + git log + `.claude/platform-constraints.md` 를 종합해 User Story 형식으로 작업 후보를 정리한다.
+- **모든 작업(코드 수정 포함)**: Claude가 직접 처리한다. sub-agent에 위임하지 않는다.
+- 파일 읽기·수정·생성은 Read, Edit, Write, Bash 도구를 직접 사용한다.
 
 ---
 

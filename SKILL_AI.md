@@ -541,7 +541,53 @@ create_subscription_from_order,
 - `get_calendar_events`: `calendar.monthrange(year, month)[1]`로 말일 계산, `.is_("deleted_at", None)` 패턴 준수
 - `create_calendar_event`: order_id 빈 문자열이면 None으로 저장
 - `find_alternative_partners`: BUYER→products+partners 조인, SELLER→order_items+partners 조인. 정렬 금지, LLM이 추천 순위 생성
-- `get_user_profile`: user_id → username → company_name 우선순위 검색, asyncio 없이 동기 호출
+- `get_user_profile`: **username → company_name → user_id** 우선순위 검색 (2026-05-05 갱신). user_id 는 `username/company_name 모두 비어 있을 때만` 폴백 동작. asyncio 없이 동기 호출. ILIKE 부분 일치는 `limit(5)` 로 쿼리하되 첫 번째 결과만 반환 (동명이인 대비).
+
+#### 도구 `_response_guide` 작성 패턴 — 번호 매기기 강제 (2026-05-05 추가)
+- 목록형 결과(판매자/구매자/거래처 상위 N개)를 LLM이 응답으로 풀어 쓸 때, "상위 5개만 노출" 같은 추상적 지시만 주면 번호 매기기를 자주 누락한다 (예: 단순 줄바꿈 나열, "•" 불릿, "첫째/둘째" 자연어).
+- 해결: 번호 형식을 **숫자 예시까지 직접 나열**해서 강제한다. "상위 5개" 가 아니라 "**1. 2. 3. 4. 5. 번호를 붙여**" 식으로.
+- 검증된 문구 패턴 (`backend/app/services/agent/tools/user.py` find_sellers_by_product / find_buyers_by_product):
+  ```
+  "반드시 상위 5개 판매자를 1. 2. 3. 4. 5. 번호를 붙여 표시하세요. "
+  "판매자가 5개 미만이면 전체를 번호와 함께 표시하세요. "
+  "나머지 판매자는 '외 N개 판매처가 더 있습니다'로 요약하세요."
+  ```
+- 핵심 3요소: ① "**반드시**" 로 강제 ② "1. 2. 3. 4. 5." 처럼 **숫자 자체를 프롬프트에 박아둠** ③ N개 미만 케이스(전체 표시) 명시 — 5개 미만일 때 LLM이 "1. 2. 3." 으로 멈출지 헷갈리는 케이스 사전 차단.
+- 같은 패턴이 필요한 다른 목록형 도구: `get_partners`, `get_orders`, `find_alternative_partners`, `get_chat_rooms`. 응답 가독성 이슈가 보고되면 같은 형식으로 `_response_guide` 를 박는다.
+- ❌ 안티패턴: "보기 좋게 정리하세요" / "구조화해서 답변하세요" / "리스트로 표시하세요" — LLM 해석이 매번 달라짐.
+
+#### 목록 도구 데이터 모델 — 엔티티 우선 조회 (users-first) 원칙 (2026-05-05 추가)
+- 문제: `find_sellers_by_product` 가 처음에는 `products` 테이블을 먼저 조회하고 거기서 seller 를 distinct 추출하는 구조였음. 결과:
+  - `count` 필드가 **상품 수**가 되어 LLM 이 "판매자 N명" 으로 잘못 안내. (상품을 여러 개 등록한 판매자가 있으면 부풀려짐)
+  - 카테고리 필터에 걸리는 상품이 0건인 판매자는 응답에서 사라져, "전체 판매자 수" 안내 자체가 불가능.
+  - flat list (각 행 = 상품) 라 LLM 이 응답 단계에서 seller_name 으로 다시 그룹핑해야 했음.
+- 해결: **users 테이블을 1차 소스로** 두고 products 를 부가 정보로 join.
+  1. `users` 에서 `role=SELLER, is_active=true, deleted_at IS NULL` 전체 조회 → 이게 `seller_count`.
+  2. `products` 를 `seller_id IN (...)` 으로 필터 + category/product_name 부가 필터 → grouping by seller_id.
+  3. 응답 형태: `{seller_count, sellers: [{seller_id, seller_name, seller_company, seller_phone, products: [...]}]}` — 판매자 단위로 이미 그룹핑된 nested 구조.
+- 효과:
+  - `seller_count` 가 진짜 판매자 수 → 첫 문장 안내가 정확해짐.
+  - LLM 이 그룹핑 안 해도 nested 구조 그대로 풀어쓸 수 있어 토큰/지연 절약.
+- 동일 원칙 적용 후보: `find_buyers_by_product` (현재는 order_items 기반이라 buyer 0건 케이스 누락). 향후 "전체 바이어 N명 중 X명이 이 카테고리 구매 이력 보유" 형식이 필요하면 같은 리팩터링.
+- `_response_guide` 변경: `count` → `seller_count` 표현으로 일관성 맞춤. nested products 배열을 들여쓰기 나열.
+
+#### 목록 도구 응답 — 검색 조건 미매칭 항목 제외 원칙 (2026-05-05 갱신)
+- 문제: `find_sellers_by_product(category=MEAT, product_name=삼겹살)` 호출 시, 3단계 그룹화 루프가 `seller_ids` 전체를 순회하며 매칭 상품이 없는 판매자도 `products: []` 인 채로 결과에 포함시켰다. LLM 이 "삼겹살을 파는 판매자" 를 묻는 사용자에게 삼겹살을 안 파는 판매자까지 "등록된 상품 없음" 으로 길게 나열함.
+- 해결 (`backend/app/services/agent/tools/user.py` find_sellers_by_product 3단계 루프):
+  ```python
+  for sid in seller_ids:
+      seller_products = products_by_seller.get(sid, [])
+      if not seller_products:
+          continue  # 검색 조건에 매칭되는 상품이 없으면 응답에서 제외
+      ...
+      sellers_with_products.append({..., "products": seller_products})
+  return {"seller_count": len(sellers_with_products), ...}  # 전체 SELLER 수가 아닌 결과 수
+  ```
+- 핵심 원칙 3가지:
+  1. **검색 조건(category/product_name)으로 필터링한 결과에서 매칭 0건 항목은 응답에서 제외**. "전체 카탈로그 보여주기" 가 아니라 "검색 결과 보여주기" 가 도구 의도.
+  2. `seller_count` 같은 카운트 필드는 **응답 배열 길이와 일치**시켜야 한다. `len(all_sellers)` (전체 SELLER 수) 가 아니라 `len(sellers_with_products)` (실제 매칭 수). LLM이 첫 문장에 안내하는 숫자 = 사용자가 결과에서 직접 셀 수 있는 숫자.
+  3. `_response_guide` 의 표시 규칙도 데이터 형태와 일치해야 한다. 빈 항목을 응답에서 제외했다면 "상품이 없는 판매자는 '등록된 상품 없음'으로 표시하세요" 같은 빈 케이스 처리 지시는 함께 제거. 안 그러면 LLM이 가이드를 보고 가짜 빈 항목을 만들어낼 수 있음.
+- 적용 대상: `find_sellers_by_product` 적용 완료. `find_buyers_by_product` 는 이미 order_items 기반이라 0건 자동 제외됨. 다른 nested 그룹화 도구 추가 시 같은 패턴 따를 것.
 
 ### 주의사항 & 함정
 
@@ -671,7 +717,8 @@ create_subscription_from_order,
   8. "견적 요청" / "들어온 견적" → `status_in=["QUOTE_REQUESTED"]`
   9. **상태 미명시** ("주문 보여줘" / "주문 목록") → 진행 중 기본값 (5상태). 완료/취소는 사용자가 명시 요청해야 포함.
 - 응답 표시 규칙 핵심 (환각 방지 5종):
-  - status enum 한글 매핑 고정: `QUOTE_REQUESTED→"견적 요청"`, `NEGOTIATING→"협상 중"`, `CONFIRMED→"주문 확정"`, `PREPARING→"준비 중"`, `SHIPPING→"배송 중"`, `COMPLETED→"완료"`, `CANCELLED→"취소"`. 임의 표현("협상 요청 중", "상태 없음", "검토 중", "보류") 금지.
+  - status enum 한글 매핑 고정: `QUOTE_REQUESTED→"견적 요청"`, `NEGOTIATING→"협상 중"`, `CONFIRMED→"주문 확정"`, `PREPARING→"출하 준비"`, `SHIPPING→"배송 중"`, `COMPLETED→"완료"`, `CANCELLED→"취소"`. 임의 표현("협상 요청 중", "상태 없음", "검토 중", "보류") 금지. (2026-05-05 갱신: `PREPARING` 한글 표현을 "준비 중" → "출하 준비" 로 통일. UI/캘린더와 어휘 일치.)
+  - **상태 표시 형식 강제**: 주문 상태 언급 시 반드시 `"[상태명] 상태"` 로 표기 (예: "주문 확정 상태입니다", "출하 준비 상태입니다"). "협상 중이며", "준비 상태로" 같이 상태명을 문장에 녹여 모호하게 표현하면 사용자가 어떤 enum 인지 헷갈린다. AGENT_BASE_SYSTEM + response_node 양쪽 매핑 직후 한 줄로 박음.
   - 도구가 반환하지 않은 주문은 절대 응답에 포함 금지 — 컨텍스트 메모리/이전 대화에 옛 주문이 기억나도 출력 X. 사용자가 직접 묻지 않은 다른 주문(어제 본 견적, 옛 참치 주문)을 끌어와 답하지 말 것.
   - 0건이면 "현재 진행 중인 주문이 없습니다" 또는 "조회된 주문이 없습니다" 만 안내. 거래처 추천·다른 카테고리 주문·상품 정보 늘어놓지 말 것.
   - 마크다운 강조·표·헤더 금지(가독성 일관). 자연체 한국어 + 필요 시 `1.` 번호.
@@ -705,6 +752,39 @@ create_subscription_from_order,
 - **핵심 교훈 — 결정 트리는 매핑 가이드와 분리해서 독립 섹션으로 박아야 LLM 이 따라간다**: 자연어 → 도구 매핑 섹션 안에 "후보 여러 개면 되묻기" 가이드를 같이 박아두면 LLM 이 매핑 규칙만 보고 결정 트리는 무시한다. 결정 트리(0/1/N 분기)는 별도 섹션 + 각 단계에 헤더([1단계], [2단계], [3단계])를 박고 각 분기마다 구체 발화 예시까지 같이 넣어야 LLM 이 단계별로 검토한다. 매핑 가이드는 "어느 도구를 부르라"이고, 결정 트리는 "그 도구의 인자를 어떻게 정하라"이므로 관심사가 다름 → 분리가 자연스럽다.
 - **핵심 교훈 — order_id 같은 UUID 인자는 schema description 에 결정 절차까지 박아야 LLM 준수율 최대화**: 본문 프롬프트만으로는 LLM 이 모호한 발화에서 임의로 한 후보를 선택하는 환각이 자주 발생. tool_call 인자 생성 직전에 LLM 이 다시 읽는 schema description 에 "0개/1개/2개+ 분기 + 임의 추측 금지" 절차를 박으면 schema 가 1차 방어선이 되고 본문 프롬프트가 보조한다. (이전 작업에서 검증된 패턴: seller_id 환각 차단 시에도 schema description 강화가 본문보다 효과 컸음. 이번 order_id 도 동일 패턴 적용.)
 - **핵심 교훈 — 후보 0개 응답에서 "다른 주문 끼워 넣기" 환각이 가장 위험**: 후보 1개/2개+ 분기는 LLM 이 비교적 잘 따라가지만, 후보 0개일 때 GPT-4o-mini 가 "친절을 가장해" 컨텍스트 메모리의 다른 주문 정보를 줄줄이 노출하는 환각이 빈번. "○○ 상품에 대한 협상 가능한 주문이 없습니다" 만 짧게 답하고 끝내라는 단정문을 명시적으로 박아야 함. 이전 [도구 실패 시 응답 가이드] 의 "안 물은 정보 끌어오지 마라" 패턴과 동일 구조 — 환각 방지 가이드는 매번 명시적 단정문이 필요.
+
+#### 카드 도구 후속 개선 — 사전 필터링 → 전체 활성 조회 + force retry 가드 (2026-05-05 추가)
+- 실제 사용자 시나리오 실패: "테스트관리 협상가를 30000으로 제시해줘" → 두 가지 버그가 연쇄되어 엉뚱한 주문(삼겹살)에 협상 실행됨.
+  1. **1단계 사전 필터링의 부작용**: 기존 가이드는 협상가 제시 시 `status_in=["QUOTE_REQUESTED","NEGOTIATING"]` 으로 사전 필터링하라고 지시. 그 결과 사용자의 매칭 상품이 CONFIRMED 상태면 get_orders 결과에서 아예 보이지 않아 "협상 가능한 주문이 없습니다" 라고만 안내됨 — 정확한 상태("이미 CONFIRMED 라 협상 불가") 안내가 불가능했음.
+  2. **`_is_counter_fab` force retry 오인 (orchestrator.py 1188 근방)**: LLM 이 "협상 가능한 주문이 없습니다" 라고 올바르게 답한 경우에도 `_has_orders_result` (get_orders 호출됨) + `submit_counter_offer not in tools_used` 조건만으로 fabrication 으로 판정 → force retry 메시지 주입 → LLM 이 두 번째 라운드에서 컨텍스트의 다른 주문(삼겹살)에 임의로 submit_counter_offer 호출.
+- 적용 위치 (orchestrator.py):
+  - **AGENT_BASE_SYSTEM `[1단계]` 가이드 변경**: 협상/납품일 변경 모두 `status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"]` 로 진행 중 주문 전체를 조회. 사전 필터링 폐기.
+  - **AGENT_BASE_SYSTEM `[2단계]` 보강**: 매칭 후 협상 목적별로 허용 상태를 분리 (협상가 제시: QUOTE_REQUESTED/NEGOTIATING / 납품일 변경: 거기에 +CONFIRMED). 매칭은 됐지만 목적상 불가한 상태(CONFIRMED+, PREPARING, SHIPPING)는 상태 명시해 안내.
+  - **AGENT_BASE_SYSTEM `[3단계 A]` 분기 세분화**: 후보 0개를 (a) "매칭은 됐는데 상태 때문에 불가" — `이미 [상태] 상태라 협상 불가` 명시 안내 (b) "매칭 자체가 0건" — `진행 중인 주문이 없습니다` 안내 두 갈래로 분리.
+  - **`_is_counter_fab` 가드 추가**: `_counter_no_eligible` 변수로 final_text 에 "협상 가능한 주문이 없", "확정 이후", "협상을 진행할 수 없", "협상 요청을 할 수 없", "협상 불가", "이미 확정" 6종 마커 검사 → 하나라도 매칭되면 force retry 차단. `(_has_orders_result and not _counter_no_eligible)` 으로 합성.
+- **핵심 교훈 — "사전 필터링" 은 양날의 검**: status_in 으로 미리 거르면 LLM 이 부적격 주문을 후보로 끌어올 위험은 줄지만, "왜 안 되는지" (상태 때문) 정확한 안내가 불가능해진다. 후보 매칭은 전체 활성 상태로 하고, "허용 상태인지" 는 매칭 이후 별도 분기로 분리하는 것이 사용자 경험 측면에서 더 나음. 0건이라는 똑같은 결과라도 "이미 CONFIRMED 라 불가" 와 "주문 자체가 없음" 은 사용자에게 완전히 다른 정보.
+- **핵심 교훈 — fabrication 가드는 "올바른 부정 답변" 화이트리스트가 필수**: `tools_used` + `tool_results` 만으로 fabrication 을 판정하면 "도구 호출은 했지만 결과가 0건이라 올바르게 거절한 답변" 까지 fabrication 으로 오인된다. force retry 가 트리거되면 LLM 이 두 번째 라운드에서 "이번엔 도구를 호출해야지" 라며 컨텍스트의 무관한 데이터에 도구를 호출하는 더 큰 환각으로 이어진다 → 일종의 자기 강화 환각 루프. 가드 조건에 final_text 의 부정형 마커 화이트리스트(`_counter_no_eligible`)를 박아 "올바른 부정 답변" 을 fabrication 판정에서 제외해야 한다. 다른 fab 가드(`_is_order_fab`, `_is_delivery_fab`)에도 동일 패턴 적용 검토 가치 있음.
+
+#### 카드 도구 force retry 가드 추가 강화 — 화이트리스트 확장 + 0건 명시 + 공백 무시 매칭 (2026-05-05 갱신)
+- 위 가드를 넣었지만 LLM 이 final_text 에 "협상가를 제시할 수 없습니다", "가격 협상이 불가합니다", "확정 상태라 협상" 같이 화이트리스트에 없는 표현을 쓰면 다시 force retry 가 트리거되어 엉뚱한 주문에 submit_counter_offer 가 호출되는 회귀가 재발. 또한 "테스트관리" vs "테스트 관리" 처럼 사용자 발화의 공백 차이만으로 매칭이 실패해 0건 분기로 빠진 뒤, force retry 메시지가 단순히 "후보 1건이면 즉시 호출 / 2건 이상이면 되묻기" 만 지시했기에 LLM 이 컨텍스트의 다른 주문에 호출하는 패턴 재현.
+- 적용 위치 (orchestrator.py):
+  - **`_counter_no_eligible` 마커 7종 추가** (라인 ~1196): 기존 6종 + `"협상가를 제시할 수 없"`, `"가격 협상이 불가"`, `"협상을 할 수 없"`, `"협상이 불가능"`, `"확정 상태라 협상"`, `"출하 준비 단계라 협상"`, `"해당 품목의 협상 가능"`, `"진행 중인 주문이 없"` 7종 추가 → 총 13종.
+  - **`_is_counter_fab` 분기 force retry 메시지 재작성** (라인 ~1224): 0건 케이스를 명시적으로 분기 — `"0건이면 submit_counter_offer를 절대 호출하지 말고 '해당 품목의 협상 가능한 주문이 없습니다…'라고만 답하고 끝내라. 사용자가 언급한 품목과 다른 상품 주문에 절대로 협상가를 제시하지 마라."` 문구 직접 삽입. 즉 force retry 메시지 자체에 "다른 주문에 호출 금지" 규칙을 박아 둠.
+  - **AGENT_BASE_SYSTEM `[2단계]` 매칭 규칙에 공백/대소문자 무시 추가** (라인 ~390): `"테스트관리" = "테스트 관리"`, `"Ssamgyupsal" = "삼겹살"` 등 유사 표기 포함.
+  - **AGENT_BASE_SYSTEM `[금지사항]` 강화** (라인 ~417): "후보가 0개일 때 사용자가 언급하지 않은 다른 상품 주문에 submit_counter_offer를 호출하는 행위 — 사용자가 지시하지 않은 다른 계약에 임의로 개입하는 행위로 절대 금지" 명시. 0건 분기에서의 환각 호출을 본문 + force retry 메시지 + 화이트리스트 3중으로 차단.
+- **핵심 교훈 — 화이트리스트 마커는 LLM 이 실제로 만들어내는 표현으로 채워야 한다**: 가드 마커를 처음 6종 짜리로 박았는데, 실제 운영에서는 LLM 이 같은 의미를 5~10가지 다른 한국어 표현으로 출력. "협상 불가" 만 박으면 "협상가를 제시할 수 없습니다" 가 누락되어 false-positive force retry 가 다시 발생. 마커 화이트리스트는 실제 운영 로그를 봐가며 점진적으로 확장하거나, 아예 LLM 한 번 더 호출해서 "이 응답이 부정 응답인가" 분류시키는 게 안정적. 본 작업에서는 우선 마커 13종으로 확장.
+
+#### chat_node 시스템 프롬프트 동기화 — 카드 도구 결정 트리 ①→②→③ 순서 명시 (2026-05-06 추가)
+- 위 두 가지 카드 도구 가드를 AGENT_BASE_SYSTEM 에는 적용했지만 `chat_node` 의 같은 결정 트리 섹션 (orchestrator.py L1810~1819) 은 여전히 옛 가이드 — `[1단계]` 가 `status_in=['QUOTE_REQUESTED','NEGOTIATING']` 으로 사전 필터링하라고 지시 → CONFIRMED/PREPARING 상태 주문이 처음부터 후보 풀에 들어오지 못해 "이미 확정라 협상 불가" 정확 안내 불가능. chat intent 라우팅이 가장 자주 도구 호출을 트리거하므로 BASE 와 chat_node 양쪽 가이드가 어긋나면 LLM 이 어느 쪽을 따를지 흔들린다.
+- 적용 위치 (orchestrator.py L1812~1817):
+  - **[1단계 — 주문 전체 조회]** 협상가 제시·납품일 변경 모두 `status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING']` 진행 중 전체 조회. "CONFIRMED/PREPARING 포함이 필수 — 이 상태 주문을 찾아야 '이미 확정라 협상 불가' 안내가 가능하다" 라는 *왜* 까지 한 줄로 박음.
+  - **[2단계 — 후보 필터링 — 반드시 이 순서]** ① 품목명 매칭 (공백·대소문자 무시) → ② 협상 허용 상태만 추출 (협상가 제시: QUOTE_REQUESTED/NEGOTIATING / 납품일 변경: 거기에 +CONFIRMED) → ③ ①에서 매칭됐는데 ②에서 0건이면 "[상태] 상태라 협상 불가" 명시 안내 + 다른 품목 주문 언급 금지. 번호(①②③) 를 박아 LLM 이 순서를 건너뛰지 않게 강제.
+  - **[3단계 — 후보 0개 분기 메시지 구체화]** "○○ 상품의 주문은 이미 [상태] 상태라 가격 협상이 불가합니다. 협상은 견적 요청 또는 협상 중 단계에서만 가능합니다." 라고 *왜 안 되는지 + 언제 가능한지* 두 정보를 함께 안내. "삼겹살·새우 등 다른 상품 주문을 절대 언급하지 마라" 도 함께 박음 — 0건 분기에서 컨텍스트의 다른 주문이 끼어드는 환각을 차단.
+- **핵심 교훈 — 결정 트리는 ① → ② → ③ 번호로 박아야 LLM 이 단계를 건너뛰지 않는다**: 기존 [2단계] 는 "상품명/거래처/수량 매칭" 이라고만 박혀 있었는데, LLM 이 매칭과 상태 필터링을 동시에 처리하면서 "매칭은 됐는데 상태가 부적격" 케이스를 그냥 0건으로 뭉뚱그려 처리. 단계를 ①(매칭) → ②(상태 추출) → ③(0건 분기 분기 안내) 로 분리 + 번호로 명시하면 LLM 이 각 단계의 결과를 따로 추적해 "①에서는 1건 찾았지만 ②에서 0건" 이라는 상황을 분리해서 응답에 반영. "반드시 이 순서" 를 헤더에 박는 것이 결정 트리 follow 율을 높이는 핵심.
+- **핵심 교훈 — 0건 안내 메시지는 *왜* + *언제 가능한지* 둘 다 박아야 사용자 만족도가 올라간다**: "협상 가능한 주문이 없습니다" 만 박으면 사용자는 "왜 없지?" "다시 시도해야 하나?" 혼란. 메시지를 "이미 [상태] 상태라 협상 불가입니다. 협상은 견적 요청 또는 협상 중 단계에서만 가능합니다" 로 박으면 (a) 현재 상태 (b) 협상 가능 조건 둘 다 전달돼 사용자가 다음 액션(상태 변경 vs 새 주문)을 자연스럽게 결정. 환각 방지 + UX 둘 다 잡는 패턴.
+- **핵심 교훈 — BASE 가이드를 갱신했으면 chat_node 도 같은 라운드에 갱신해라 (5중 명시 패턴 일부)**: chat_node 시스템 프롬프트는 BASE 와 별도로 동일 가이드를 직접 박아두는 5중 명시 패턴(BASE + chat_node + schema description + force retry 메시지 + 화이트리스트 마커) 의 두 번째 위치. BASE 만 갱신하고 chat_node 를 두면 chat 라우팅이 BASE 보다 chat_node 본문을 우선시하는 순간이 생겨 회귀가 재발. 카드 도구 가이드를 손볼 때마다 BASE + chat_node + schema description 3곳을 항상 같이 손보는 것이 표준 절차.
+- **핵심 교훈 — force retry 메시지 자체에 "절대 하지 말 것" 규칙 박기**: force retry 가 트리거되면 LLM 은 "도구를 안 불렀으니 불러야 한다" 라는 압박을 받아 컨텍스트의 임의 주문에 호출하는 환각이 재현. force retry 메시지에 "0건이면 호출하지 말고 안내만", "사용자가 언급한 품목과 다른 상품에 호출 금지" 를 명시하면 두 번째 라운드에서도 LLM 이 환각 호출을 거부함. force retry 는 "재시도 트리거" 가 아니라 "재시도 트리거 + 행동 가드레일" 로 작성해야 한다.
+- **핵심 교훈 — 한국어 사용자 입력의 공백 차이는 매칭 단계에서 normalize 해야 한다**: 사용자가 "테스트관리" / "테스트 관리" / "테스트  관리" 등 공백을 임의로 입력해도 같은 상품으로 매칭되어야 한다. 본문 프롬프트에 공백 무시 규칙을 박는 것이 schema description / 도구 인자 정규화보다 LLM 준수율이 높다 (LLM 이 본문을 직접 follow 하므로).
 
 #### get_partners 자연어 → status 매핑 가이드 (2026-05-04 추가)
 - 신규 `get_partners(user_id, status?, status_in?, role?)` 도구는 schema description 에 자연어 트리거("거래처 목록", "내 거래처", "거래 중인 곳" 등)와 ACTIVE/PENDING_OUTGOING/PENDING_INCOMING/INACTIVE 4종 enum 을 명시했지만, 본문 프롬프트에도 동일한 매핑을 박아야 LLM 이 일관되게 status 인자를 채운다. 이전 `get_orders` status_in 작업과 동일한 "schema + 본문 2중 명시" 패턴을 그대로 적용.
@@ -973,3 +1053,59 @@ create_subscription_from_order,
 - **단위 테스트**: `backend/tests/test_orchestrator_response_fab_gate.py` (7 케이스) 추가 — CALENDAR + ORD-, CHAT + ORD-, ORDER fab 차단 정상, ORDER + create_order 정상, ORDER + get_orders 정상, INVENTORY + 납품일 fab 차단, CALENDAR + 납품일 마커 통과. 모두 PASSED.
 - **핵심 교훈 — fab 안전망은 intent gate 가 필수**: 응답 콘텐츠 기반 마커 검사는 false positive 가 항상 발생한다 (특히 도구가 임베딩으로 cross-domain 데이터를 가져올 때). intent 별로 어떤 노드가 final_response 를 채웠는지 명시적으로 게이트해야 한다. CALENDAR 노드가 채운 응답에 "ORD-" 가 있으면 정상, INVENTORY/ORDER 노드가 채운 응답에 "ORD-" 가 있는데 create_order 호출 흔적이 없으면 환각. 둘은 정반대 케이스라 같은 마커로 묶어서 검사하면 안 됨.
 - **재발 방지**: 새 fab 마커 추가 시 intent gate 안쪽에 추가하고, 다른 intent 응답에서 우연히 해당 키워드를 정상적으로 사용할 수 있는지 검토 필수. `response_node` 의 모든 short-circuit return 은 어느 intent 의 결과를 차단하는지 주석으로 명시.
+
+#### 사용자 이름 단순 조회 라우팅 — 라우터 + 양 ROLE_APPENDIX 3중 박기 (2026-05-05 추가)
+- **증상**: "QA판매자 정보를 찾아줘", "○○농산 연락처 알려줘", "test2 판매자 누구야" 같이 **품목명 없이** 사용자/업체 이름만 언급하며 정보를 요청하면 라우터가 GENERAL 로 오분류 → 인사·날씨 톤으로 회피 응답하거나 inventory_order_node 로 가더라도 LLM 이 어떤 도구를 부를지 몰라 "정보가 없다" 응답 생성. 실제로는 `get_user_profile` 도구가 username/company_name ILIKE 부분 일치 검색을 지원하므로 호출만 하면 결과를 받을 수 있는 케이스.
+- **원인 분석**:
+  1. 라우터 `_build_router_system` INVENTORY 분류 예시가 모두 품목명 동반 케이스("사과 있어?", "딸기 구매하고 싶어")라 "이름만 있는 정보 조회" 발화는 INVENTORY 패턴에 안 걸림.
+  2. INVENTORY 의 "(판매자 탐색 캐치)" 규칙은 "누가 팔아", "어느 업체" 같이 동사를 동반한 발화만 캐치. 명사형 "○○ 정보 찾아줘"는 잡지 못함.
+  3. BUYER_ROLE_APPENDIX 의 "[🚨 주문 대상 판매자 식별 절차]" 의 3순위 `get_user_profile` 폴백은 **주문 대상 식별** 문맥에 묶여 있어 "단순 정보 조회" 흐름에는 LLM 이 적용을 안 함.
+- **수정 (3중 박기)**: orchestrator.py 한 곳만 손대면 SELLER/BUYER 양쪽 시스템 프롬프트에 모두 반영되는 구조 활용.
+  1. **라우터 INVENTORY 예시 추가** (`_build_router_system` 라인 ~189): `"QA판매자 정보 찾아줘"`, `"○○ 업체 연락처 알려줘"`, `"홍길동 구매자 정보 조회"`, `"○○농산 누구야"`, `"test2 판매자 정보 알려줘"` 5개 예시 추가. few-shot 으로 라우터 LLM 에 패턴 인식 강화.
+  2. **모호성 해결 규칙 추가** (라인 ~232, "(판매자 탐색 캐치)" 바로 뒤): "(사용자 정보 단순 조회 캐치)" 규칙 신설 — "품목명이 전혀 없더라도 사용자가 특정 사람/업체 이름만 언급하며 정보·연락처·소속을 묻는 경우에도 거래처/사용자 조회 맥락이므로 반드시 INVENTORY 로 분류". 명시적으로 "GENERAL 로 분류하지 마세요" 부정 명령형으로 봉쇄.
+  3. **BUYER_ROLE_APPENDIX `[판매자 정보 단순 조회]` 신규 섹션** (라인 ~674, "[🚨 주문 대상 판매자 식별 절차]" 직전): "사용자가 품목 없이 판매자 이름/업체명으로 정보를 요청할 때 → `get_user_profile(username='○○' 또는 company_name='○○')` 즉시 호출 → `find_sellers_by_product` 호출 불필요 (상품 조회가 목적이 아님)". 주문 식별 절차의 3순위 폴백과 의도적으로 분리해 LLM 이 "이건 주문 흐름이 아니라 단순 조회구나"를 명확히 구분하도록.
+  4. **SELLER_ROLE_APPENDIX `[구매자 정보 단순 조회]` 신규 섹션** (라인 ~627, "[🚨 판매자 신규 구매자 발굴]" 직전): 판매자 시점의 미러링 가이드. `find_alternative_partners` (신규 바이어 발굴) 도구와도 의도적으로 분리 — 단순 조회는 후보 추천이 아니라 이름으로 정확 조회.
+- **핵심 교훈 — 라우터 분류 + 노드 도구 호출은 분리 박기 필수**: 라우터에서 INVENTORY 로만 보내도 노드의 LLM 이 "어떤 도구를 부를지" 명시적 지시가 없으면 환각으로 "정보 없음" 응답을 만들어낸다. 라우터 분류와 노드 도구 매핑은 각각 별도 가이드 필요. 이번처럼 (a) 라우터 예시 + (b) 라우터 모호성 규칙 + (c) ROLE_APPENDIX 도구 매핑 3중으로 박는 것이 표준 패턴.
+- **핵심 교훈 — `get_user_profile` 의 두 가지 사용 맥락 분리**: 같은 도구라도 (1) 주문 대상 식별 폴백 (3순위) vs (2) 단순 정보 조회 (1순위) 로 사용 맥락이 다르다. 한 가이드 안에 묶으면 LLM 이 "주문 의도 없으니 호출하지 마라"로 잘못 학습. 별도 섹션으로 박아 사용 트리거를 분명히 분리.
+- **검증**: `python3 -c "import ast; ast.parse(...)"` AST OK. `grep` 로 5개 예시 + 모호성 규칙 + BUYER `[판매자 정보 단순 조회]` 섹션 + SELLER `[구매자 정보 단순 조회]` 섹션 모두 존재 확인.
+
+#### get_user_profile 우선순위 재정의 — username/company_name > user_id (2026-05-05 추가)
+- **증상**: "QA판매자 정보 알려줘" 와 같이 사용자가 다른 사람의 이름을 물었는데, LLM 이 schema 의 `user_id` 파라미터에 **현재 로그인 사용자의 UUID**를 자동으로 채워 넣고 동시에 `username="QA판매자"` 도 함께 전달하는 케이스 발생. 기존 우선순위가 `user_id → username → company_name` 이라 user_id 매칭이 먼저 성공해 username 검색이 무시되고 **로그인한 본인 프로필**이 그대로 반환됨 → "당신은 ○○입니다" 식 엉뚱한 응답.
+- **원인 분석**:
+  1. 도구 schema 에 `user_id`, `username`, `company_name` 모두 optional 로 노출되어 있어 LLM 이 "더 정확해 보이는 user_id 도 같이 채우자"는 휴리스틱으로 컨텍스트의 자기 UUID 를 끼워 넣음.
+  2. 코드의 `if user_id:` 1순위 분기는 user_id 가 비어 있는지만 체크하고, **다른 인자가 함께 들어왔을 때 어느 게 사용자 의도인지** 판별 안 함.
+  3. 사용자 자연어 의도는 "QA판매자" 이름 검색인데, user_id 가 더 정확한 키처럼 코드가 가정해버림.
+- **수정 (`backend/app/services/agent/tools/user.py` get_user_profile)**:
+  1. 우선순위를 `username (1순위) → company_name (2순위) → user_id (3순위)` 로 재정의.
+  2. 3순위 user_id 분기는 **`if user_id and not username and not company_name:`** 가드를 추가 — 이름/회사명 인자가 같이 들어오면 user_id 는 무시.
+  3. ILIKE 부분 일치 쿼리는 `limit(1)` → `limit(5)` 로 여유 있게 받되, 반환은 여전히 `result.data[0]` 첫 번째 결과만.
+- **핵심 교훈 — LLM 이 채워 넣은 "더 정확한 키" 가 함정**: schema 에 식별자 파라미터 여러 개가 노출되면 LLM 은 "더 강한 식별자(UUID) 도 같이 채워주는 게 친절"이라고 학습한다. 하지만 코드의 우선순위가 식별자 강도 순서면 사용자가 자연어로 표현한 의도(이름)를 무시해버림. **자연어 입력에서 가장 자주 쓰이는 인자(이름/회사명)를 1순위로 두고, UUID 는 다른 인자가 비어 있을 때만 폴백**으로 두는 것이 LLM 환각에 강건함.
+- **검증**: `python3 -c "import ast; ast.parse(...)"` AST OK. 함수 본문만 변경, `@tool` 데코레이터/description/parameters/groups 미변경.
+
+#### 협상/납품일 변경 발화 시 "관련 품목 주문만" 강제 + 한글 매핑 절대성 강조 (2026-05-06 추가)
+- **증상 1 (전체 주문 나열)**: 사용자가 "옥수수 협상가 130만원으로 보내줘" 처럼 특정 품목을 콕 집어 협상을 요청해도, 후보가 0개일 때 LLM 이 "협상 가능한 옥수수 주문이 없습니다. 다만 다른 진행 중인 주문 5건은 다음과 같습니다…" 식으로 사용자가 묻지 않은 전체 주문을 친절심으로 줄줄이 나열. 사용자 의도(옥수수 협상)와 무관한 정보 노출.
+- **증상 2 (PREPARING ↔ SHIPPING 혼동)**: 한글 매핑이 "PREPARING → 출하 준비" 로 명시되어 있어도 LLM 이 자체 지식("preparing = 준비하는 = 배송 준비") 으로 "배송 준비 중", "배송 중" 으로 응답하는 사례. SHIPPING 상태와 의미 충돌 발생.
+- **수정 (`orchestrator.py` 4곳 동기 박기)**:
+  1. **L415 [발화 모호성 처리]** — "협상·납품일 변경 요청이면 언급된 품목 관련 주문만 언급하라. 전체 진행 중 주문 목록을 나열하지 마라." 한 줄 명시 추가.
+  2. **L417 [금지사항] 마지막 항목 추가** — "협상 또는 납품일 변경 요청 맥락에서 사용자가 특정 품목을 언급했을 때 전체 진행 중 주문 목록을 나열하는 행위 금지 — 언급된 품목 관련 주문만 언급하라."
+  3. **L532 한글 매핑 헤더** — "(이 매핑만 사용)" → "(이 매핑만 사용 — LLM 자체 지식으로 번역 금지, 절대적 규칙)" 로 강화. PREPARING 항목에 "(SHIPPING '배송 중'과 절대 혼동 금지)" 인라인 주석 추가. 매핑 표 직후에 "이 매핑은 절대적이다. LLM 자체 지식으로 번역하지 말고 반드시 이 표만 사용하라." 한 줄 추가.
+  4. **L1755 / L1778 force retry 프롬프트** — 동일 패치를 force retry 시스템 프롬프트(짧게 압축된 버전)에도 동기 적용. force retry 단계에서 LLM 이 다시 환각하면 사용자에게 그대로 노출되므로 두 곳 동기화 필수.
+- **핵심 교훈 — 메인 프롬프트 + force retry 프롬프트 동기화**: orchestrator.py 에는 (a) 본 시스템 프롬프트 (`AGENT_BASE_SYSTEM` 등) 와 (b) validator 가 RETRY 결정을 내렸을 때 사용하는 force retry 프롬프트가 별도로 존재. 본 프롬프트에만 가이드를 박으면 force retry 단계에서 다시 환각 발생. 같은 규칙은 반드시 두 곳 모두에 동기 박기.
+- **핵심 교훈 — "절대적 규칙" 명시가 LLM 자체 지식 오버라이드를 강제**: GPT-4o-mini 는 한글 enum 매핑 표가 있어도 자체 지식이 우세하면 표를 무시하는 경향. "(이 매핑만 사용 — LLM 자체 지식으로 번역 금지, 절대적 규칙)" + "이 매핑은 절대적이다" 를 표 헤더와 표 직후에 이중으로 박으면 준수율 향상. 특히 영어 enum 의 의미가 한국어 자연 번역과 다른 경우(PREPARING="출하 준비" ≠ "배송 준비") "X와 절대 혼동 금지" 인라인 주석으로 충돌 후보를 명시하면 효과적.
+- **핵심 교훈 — "친절심 환각" 차단 패턴**: LLM 은 사용자 요청이 0건 결과를 받으면 친절심으로 "다른 정보라도…" 하며 컨텍스트의 무관한 데이터를 끌어와 응답을 채우는 경향. 단순히 "다른 정보 늘어놓지 말라"보다 "[발화 모호성 처리]" + "[금지사항]" 양쪽에 같은 규칙을 명시적으로 박는 게 효과적. 발화 모호성 처리는 긍정 가이드("관련 품목만"), 금지사항은 부정 가이드("전체 나열 금지") 로 양면 박기.
+- **검증**: 4개 위치(L415, L417, L532-540, L1755+L1778) Edit 적용 완료. orchestrator.py 본 프롬프트와 force retry 프롬프트 모두 동일 가이드 반영.
+
+#### submit_counter_offer "다른 품목 order_id 오발사" 차단 (2026-05-06 추가)
+- **증상**: 사용자가 "테스트관리 협상가를 30000으로 제시해줘" 라고 요청 → '테스트 관리' 주문은 모두 CONFIRMED/PREPARING 상태(협상 불가)인데 LLM 이 사용자가 언급하지 않은 "새우" 주문 order_id 로 submit_counter_offer 를 잘못 호출. 백엔드는 valid order 라 정상 처리하고 카운터오퍼 카드가 엉뚱한 주문(새우)에 발송됨.
+- **근본 원인 3가지**:
+  1. `negotiation.py` tool description 의 "상태 확인 없이 즉시 호출하라 — 허용 여부는 서버가 검증" 문구가 LLM 에게 "도구 호출을 확정한 뒤 후보를 채워라" 로 해석됨. 후보 0개여도 다른 품목 order_id 를 채워서라도 호출함.
+  2. `order_id` 파라미터 description 의 "0개면 안내" 는 파라미터 입력 단계의 가이드 — 도구 호출 자체를 중단하는 강제력이 없음.
+  3. orchestrator.py `_is_counter_fab` 가드는 `"submit_counter_offer" not in tools_used` 조건이라, 잘못된 품목으로 도구가 실제로 호출된 경우는 감지 못 함.
+- **수정 (3곳 동기 박기)**:
+  1. **`negotiation.py` tool description** — "상태 확인 없이 즉시 호출하라" 제거 → "⚠️ 호출 전 필수 확인: 사용자가 특정 품목명을 언급한 경우, get_orders 로 해당 품목의 QUOTE_REQUESTED/NEGOTIATING 주문이 있는지 먼저 확인하라. 없으면 이 도구를 절대 호출하지 마라. 사용자가 언급하지 않은 다른 품목의 order_id 로 호출하는 것은 절대 금지." 로 교체.
+  2. **`negotiation.py` order_id 파라미터 description** — "0개면 '안내' 한다" → "⚠️ 후보가 0개면 — 이 도구 자체를 호출하지 마라. 이 파라미터를 채울 필요가 없다." 로 강조 변경. "사용자가 언급한 품목 이외의 다른 품목 order_id 를 절대 이 파라미터에 넣지 마라." 명시.
+  3. **`orchestrator.py` `_is_wrong_product_counter` 안전망 신설** — submit_counter_offer 가 호출되었고 + get_orders 결과에 사용자 언급 품목과 매칭되는 주문이 존재하는데 + 그 주문들이 모두 CONFIRMED/PREPARING/SHIPPING/COMPLETED/CANCELLED 상태이면 → force retry 트리거. force retry 메시지: "사용자가 언급한 품목의 주문은 모두 CONFIRMED/PREPARING 이후 상태라 협상이 불가한데, 사용자가 언급하지 않은 다른 상품에 submit_counter_offer 를 잘못 호출했습니다. '협상은 견적 요청 또는 협상 중 단계에서만 가능합니다.' 라고 안내하라. 다른 상품 정보나 협상가 제시 결과는 언급하지 마라." (`_ineligible_statuses` 집합으로 체크, `product_summary`/`primary_product_name` 공백 무시 매칭).
+- **핵심 교훈 — "서버가 검증한다" 문구는 LLM 에게 잘못된 안전감을 줌**: tool description 에 "허용 여부는 서버가 검증" 같은 문구가 있으면 LLM 은 "내가 검증할 책임이 없다 = 일단 호출하면 된다" 로 해석. 결과적으로 후보가 없어도 억지로 호출함. 차단하려면 description 에서 "절대 호출하지 마라" + "다른 품목 order_id 절대 금지" 같은 명시적 부정 명령이 필요.
+- **핵심 교훈 — 파라미터 description 가이드는 호출 자체를 막을 수 없다**: `order_id` 파라미터 설명 안에 "0개면 안내" 라고 적어도, LLM 이 도구 호출을 결심한 시점에는 이미 늦음. 호출 자체의 게이팅은 **tool 자체 description** (메인 트리거 텍스트) 에 박아야 효과 있음. 파라미터 description 은 보조.
+- **핵심 교훈 — 3중 방어 필요**: (1) tool description 에서 호출 전 필터링 강제, (2) 파라미터 description 에서 "0건이면 호출 자체 금지" 재강조, (3) orchestrator force retry 안전망에서 잘못 호출된 케이스 감지·복구. 1·2 가 뚫려도 3 이 잡아낸다. `_is_counter_fab` 는 "도구 미호출 시" 가드이므로, "도구 잘못 호출됨" 케이스는 별도 변수(`_is_wrong_product_counter`) 가 필요.
+- **검증**: 3곳 Edit 완료 — `backend/app/services/agent/tools/negotiation.py` (description + order_id), `backend/app/services/orchestrator.py` (`_is_wrong_product_counter` + force retry 메시지 분기). force retry 가드는 `_is_order_fab`/`_is_delivery_fab`/`_is_counter_fab` 와 동일한 round 가드 안에서 동작.
