@@ -54,16 +54,23 @@ def test_all_domain_modules_loaded():
 
 
 def test_total_registered_tool_count():
-    """PR 4 시점에 등록된 41 개 도구 그대로 유지 — 누락/중복 회귀 방지."""
-    assert len(TOOL_FUNCTION_MAP) == 41, (
-        f"등록된 도구 수가 41 개에서 변경됨: {len(TOOL_FUNCTION_MAP)}. "
+    """PR 5 시점에 등록된 42 개 도구 그대로 유지 — 누락/중복 회귀 방지.
+
+    PR 5 에서 subscription 도메인에 get_subscriptions 가 추가되어 41 → 42.
+    """
+    assert len(TOOL_FUNCTION_MAP) == 42, (
+        f"등록된 도구 수가 42 개에서 변경됨: {len(TOOL_FUNCTION_MAP)}. "
         f"의도된 변경이면 이 테스트와 test_agent_registry.py 도 함께 수정."
     )
 
 
 def test_groups_distribution():
-    """그룹별 분류 — inventory_order 34 / calendar 4 / chat 3."""
-    assert len(TOOLS) == 34, f"inventory_order 그룹: {len(TOOLS)}"
+    """그룹별 분류 — inventory_order 35 / calendar 4 / chat 3.
+
+    PR 5 에서 subscription 도메인에 get_subscriptions 가 추가되어
+    inventory_order 그룹이 34 → 35 로 증가.
+    """
+    assert len(TOOLS) == 35, f"inventory_order 그룹: {len(TOOLS)}"
     assert len(TOOLS_CALENDAR) == 4, f"calendar 그룹: {len(TOOLS_CALENDAR)}"
     assert len(TOOLS_CHAT) == 3, f"chat 그룹: {len(TOOLS_CHAT)}"
 

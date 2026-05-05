@@ -701,7 +701,7 @@ pytest-cov==6.0.0
   )
   ```
 
-- **AI 도구 모듈화 완료 — `agent/tools/<domain>.py` + ToolRegistry 자동 등록 (PR 0/1/2/3/4, 2026-05-05)**: 기존 `agent_tools.py` 단일 파일에 41 개 LLM 도구가 누적되어 한 도구 수정 시 다른 도구의 hunk 충돌이 빈번했다. 도메인별 분리 + `@tool` 데코레이터 자동 등록 인프라 도입 → PR 4 에서 `agent_tools.py` 완전 제거.
+- **AI 도구 모듈화 완료 — `agent/tools/<domain>.py` + ToolRegistry 자동 등록 (PR 0/1/2/3/4/5, 2026-05-05)**: 기존 `agent_tools.py` 단일 파일에 LLM 도구가 누적되어 한 도구 수정 시 다른 도구의 hunk 충돌이 빈번했다. 도메인별 분리 + `@tool` 데코레이터 자동 등록 인프라 도입 → PR 4 에서 `agent_tools.py` 완전 제거. PR 5 (2026-05-04) 에서 subscription 도메인에 `get_subscriptions` 추가 → 총 42 개 도구.
   ```
   backend/app/services/agent/
   ├── __init__.py        # TOOL_FUNCTION_MAP, TOOLS, TOOLS_CALENDAR, TOOLS_CHAT, INT_FIELDS 노출
@@ -715,7 +715,7 @@ pytest-cov==6.0.0
       ├── product.py     # 6 개 (inventory_order)
       ├── order.py       # 6 개 (inventory_order)
       ├── partner.py     # 7 개 (inventory_order)
-      ├── subscription.py# 5 개 (inventory_order) — PR 4 에서 get_incoming_subscription_requests 통합
+      ├── subscription.py# 6 개 (inventory_order) — PR 4 incoming_requests, PR 5 get_subscriptions
       ├── negotiation.py # 6 개 (inventory_order)
       ├── user.py        # 4 개 (inventory_order)
       ├── calendar.py    # 4 개 (calendar)
@@ -742,7 +742,11 @@ pytest-cov==6.0.0
     - `chat_ws.py` 의 직접 호출은 `from app.services.agent.tools.<domain> import <fn>` 사용 (예: `from app.services.agent.tools.calendar import create_calendar_event`).
     - cross-domain helper 직접 호출은 `from app.services.agent._shared import _UUID_PATTERN` 등.
     - **금지**: `from app.services.agent_tools import ...` (PR 4 이후 모듈 자체 부재 → ImportError).
-  - **신규 도구 추가 패턴**: (1) 적절한 도메인 모듈 (`tools/<domain>.py`) 에 `@tool` 데코레이터 함수 추가, (2) cross-domain helper 가 필요하면 `from .._shared import ...` 로 lazy import (또는 module-level), (3) 신규 도메인 모듈 신설 시 `tools/__init__.py` 에 import 한 줄 추가, (4) 검증 — `python3 -m pytest tests/test_agent_registry.py`. orchestrator.py 의 `TOOLS = ...` / `TOOLS_CALENDAR = ...` 는 자동 갱신.
+  - **신규 도구 추가 패턴**: (1) 적절한 도메인 모듈 (`tools/<domain>.py`) 에 `@tool` 데코레이터 함수 추가, (2) cross-domain helper 가 필요하면 `from .._shared import ...` 로 lazy import (또는 module-level), (3) 신규 도메인 모듈 신설 시 `tools/__init__.py` 에 import 한 줄 추가, (4) 검증 — `python3 -m pytest tests/test_agent_registry.py tests/test_tools_smoke.py`. orchestrator.py 의 `TOOLS = ...` / `TOOLS_CALENDAR = ...` 는 자동 갱신.
+  - **도구 카운트 하드코딩 — 두 테스트 동시 갱신 필수 (PR 5, 2026-05-04 발견)**: 도구 추가/삭제 시 hard-coded 총 카운트가 두 곳에 존재하므로 둘 다 갱신해야 한다. 한쪽만 갱신하면 smoke/registry 중 하나가 회귀로 실패한다.
+    - `tests/test_agent_registry.py::test_domain_modules_register_42_tools` — `len(TOOL_FUNCTION_MAP)`, `len(TOOLS)`, `len(TOOLS_CALENDAR)`, `len(TOOLS_CHAT)` 4개 assert.
+    - `tests/test_tools_smoke.py::test_total_registered_tool_count` + `test_groups_distribution` — 동일 4개 카운트.
+    - 검증 — `/Users/l.s.h/workspace/NEXT_2026/web/backend/nextagri/bin/python -c "from app.services.agent import TOOL_FUNCTION_MAP, TOOLS, TOOLS_CALENDAR, TOOLS_CHAT; print(len(TOOL_FUNCTION_MAP), len(TOOLS), len(TOOLS_CALENDAR), len(TOOLS_CHAT))"` 로 실제 값 먼저 확인 후 두 파일 동시 수정.
 
 - **agent 도구는 항상 sync — async service 호출 시 sync 재구현 (2026-05-04 partner 거래처 등록 도구 추가)**: `orchestrator._execute_tool` 은 `func(**tool_input)` 패턴으로 도구 함수를 호출한다 (await 없음). 따라서 `agent/tools/<domain>.py` 의 모든 도구는 동기 함수여야 한다. 만약 호출하고 싶은 비즈니스 로직이 `partner_service.create_partner` 처럼 `async def` 라면, 그 안의 핵심 로직(자기 자신 차단, 양방향 PENDING 두 row INSERT, 23505 처리, partner_user 임베딩)을 supabase 클라이언트 동기 호출 패턴으로 재구현하거나 `agent._shared._run_async_in_thread(coro_fn)` 으로 별도 thread 에서 실행한다. 검증된 패턴:
   ```python

@@ -126,11 +126,11 @@ _PR3_DOMAIN_MODULES = [
 ]
 
 
-def test_domain_modules_register_41_tools(_reset_registry=None):  # noqa: ARG001
-    """PR 1+2+3+4: 8 개 도메인 모듈 import 시 총 41 개 도구 등록 (34 inventory_order + 4 calendar + 3 chat).
+def test_domain_modules_register_42_tools(_reset_registry=None):  # noqa: ARG001
+    """PR 1+2+3+4+5: 8 개 도메인 모듈 import 시 총 42 개 도구 등록 (35 inventory_order + 4 calendar + 3 chat).
 
-    PR 4 에서 subscription 도메인에 get_incoming_subscription_requests 가 추가되어
-    inventory_order 33 → 34, 전체 40 → 41.
+    PR 5 에서 subscription 도메인에 get_subscriptions 가 추가되어
+    inventory_order 34 → 35, 전체 41 → 42.
     """
     # 새로 import 하기 위해 sys.modules 초기화
     import importlib
@@ -142,8 +142,8 @@ def test_domain_modules_register_41_tools(_reset_registry=None):  # noqa: ARG001
     ToolRegistry._items.clear()
 
     agent = importlib.import_module("app.services.agent")
-    assert len(agent.TOOL_FUNCTION_MAP) == 41
-    assert len(agent.TOOLS) == 34  # inventory_order 그룹 (PR 4: subscription 5)
+    assert len(agent.TOOL_FUNCTION_MAP) == 42
+    assert len(agent.TOOLS) == 35  # inventory_order 그룹 (PR 5: subscription 6)
     assert len(agent.TOOLS_CALENDAR) == 4  # PR 2 — calendar 그룹
     assert len(agent.TOOLS_CHAT) == 3  # PR 3 — chat 그룹
 
@@ -160,10 +160,10 @@ def test_domain_modules_register_41_tools(_reset_registry=None):  # noqa: ARG001
         "request_partner_registration_by_name", "get_partners",
         "get_incoming_partner_requests", "accept_partner_request",
         "reject_partner_request",
-        # subscription (PR 4: get_incoming_subscription_requests 추가)
+        # subscription (PR 4: get_incoming_subscription_requests, PR 5: get_subscriptions)
         "create_subscription_request", "accept_subscription_request",
         "reject_subscription_request", "create_subscription_from_order",
-        "get_incoming_subscription_requests",
+        "get_incoming_subscription_requests", "get_subscriptions",
         # negotiation
         "submit_counter_offer", "accept_counter_offer", "reject_counter_offer",
         "submit_delivery_date_change", "accept_delivery_date_change",

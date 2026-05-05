@@ -3,15 +3,15 @@
 각 모듈의 top-level 에서 @tool 데코레이터가 실행되며 registry 에 등록된다.
 새 도메인 모듈 추가 시 이 파일에 import 한 줄만 추가하면 자동 노출됨.
 
-8 개 도메인 모듈 (총 41 개 도구):
+8 개 도메인 모듈 (총 42 개 도구):
 - product       (6): get_products, check_stock, update_stock, create_product, delete_product, update_product
 - order         (6): get_orders, get_order_detail, update_order_status, update_order, create_order, delete_order
 - partner       (7): find_alternative_partners, request_partner_registration,
                      request_partner_registration_by_name, get_partners,
                      get_incoming_partner_requests, accept_partner_request, reject_partner_request
-- subscription  (5): create_subscription_request, accept_subscription_request,
+- subscription  (6): create_subscription_request, accept_subscription_request,
                      reject_subscription_request, create_subscription_from_order,
-                     get_incoming_subscription_requests
+                     get_incoming_subscription_requests, get_subscriptions
 - negotiation   (6): submit/accept/reject_counter_offer, submit/accept/reject_delivery_date_change
 - user          (4): get_user_profile, find_sellers_by_product, find_buyers_by_product, open_chat_room
 - calendar      (4): get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event
@@ -19,7 +19,7 @@
 - chat (외부)    (1): analyze_chat_consensus — chat_ws.py 직접 호출, ToolRegistry 미등록
 
 그룹 분류:
-- "inventory_order" : product 6 + order 6 + partner 7 + subscription 5 + negotiation 6 + user 4 = 34
+- "inventory_order" : product 6 + order 6 + partner 7 + subscription 6 + negotiation 6 + user 4 = 35
 - "calendar"        : 4
 - "chat"            : 3
 """

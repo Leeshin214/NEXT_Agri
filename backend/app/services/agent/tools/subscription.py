@@ -793,12 +793,304 @@ def create_subscription_from_order(
 
 
 @tool(
+    name="get_subscriptions",
+    description=(
+        "사용자 본인의 정기배송 목록을 status 별로 조회한다.\n\n"
+        "자연어 트리거:\n"
+        "- '정기배송 목록', '내 정기배송', '정기배송 보여줘', '정기배송 현황'\n"
+        "- '거래처 중 정기배송 있는 곳' (이 경우 status='ACTIVE' 만 조회)\n"
+        "- '진행 중인 정기배송', '활성 정기배송' → status='ACTIVE'\n"
+        "- '보낸 정기배송 신청' → status='PENDING_OUTGOING' "
+        "(DB 의 status='PENDING' 중 created_by == 본인 인 행만)\n"
+        "- '받은 정기배송 신청' → status='PENDING_INCOMING' "
+        "(DB 의 status='PENDING' 중 created_by != 본인 인 행만; "
+        "get_incoming_subscription_requests 와 동일 효과)\n"
+        "- '일시정지된' → status='PAUSED'\n"
+        "- '거절된' → status='REJECTED'\n"
+        "- '종료된' → status='ENDED'\n"
+        "- '취소된' → status='CANCELLED'\n\n"
+        "상태 미명시 시 기본 ACTIVE + PENDING_OUTGOING + PENDING_INCOMING "
+        "(사용자가 보통 '내 정기배송' 이라고 하면 진행 중 + 신청 대기 둘 다 보고 싶어함).\n\n"
+        "응답에는 거래처 이름/회사명, frequency (WEEKLY/BIWEEKLY/MONTHLY), start_date, "
+        "다음 회차 예정일(next_delivery_date), 품목 요약 포함.\n\n"
+        "도구 결과 외 임의 정보 추가 금지. 결과 0건이면 '현재 진행 중인 정기배송이 "
+        "없습니다' 만 안내."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "user_id": {
+                "type": "string",
+                "description": "조회할 사용자(현재 로그인 사용자) UUID. 서버에서 강제 주입.",
+            },
+            "status": {
+                "type": "string",
+                "enum": [
+                    "ACTIVE",
+                    "PENDING_OUTGOING",
+                    "PENDING_INCOMING",
+                    "PAUSED",
+                    "REJECTED",
+                    "ENDED",
+                    "CANCELLED",
+                ],
+                "description": (
+                    "단일 상태 필터. PENDING_OUTGOING = 내가 보낸 PENDING, "
+                    "PENDING_INCOMING = 내가 받은 PENDING."
+                ),
+            },
+            "status_in": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "ACTIVE",
+                        "PENDING_OUTGOING",
+                        "PENDING_INCOMING",
+                        "PAUSED",
+                        "REJECTED",
+                        "ENDED",
+                        "CANCELLED",
+                    ],
+                },
+                "description": (
+                    "다중 상태 필터 (status 보다 우선). "
+                    "예: ['ACTIVE', 'PENDING_OUTGOING', 'PENDING_INCOMING']."
+                ),
+            },
+        },
+        "required": ["user_id"],
+    },
+    groups=("inventory_order",),
+    int_fields=frozenset(),
+)
+def get_subscriptions(
+    user_id: str,
+    status: Optional[str] = None,
+    status_in: Optional[list[str]] = None,
+) -> dict:
+    """사용자 본인의 정기배송 목록을 status 별로 조회한다.
+
+    PENDING_OUTGOING / PENDING_INCOMING 가상 상태:
+      DB 의 실제 status 는 'PENDING' 1종이지만, 본 도구에서는 사용자 입장에서
+      "내가 보낸" / "내가 받은" 두 가지로 분리 노출한다.
+      created_by 컬럼을 본인 UUID 와 비교해 필터링.
+
+    필터 우선순위: status_in > status > 기본값(ACTIVE+PENDING_OUTGOING+PENDING_INCOMING).
+
+    응답:
+      success: bool
+      subscriptions: [{
+        id, status, frequency, start_date, next_delivery_date,
+        partner_user_id, partner_name, partner_company,
+        my_role ('SELLER'|'BUYER'),
+        items: [{product_name, quantity, unit, unit_price}],
+        items_count, total_amount,
+        created_by, is_outgoing  # PENDING 행에서만 의미 있음
+      }]
+      count: int
+      message: str
+    """
+    from .._shared import _UUID_PATTERN, _run_async_in_thread
+
+    user_clean = (user_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id"}
+
+    # 1) 가상 상태 → 실제 DB status + 추가 필터(plan) 매핑
+    #    plan 의 각 entry: ("ACTIVE", None) | ("PENDING", "outgoing") | ("PENDING", "incoming") ...
+    _VIRTUAL_TO_DB = {
+        "ACTIVE": ("ACTIVE", None),
+        "PAUSED": ("PAUSED", None),
+        "ENDED": ("ENDED", None),
+        "CANCELLED": ("CANCELLED", None),
+        "REJECTED": ("REJECTED", None),
+        "PENDING_OUTGOING": ("PENDING", "outgoing"),
+        "PENDING_INCOMING": ("PENDING", "incoming"),
+    }
+
+    # 우선순위: status_in > status > default
+    if status_in:
+        requested_virtuals = [s.strip().upper() for s in status_in if isinstance(s, str) and s.strip()]
+    elif status and isinstance(status, str) and status.strip():
+        requested_virtuals = [status.strip().upper()]
+    else:
+        # 기본값
+        requested_virtuals = ["ACTIVE", "PENDING_OUTGOING", "PENDING_INCOMING"]
+
+    plan: list[tuple[str, Optional[str]]] = []
+    unknown: list[str] = []
+    for v in requested_virtuals:
+        if v in _VIRTUAL_TO_DB:
+            plan.append(_VIRTUAL_TO_DB[v])
+        else:
+            unknown.append(v)
+    if unknown:
+        return {
+            "success": False,
+            "error": "invalid_status",
+            "message": f"지원하지 않는 status 값: {', '.join(unknown)}",
+        }
+    if not plan:
+        return {"success": True, "subscriptions": [], "count": 0, "message": "조회 조건이 없습니다."}
+
+    # 2) subscription_service.list_subscriptions 위임 (DB status 별 1회씩 호출 후 합집합)
+    #    PENDING 은 outgoing/incoming 둘 다 같은 DB 호출 결과를 created_by 로 분기하므로
+    #    실제 호출은 unique DB status 별 1회씩만 수행한다.
+    from app.services.subscription_service import subscription_service
+    from uuid import UUID as _UUID
+
+    db_statuses = {db_status for db_status, _ in plan}
+    # PENDING 분기 종류 — outgoing / incoming / 양쪽 모두
+    pending_modes = {mode for db_status, mode in plan if db_status == "PENDING" and mode}
+
+    rows_by_id: dict[str, dict] = {}
+    try:
+        for db_status in db_statuses:
+            page = 1
+            page_limit = 200
+            seen_pages = 0
+            max_pages = 50  # 최대 1만건 안전 한도
+            while seen_pages < max_pages:
+                try:
+                    rows, meta = _run_async_in_thread(
+                        lambda ds=db_status, p=page, lim=page_limit: subscription_service.list_subscriptions(
+                            user_id=_UUID(user_clean),
+                            status_filter=ds,
+                            page=p,
+                            limit=lim,
+                        )
+                    )
+                except Exception as e:
+                    return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
+                for row in rows or []:
+                    rid = row.get("id")
+                    if not rid:
+                        continue
+                    rid_str = str(rid)
+
+                    # PENDING 의 경우 created_by 분기로 노출 여부 결정
+                    if db_status == "PENDING":
+                        cb_val = row.get("created_by")
+                        cb_str = str(cb_val) if cb_val else None
+                        is_outgoing = bool(cb_str and cb_str == user_clean)
+                        if pending_modes:
+                            if is_outgoing and "outgoing" not in pending_modes:
+                                continue
+                            if not is_outgoing and "incoming" not in pending_modes:
+                                continue
+                        # pending_modes 가 비어있는데 PENDING 이 db_statuses 에 있는 경우는
+                        # 가상 상태 매핑에서 PENDING_* 가 plan 에 들어왔을 때만 발생하므로
+                        # 위 분기에서 처리됨. 안전 fallback — 그대로 노출.
+
+                    rows_by_id[rid_str] = row
+
+                seen_pages += 1
+                # total_pages 가 있으면 끝까지, 없으면 빈 페이지에서 종료
+                total_pages = getattr(meta, "total_pages", None) or 0
+                if total_pages and page >= total_pages:
+                    break
+                if not rows:
+                    break
+                page += 1
+            # while
+        # for
+    except Exception as e:  # noqa: BLE001
+        return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 3) 결과 row 가공 — 사용자 입장의 상대방(counterpart) 정보로 평탄화
+    subscriptions: list[dict] = []
+    for row in rows_by_id.values():
+        seller_id = str(row.get("seller_id")) if row.get("seller_id") else None
+        buyer_id = str(row.get("buyer_id")) if row.get("buyer_id") else None
+        if seller_id == user_clean:
+            my_role = "SELLER"
+            partner_user_id = buyer_id
+            partner_name = row.get("buyer_name")
+            partner_company = row.get("buyer_company")
+        elif buyer_id == user_clean:
+            my_role = "BUYER"
+            partner_user_id = seller_id
+            partner_name = row.get("seller_name")
+            partner_company = row.get("seller_company")
+        else:
+            # 본인이 당사자가 아닌 행은 list_subscriptions 가 이미 OR 필터로 거르므로
+            # 도달하지 않지만, 방어적으로 skip.
+            continue
+
+        items_raw = row.get("items") or []
+        items_simple: list[dict] = []
+        for it in items_raw:
+            items_simple.append({
+                "product_id": str(it.get("product_id")) if it.get("product_id") else None,
+                "product_name": it.get("product_name"),
+                "quantity": it.get("quantity"),
+                "unit": it.get("unit"),
+                "unit_price": it.get("unit_price"),
+            })
+
+        cb_val = row.get("created_by")
+        cb_str = str(cb_val) if cb_val else None
+        is_outgoing = bool(cb_str and cb_str == user_clean) if row.get("status") == "PENDING" else None
+
+        subscriptions.append({
+            "id": str(row.get("id")) if row.get("id") else None,
+            "status": row.get("status"),
+            "frequency": row.get("frequency"),
+            "start_date": row.get("start_date"),
+            "end_date": row.get("end_date"),
+            "next_delivery_date": row.get("next_delivery_date"),
+            "partner_user_id": partner_user_id,
+            "partner_name": partner_name,
+            "partner_company": partner_company,
+            "my_role": my_role,
+            "items": items_simple,
+            "items_count": len(items_simple),
+            "total_amount": row.get("total_amount"),
+            "delivery_address": row.get("delivery_address"),
+            "notes": row.get("notes"),
+            "created_by": cb_str,
+            "is_outgoing": is_outgoing,
+        })
+
+    # 4) 다음 배송일 가까운 순(있으면) → 시작일 가까운 순으로 정렬해 응답 일관성 확보
+    def _sort_key(s: dict):
+        nd = s.get("next_delivery_date") or s.get("start_date") or ""
+        return str(nd)
+
+    subscriptions.sort(key=_sort_key)
+
+    if not subscriptions:
+        return {
+            "success": True,
+            "subscriptions": [],
+            "count": 0,
+            "message": "현재 진행 중인 정기배송이 없습니다.",
+            "filters": {
+                "status_in": requested_virtuals,
+            },
+        }
+
+    return {
+        "success": True,
+        "subscriptions": subscriptions,
+        "count": len(subscriptions),
+        "filters": {
+            "status_in": requested_virtuals,
+        },
+    }
+
+
+@tool(
     name="get_incoming_subscription_requests",
     description=(
         "내게 들어온 PENDING 정기배송 요청 목록을 반환한다. "
         "내가 만들지 않은 (created_by != 내 ID) PENDING 상태 정기배송만 포함한다. "
         "사용자가 '들어온 정기배송 요청', '받은 정기배송' 등을 묻거나 "
-        "정기배송 수락/거절을 검토하려 할 때 호출."
+        "정기배송 수락/거절을 검토하려 할 때 호출. "
+        "참고: get_subscriptions(status='PENDING_INCOMING') 와 동일 효과 — "
+        "두 도구 모두 호환 유지용으로 등록되어 있다."
     ),
     parameters={
         "type": "object",

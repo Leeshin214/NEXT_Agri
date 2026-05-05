@@ -757,6 +757,34 @@ create_subscription_from_order,
 - **핵심 교훈 — 사용자 일반 발화의 기본값은 "정확히 한 상태"가 아니라 "사용자가 보고 싶을 만한 모든 상태의 묶음"이어야 한다**: 거래처는 사용자가 자연스럽게 "내 거래처 다 보여줘"라고 했을 때 ACTIVE 1곳만 보여주면 진행 중인 거래처 신청을 빼먹은 것으로 오인된다. 일반 발화에서는 status_in 다중 조회를 기본으로 두고, 사용자가 명시적으로 한 상태를 콕 집어 묻는 경우(예: "거래 중인 곳만") 만 단일 status 로 좁힌다. 직전 작업의 "단일 status 5종 매핑"은 정확하지만 "기본값 ACTIVE" 부분이 사용자 멘탈 모델과 불일치 — 다중 조회를 기본값으로 바꿔야 사용자가 만족.
 - **핵심 교훈 — PENDING 동의어 사전은 명시적으로 길게 박아야 LLM 이 일관되게 매핑한다**: "승인 대기", "신청 대기", "기다리는 거래처", "수락 대기" 같은 동의어가 가이드 본문에 명시 안 돼 있으면 LLM 이 "PENDING 상태에 대한 도구 호출"을 스킵하고 "없다"고 환각으로 답한다. 동의어 사전을 길게 펼쳐 박는 것이 5종 enum 만 박는 것보다 실전 발화 커버리지가 훨씬 높다.
 
+#### 정기배송 목록 조회 가이드 신설 — get_subscriptions 자연어 매핑 + 거래처 교차 조회 (2026-05-04 추가)
+- 배경: backend-agent 가 `get_subscriptions` 도구를 신설(`backend/app/services/agent/tools/subscription.py`). description 에 자연어 트리거가 명시돼 있지만, BUYER/SELLER 가이드 본문에 자연어 → 호출 매핑이 없어 LLM 이 단일 status 만 부르거나 PENDING 상태를 누락하는 환각 가능성이 있었다. 거래처 가이드와 동일한 보강 패턴(일반 발화는 status_in 다중, 특정 상태는 단일 status)을 정기배송에도 적용.
+- 해결 — 두 가지 동시 적용:
+  1. **일반 발화 기본값을 status_in 다중 조회로 전환**: "정기배송 목록" / "내 정기배송" / "정기배송 보여줘" / "정기배송 현황" 처럼 사용자가 상태를 명시하지 않으면 `status_in=["ACTIVE","PENDING_OUTGOING","PENDING_INCOMING"]` 으로 한 번에 가져와 "진행 중 N건, 보낸 신청 N건, 받은 신청 N건" 으로 분류해서 답한다.
+  2. **거래처 + 정기배송 교차 조회 절차 명시**: "거래처 중 정기배송 있는 곳" / "거래 중인 곳 정기배송" 같이 두 도메인을 동시에 묻는 발화 패턴을 직접 매핑 — 먼저 `get_partners(status="ACTIVE")` 로 활성 거래처 확인 → `get_subscriptions(status="ACTIVE")` 로 진행 중 정기배송 → 두 결과를 교차해 답변. 활성 거래처 0곳이면 "활성 거래처가 없어 정기배송 조회 불가" 안내.
+  3. **상태별 단독 조회 7종 매핑**: ACTIVE("진행 중인 정기배송"), PENDING_OUTGOING("보낸 정기배송 신청"), PENDING_INCOMING("받은 정기배송 신청" — 단독은 `get_incoming_subscription_requests` 우선), PAUSED("일시정지", "쉬고 있는"), ENDED("종료된", "끝난"), REJECTED("거절된"), CANCELLED("취소된").
+- 적용 위치 (orchestrator.py, 두 곳 동기 — 이전 거래처 가이드와 동일 5중 명시 패턴):
+  - `AGENT_BASE_SYSTEM` 의 `[정기배송 목록 조회 가이드 — 매우 중요]` 섹션 (라인 473 근방, [거래처 목록 조회 가이드] 직후, [주문 응답 표시 규칙] 직전). SELLER/BUYER 합성본 양쪽에 자동 반영. 큰따옴표 형식.
+  - `chat_node` 시스템 프롬프트의 동일 섹션 (라인 1694 근방, [거래처 목록 조회 가이드] 직후, [주문 응답 표시 규칙 — 환각 방지] 직전). 작은따옴표 형식. 자연어로 "정기배송 보여줘" 가 채팅 노드에서도 자주 발생하므로 BASE 와 별도 동기화 유지.
+- 응답 표현 규칙 (전체 조회 시 — 거래처 가이드와 같은 형식):
+  ```
+  정기배송 현황입니다.
+  - 진행 중 (ACTIVE): A마트 매주 옥수수 50kg 외 2종 (다음 예정 5월 10일)
+  - 보낸 신청 (PENDING_OUTGOING): B농가 격주 사과 30kg (수락 대기)
+  - 받은 신청 (PENDING_INCOMING): 없음
+  ```
+  각 항목은 상대방 회사명/담당자, frequency 한글(WEEKLY→"매주", BIWEEKLY→"격주", MONTHLY→"매월"), start_date, 다음 예정일, 품목 요약을 자연체로 풀어 안내. 상태별 단독 조회는 그 상태만 답하고 다른 상태 정보를 끼워 넣지 말 것 (이전 가이드의 환각 방지 4종 그대로 유지).
+- 검증 결과:
+  - AST OK (`python3 -m ast` parse 성공)
+  - placeholder 11/11 보존 (`role_label: 3, company_name: 6, user_name: 6, user_id: 27→49 (BASE +9 / chat_node +13), role_label_short: 1, case1/2/10/11_action: 각 1, auth_product_rule: 2, ambiguity_modify_rule: 2`)
+  - `_build_role_system(AGENT_BASE_SYSTEM, _SELLER_ROLE_VARS)` 렌더 OK (잔여 placeholder 0, len 18792)
+  - `_build_role_system(AGENT_BASE_SYSTEM, _BUYER_ROLE_VARS)` 렌더 OK (잔여 placeholder 0, len 18756)
+  - BASE/chat_node 양쪽 새 헤더 `[정기배송 목록 조회 가이드 — 매우 중요]` 1회씩 (총 2 grep)
+  - 이전 가이드 18종(가독성, 대체 거래처, send_chat_message needs_confirmation, 자연어→카드, 협상가/납품일 절차, 안전장치, 재고 vs 대체, 거래처 등록, 정기배송 등록, 주문 후 채팅방 연결, auto_confirm/납품일 필수, seller_id 1순위, 도구 실패 환각 방지, 주문 목록 status_in, 주문 응답 표시, 거래처 목록 조회, 협상가/납품일 order_id 결정, find_alternative_partners) 모두 보존
+  - git diff --stat = 1 file changed, 53 insertions(+), 0 deletions(-)
+- **핵심 교훈 — 도메인 교차 조회는 본문에 절차를 명시해야 LLM 이 두 번 호출한다**: "거래처 중 정기배송 있는 곳" 같은 두 도메인 동시 질문은 LLM 에게 자연스럽게 "한 번의 도구 호출"로 풀려는 경향이 있다. 본문에 "먼저 get_partners 로 활성 거래처 확인 → get_subscriptions 로 진행 중 정기배송 → 두 결과 교차" 라는 2단계 절차를 명시적으로 박아야 LLM 이 일관되게 두 번 호출하고 교차 결과를 만든다. 단일 도구 호출만 하고 한 도메인 정보를 누락하는 환각을 차단하는 것이 핵심.
+- **핵심 교훈 — 일반 발화 기본값 = status_in 다중 패턴은 도메인 무관한 표준 패턴**: 거래처 / 주문 / 정기배송 모두 사용자가 "○○ 보여줘" 라고 말할 때 ACTIVE 만 답하면 PENDING/진행 중 항목을 누락한 것으로 인식된다. 도메인이 늘어날 때마다 (1) 일반 발화 기본값 = status_in 다중, (2) 상태별 단독 조회 = 단일 status, (3) 동의어 사전 명시 — 이 3종 세트를 표준으로 박아 두는 것이 LLM 일관성에 가장 효과적이다. 향후 새 list 도구(예: 캘린더 일정, 알림) 추가 시도 동일 패턴 따르기.
+
 #### 도구 모듈화 리팩터링 — PR 0 인프라 신설 (2026-05-04 추가)
 - 배경: `backend/app/services/agent_tools.py` 가 41개 도구를 한 파일(약 16만 자)에 담고 있어 LLM·휴먼 모두 한 도구를 수정할 때 다른 도구의 컨텍스트를 끌고 가야 하는 구조. 도구 추가/수정 시 회귀 위험과 머지 충돌이 누적되는 패턴을 격리하기 위해 도메인별 분리 진행. 사용자 승인된 설계 = "단계별 PR 으로 점진 이동, PR 0 은 인프라만 — 회귀 위험 0".
 - PR 0 신설 파일 (5개, 절대 경로):
