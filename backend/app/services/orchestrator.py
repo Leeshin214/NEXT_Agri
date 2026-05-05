@@ -438,21 +438,37 @@ C. 후보 2개 이상:
 - "견적 요청" / "받은 견적" / "들어온 견적" → status_in=["QUOTE_REQUESTED"]
 - 사용자가 특정 상태를 명시하지 않고 그냥 "주문 보여줘", "주문 목록", "주문 좀 확인해줘"라고 하면 → 진행 중 기본값 status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"] 로 호출 (완료·취소는 사용자가 명시 요청할 때만 포함).
 
-[거래처 목록 조회 가이드 — 자연어 → status 매핑 (매우 중요)]
-사용자가 거래처 목록을 묻는 발화는 표현이 다양해도 항상 get_partners 의 status 단일 상태 파라미터로 정확히 매핑한다. 사용자가 "활성 거래처와 보낸 신청 둘 다 보여줘" 처럼 명시적으로 여러 상태를 한꺼번에 요청한 경우에만 status_in 배열을 사용하고, 그 외에는 status 단일을 우선한다.
+[거래처 목록 조회 가이드 — 매우 중요]
+사용자가 거래처 목록을 묻는 발화는 표현이 다양하다. 일반 발화는 ACTIVE + PENDING 까지 모두 가져와 상태별로 분류해 답하고, 사용자가 특정 상태만 콕 집어 물었을 때는 그 상태만 단독 조회한다.
 
-매핑 규칙:
-- "거래처 목록" / "내 거래처" / "거래 중인 곳" / "거래처 보여줘" / "거래하고 있는 거래처" / "내가 거래하는 사람들" → get_partners(user_id={user_id}, status="ACTIVE")
-- "보낸 거래처 신청" / "신청 보낸 곳" / "내가 신청한 거래처" / "보낸 요청" → get_partners(user_id={user_id}, status="PENDING_OUTGOING")
-- "받은 거래처 신청" / "들어온 거래처 요청" / "거래처 신청 왔어?" → 단독 조회 시 get_incoming_partner_requests(user_id={user_id}) 우선 사용. 다른 상태와 함께 묻는 맥락에서만 get_partners(user_id={user_id}, status="PENDING_INCOMING").
-- "거절된 거래처" / "비활성 거래처" / "거래 종료된 곳" → get_partners(user_id={user_id}, status="INACTIVE")
-- 사용자가 상태를 명시하지 않고 그냥 "거래처 보여줘", "거래처 목록"이라고 하면 → 기본값 status="ACTIVE" 로 호출 (PENDING/INACTIVE 는 사용자가 명시 요청할 때만 포함).
+자연어 → status / status_in 매핑:
 
-거래처 응답 표시 규칙:
-- 도구 결과가 0건이면 "현재 활성 거래처가 없습니다" (또는 status 에 맞춰 "보낸 거래처 신청이 없습니다" / "거절된 거래처가 없습니다") 정도로만 안내한다. 다른 정보(주문 내역, 상품 추천, 다른 카테고리 거래처 등)를 늘어놓지 마라.
+(전체 조회 — 일반 발화 시 기본값)
+- "거래처 목록" / "내 거래처" / "거래처 보여줘" / "거래처 다 알려줘" / "거래처 현황" / "거래하고 있는 거래처" / "내가 거래하는 사람들" → get_partners(user_id={user_id}, status_in=["ACTIVE","PENDING_OUTGOING","PENDING_INCOMING"])
+  결과를 "거래 중 (ACTIVE) N곳, 보낸 신청 (PENDING_OUTGOING) N곳, 받은 신청 (PENDING_INCOMING) N곳" 으로 분류해서 답변한다.
+
+(상태별 단독 조회)
+- "거래 중" / "활성 거래처" / "거래중인 곳" / "지금 거래하는 곳만" → get_partners(user_id={user_id}, status="ACTIVE")
+- "승인 대기" / "신청 대기" / "기다리는 거래처" / "보낸 신청" / "내가 신청한 거" / "신청 보낸 곳" / "보낸 요청" → get_partners(user_id={user_id}, status="PENDING_OUTGOING")
+- "받은 신청" / "들어온 거래처 신청" / "수락 대기" / "거래처 신청 왔어?" → 단독 조회 시 get_incoming_partner_requests(user_id={user_id}) 우선 사용. 다른 상태와 함께 묻는 맥락에서만 get_partners(user_id={user_id}, status="PENDING_INCOMING").
+- "거절된 거래처" → get_partners(user_id={user_id}, status="REJECTED")
+- "비활성 거래처" / "끊긴 거래처" / "거래 종료된 곳" → get_partners(user_id={user_id}, status="INACTIVE")
+
+[응답 표현 규칙]
+- 전체 조회 결과 표현 예시(자연체 한국어, 줄바꿈으로 구분):
+  "현재 거래처 현황입니다.
+   - 거래 중: 판매자테스트(판매자) 1곳
+   - 보낸 신청: 옥수수농장(이○○) 1곳 (수락 대기 중)
+   - 받은 신청: 없음"
+- 상태별 단독 조회는 그 상태만 깔끔하게 안내. 다른 상태 정보를 끼워 넣지 말 것.
+- 도구 결과가 0건이면 그 상태만 정확히 안내한다. 예: "현재 활성 거래처가 없습니다" / "보낸 거래처 신청이 없습니다" / "거절된 거래처가 없습니다". 다른 정보(주문 내역, 상품 추천, 다른 카테고리 거래처 등)를 늘어놓지 마라.
 - 도구가 반환하지 않은 거래처는 절대 응답에 포함하지 마라. 컨텍스트 메모리·이전 대화에 있던 옛 거래처 정보를 끌어와 함께 답하지 말 것.
-- 도구 결과 외 임의 정보 추가 금지. 사용자가 직접 묻지 않은 다른 거래처 정보를 카탈로그처럼 늘어놓지 마라.
 - 마크다운 강조(`**굵게**`)·표(`|`)·헤더(`#`) 사용 금지. 자연체 한국어 문장 + 필요 시 `-` 불릿이나 `1.` 번호만 사용.
+
+[금지사항]
+- 사용자가 명시적으로 ACTIVE 만 원하지 않은 일반 발화에서 status="ACTIVE" 로만 조회하고 PENDING 거래처를 누락하기. 일반 발화는 반드시 status_in=["ACTIVE","PENDING_OUTGOING","PENDING_INCOMING"] 으로 한 번에 가져와야 한다.
+- "승인 대기 중인 거래처 요청이 없습니다" 라고 답하기 전에 status="PENDING_OUTGOING" 또는 "PENDING_INCOMING" 으로 실제 조회했는지 확인. 안 했으면 답하기 전에 먼저 조회한다.
+- 결과 0건이면 그 상태만 정확히 안내하고 끝낸다 (이전 환각 방지 가이드와 일관). 다른 정보를 늘어놓지 마라.
 
 [주문 응답 표시 규칙 — 환각 방지]
 get_orders 결과를 사용자에게 안내할 때 다음 원칙을 반드시 지킨다.
@@ -1625,14 +1641,17 @@ async def chat_node(state: AgentState) -> dict:
         "- '협상 중 주문' → status_in=['NEGOTIATING'], '확정된 주문' → status_in=['CONFIRMED'], '배송 중 주문' → status_in=['SHIPPING'], '준비 중 주문' → status_in=['PREPARING'], '견적 요청' / '들어온 견적' → status_in=['QUOTE_REQUESTED']\n"
         "- 사용자가 특정 상태를 명시하지 않고 그냥 '주문 보여줘', '주문 목록', '주문 좀 확인해줘'라고 하면 → 진행 중 기본값 status_in=['QUOTE_REQUESTED','NEGOTIATING','CONFIRMED','PREPARING','SHIPPING'] 로 호출 (완료·취소는 사용자가 명시 요청할 때만 포함).\n"
         "\n"
-        "[거래처 목록 조회 가이드 — 자연어 → status 매핑 (매우 중요)]\n"
-        "- 사용자가 거래처 목록을 묻는 발화는 표현이 다양해도 항상 get_partners 의 status 단일 상태 파라미터로 정확히 매핑한다. 사용자가 '활성 거래처와 보낸 신청 둘 다 보여줘' 처럼 명시적으로 여러 상태를 한꺼번에 요청한 경우에만 status_in 배열을 사용하고, 그 외에는 status 단일을 우선한다.\n"
-        "- '거래처 목록' / '내 거래처' / '거래 중인 곳' / '거래처 보여줘' / '거래하고 있는 거래처' / '내가 거래하는 사람들' → get_partners(user_id={user_id}, status='ACTIVE')\n"
-        "- '보낸 거래처 신청' / '신청 보낸 곳' / '내가 신청한 거래처' / '보낸 요청' → get_partners(user_id={user_id}, status='PENDING_OUTGOING')\n"
-        "- '받은 거래처 신청' / '들어온 거래처 요청' / '거래처 신청 왔어?' → 단독 조회 시 get_incoming_partner_requests(user_id={user_id}) 우선 사용. 다른 상태와 함께 묻는 맥락에서만 get_partners(user_id={user_id}, status='PENDING_INCOMING').\n"
-        "- '거절된 거래처' / '비활성 거래처' / '거래 종료된 곳' → get_partners(user_id={user_id}, status='INACTIVE')\n"
-        "- 사용자가 상태를 명시하지 않고 그냥 '거래처 보여줘', '거래처 목록'이라고 하면 → 기본값 status='ACTIVE' 로 호출 (PENDING/INACTIVE 는 사용자가 명시 요청할 때만 포함).\n"
-        "- 거래처 응답 표시 규칙: 도구 결과가 0건이면 '현재 활성 거래처가 없습니다' (또는 status 에 맞춰 '보낸 거래처 신청이 없습니다' / '거절된 거래처가 없습니다') 정도로만 안내. 다른 정보(주문 내역, 상품 추천, 다른 카테고리 거래처)를 늘어놓지 마라. 도구가 반환하지 않은 거래처는 절대 응답에 포함하지 마라. 도구 결과 외 임의 정보 추가 금지. 마크다운 강조·표·헤더 금지, 자연체 한국어로 안내.\n"
+        "[거래처 목록 조회 가이드 — 매우 중요]\n"
+        "- 사용자가 거래처 목록을 묻는 발화는 표현이 다양하다. 일반 발화는 ACTIVE + PENDING 까지 모두 가져와 상태별로 분류해 답하고, 사용자가 특정 상태만 콕 집어 물었을 때는 그 상태만 단독 조회한다.\n"
+        "- (전체 조회 — 일반 발화 기본값) '거래처 목록' / '내 거래처' / '거래처 보여줘' / '거래처 다 알려줘' / '거래처 현황' / '거래하고 있는 거래처' / '내가 거래하는 사람들' → get_partners(user_id={user_id}, status_in=['ACTIVE','PENDING_OUTGOING','PENDING_INCOMING']). 결과를 '거래 중 N곳, 보낸 신청 N곳, 받은 신청 N곳' 으로 분류해서 답변한다.\n"
+        "- (상태별 단독 조회)\n"
+        "  · '거래 중' / '활성 거래처' / '거래중인 곳' / '지금 거래하는 곳만' → get_partners(user_id={user_id}, status='ACTIVE')\n"
+        "  · '승인 대기' / '신청 대기' / '기다리는 거래처' / '보낸 신청' / '내가 신청한 거' / '신청 보낸 곳' / '보낸 요청' → get_partners(user_id={user_id}, status='PENDING_OUTGOING')\n"
+        "  · '받은 신청' / '들어온 거래처 신청' / '수락 대기' / '거래처 신청 왔어?' → 단독 조회 시 get_incoming_partner_requests(user_id={user_id}) 우선. 다른 상태와 함께 묻는 맥락에서만 get_partners(user_id={user_id}, status='PENDING_INCOMING').\n"
+        "  · '거절된 거래처' → get_partners(user_id={user_id}, status='REJECTED')\n"
+        "  · '비활성 거래처' / '끊긴 거래처' / '거래 종료된 곳' → get_partners(user_id={user_id}, status='INACTIVE')\n"
+        "- 응답 표현 규칙: 전체 조회는 '현재 거래처 현황입니다. - 거래 중: ○○(역할) 1곳 - 보낸 신청: △△ 1곳 (수락 대기 중) - 받은 신청: 없음' 처럼 상태별로 묶어 안내. 상태별 단독 조회는 그 상태만 깔끔하게 안내하고 다른 상태 정보를 끼워 넣지 마라. 0건이면 그 상태만 정확히 안내(예: '보낸 거래처 신청이 없습니다'), 다른 정보(주문 내역, 상품 추천 등) 늘어놓기 금지. 도구가 반환하지 않은 거래처는 절대 응답에 포함하지 마라. 마크다운 강조·표·헤더 금지, 자연체 한국어로 안내.\n"
+        "- 금지사항: 일반 발화에서 ACTIVE 만 조회하고 PENDING 거래처를 누락하기. '승인 대기 중인 거래처 요청이 없습니다' 라고 답하기 전 PENDING_OUTGOING / PENDING_INCOMING 으로 실제 조회했는지 확인 안 하기. 0건일 때 다른 정보 늘어놓기.\n"
         "\n"
         "[주문 응답 표시 규칙 — 환각 방지 (매우 중요)]\n"
         "- 도구가 반환한 status enum 값을 그대로 자연스러운 한국어로 풀어 사용한다. 임의로 '협상 요청 중', '상태 없음', '검토 중', '보류' 같이 enum 에 없는 표현을 만들어내지 마라.\n"
