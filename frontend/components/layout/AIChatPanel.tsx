@@ -205,7 +205,7 @@ export default function AIChatPanel() {
           type="button"
           onClick={() => scrollToBottom(true)}
           aria-label="맨 아래로 이동"
-          className={`absolute -top-5 left-1/2 -translate-x-1/2 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-600 shadow-md hover:bg-gray-50 hover:text-primary-600 transition-opacity duration-200 ${
+          className={`absolute -top-8 left-1/2 -translate-x-1/2 z-10 flex h-9 w-9 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-600 shadow-md hover:bg-gray-50 hover:text-primary-600 transition-opacity duration-200 ${
             isAtBottom || turns.length === 0
               ? 'pointer-events-none opacity-0'
               : 'opacity-100'
