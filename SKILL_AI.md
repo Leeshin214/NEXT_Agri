@@ -851,3 +851,40 @@ create_subscription_from_order,
 - **검증된 패턴 — `@tool` 없는 함수를 같은 모듈에 두는 격리 원칙**: `analyze_chat_consensus` 는 chat 도메인 의미적으로는 chat 모듈에 살아야 하지만, LLM 도구가 아니라 chat_ws.py 가 직접 호출하는 background 분석 함수. 별도 파일을 만들지 않고 같은 모듈 하단에 `# === LLM 도구 외 함수 ===` 주석 섹션으로 분리 + `@tool` 미부착. ToolRegistry 가 자동으로 LLM 노출에서 제외하므로 별도 코드 변경 없이 격리됨. CONSENSUS_SYSTEM_PROMPT / _CONSENSUS_FALLBACK 같은 동반 상수도 같은 섹션에 둠.
 - **검증된 패턴 — chat 도메인 helper 가 같은 모듈에 함께 사는 자연스러움**: `_resolve_chat_room_candidates` / `_do_send_chat_message` 는 send_chat_message 만 사용하는 internal helper. order/subscription 같은 다른 도메인 모듈에서는 lazy import 안 함. 도메인 모듈은 자신의 internal helper 를 module-level 에 둘 수 있고, cross-domain helper (`_UUID_PATTERN`) 만 lazy import — 이 분리가 코드 가독성과 PR 4 의 _shared.py 마이그레이션 모두 단순하게 만든다.
 - **검증된 함정 — 옛 test 가 silent pass 하는 사례**: PR 3 적용 전, `test_domain_modules_register_37_tools` 는 `_PR2_DOMAIN_MODULES` 에 chat 모듈을 포함하지 않아 chat 등록이 silent skip 되었지만 (registry clear 후 import 시 chat 은 안 등록됨), 테스트 자체는 37 을 expect 하므로 통과했다. PR 3 에서 `_PR3_DOMAIN_MODULES` 에 chat 추가 + expect 40 으로 동시 변경 안 하면 (a) 37 expect → 40 actual 로 실패, 또는 (b) chat 모듈을 _PR3 에 추가하지 않으면 silent skip 으로 잘못된 안전감 발생. **새 도메인 모듈 추가 시 test 의 _PR{n}_DOMAIN_MODULES 리스트도 동시에 업데이트하는 것이 PR-by-PR 회귀 차단의 핵심**.
+
+#### 도구 모듈화 리팩터링 — PR 5: int_fields 자동 추출 + 도구 smoke 테스트 (2026-05-04 완료)
+- PR 5 의 핵심 가치 — **도구 시그니처가 단일 진실의 원천 (Single Source of Truth)**: 옛 구조에서는 도구 함수의 `quantity: int` 어노테이션과 `@tool(int_fields=frozenset({"quantity"}))` 명시가 두 곳에 따로 적혀 있어 한쪽만 갱신해도 silent 누락이 가능했다 (`get_calendar_events.year/month`, `get_chat_messages.limit` 가 그 사례 — 시그니처는 int 인데 명시는 누락). PR 5 가 `tool(int_fields=None)` 을 기본값으로 두고 데코레이터 내부에서 `_auto_int_fields(fn)` 으로 함수 시그니처를 inspect 해 자동 추출하면서, 명시값이 있으면 명시 우선·없으면 자동 — **명시 + 자동 병행 fallback** 패턴 채택.
+- 변경 파일 (1):
+  - `backend/app/services/agent/_registry.py` (+60 lines, 105 → 165 lines) — `_auto_int_fields(fn)` 헬퍼 추가, `tool(...)` 의 `int_fields: frozenset[str] | None = None` 기본값으로 전환, 데코레이터 내부에서 `int_fields if int_fields is not None else _auto_int_fields(fn)` 로 분기. `types.UnionType` (PEP 604 `int | None`) 과 `typing.Union` (`Optional[int]` / `Union[int, None]`) 둘 다 처리.
+- 신규 테스트 파일 (2):
+  - `backend/tests/test_auto_int_fields.py` (17 케이스) — `_auto_int_fields` raw 함수 테스트 11종 (int, Optional[int], int|None, str 제외, default 값, 어노테이션 없음, list[int] 제외, return 무시, 평가 실패 시 빈 set) + 데코레이터 통합 4종 (auto 추출, 명시 우선, 빈 frozenset 명시 = 자동 끄기, int 없는 함수) + 도메인 모듈 적용 검증 2종 (기존 명시값 보존, year/month/limit 신규 자동 추출).
+  - `backend/tests/test_tools_smoke.py` (18 케이스) — 8 도메인 모듈 로드 검증, 41 도구 등록 카운트, 그룹 분포 (34/4/3), schema 형식 검증 (name/description/parameters), 도구별 시그니처 sanity (get_products/create_order/find_alternative_partners/create_subscription_request/submit_counter_offer/get_user_profile/get_calendar_events/get_chat_rooms/get_chat_messages), `analyze_chat_consensus` 미등록 + callable, `_find_product_by_name` / `_shared` 헬퍼 import 검증.
+- 검증 (모두 PASSED, 47/47):
+  1. `pytest tests/test_agent_registry.py tests/test_auto_int_fields.py tests/test_tools_smoke.py --noconftest` — 12 + 17 + 18 = **47 passed**.
+  2. `INT_FIELDS` 자동 합집합 = `{limit, min_order_qty, month, new_quantity, new_unit_price, price_per_unit, proposed_total_amount, quantity, stock_quantity, unit_price, year}` (11 필드). 기존 명시 8 필드 보존 + 자동 3 신규 (`year`, `month`, `limit`) — superset 안전.
+  3. orchestrator.execute_tool 의 inline `INT_FIELDS = {...}` 8 필드 (옛 하드코딩) 와 비교: registry 자동 합집합이 추가로 `limit` 까지 잡아 더 정확. orchestrator 본체 통합은 별도 PR.
+- **검증된 패턴 — `_auto_int_fields(fn)` PEP 604 호환 추출**:
+  ```python
+  def _auto_int_fields(fn):
+      try: hints = get_type_hints(fn)
+      except Exception: return frozenset()  # forward-ref 평가 실패 시 안전
+      result = set()
+      for param_name, hint in hints.items():
+          if param_name == "return": continue
+          if hint is int: result.add(param_name); continue
+          origin = get_origin(hint)
+          # typing.Union (Optional[int]) + types.UnionType (int | None) 둘 다 처리
+          if origin is Union or origin is types.UnionType:
+              args = [a for a in get_args(hint) if a is not type(None)]
+              if len(args) == 1 and args[0] is int:
+                  result.add(param_name)
+      return frozenset(result)
+  ```
+  - `from __future__ import annotations` 가 도메인 모듈에 적용되어 어노테이션이 문자열로 보존돼도 `typing.get_type_hints(fn)` 이 평가해 실제 타입 객체로 변환. raw `__annotations__` 비교는 작동 안 함 (테스트도 `get_type_hints` 사용 필수).
+  - `list[int]` / `Optional[list[int]]` 같은 컨테이너 타입은 LLM 입력에서 직접 변환 대상이 아니므로 제외 (origin 이 list 라 Union 분기로 안 들어감).
+- **검증된 패턴 — `int_fields=None` vs `int_fields=frozenset()` 의미 구분**: 두 값을 모두 허용하되 서로 다른 의미.
+  - `None` (기본): "선언 안 함 → 자동 추출 적용"
+  - `frozenset()` (빈 frozenset 명시): "이 도구는 int 변환 대상 0개 — 자동 추출도 끄기" (강제 선언)
+  - 이 분리가 없으면 default 값이 `frozenset()` 일 경우 자동 추출이 영영 안 켜진다. `None` 을 sentinel 로 사용하는 패턴이 표준.
+- **검증된 함정 — `from __future__ import annotations` 적용 모듈에서 raw `__annotations__` 비교 무용**: `inspect.get_annotations(fn)` 또는 `fn.__annotations__` 는 stringified 된 어노테이션 (`'int'`) 을 그대로 반환해 `is int` 비교가 항상 False. 반드시 `typing.get_type_hints(fn)` 으로 실제 타입 객체로 평가한 뒤 비교. 도메인 도구가 모두 `from __future__ import annotations` 사용하므로 `_auto_int_fields` 와 테스트 둘 다 `get_type_hints` 사용 필수. raw annotation 으로 짠 첫 시도 테스트 2개가 `'int' is int` 로 실패한 사례 — 항상 `get_type_hints` 우선.
+- **smoke 테스트 설계 원칙**: 도구당 깊은 비즈니스 로직 (모든 분기, RLS, race condition) 까지 mock 으로 검증하는 건 비용 대비 회귀 가치가 낮다. PR 5 는 "import → 등록 → callable → schema 형식 → 시그니처 키워드 sanity" 의 5단계 smoke 만 커버. 깊은 mock 테스트는 도구별 버그가 실제 발생할 때 핀포인트로 추가 (회귀 진단 비용이 발생할 때만). 이 원칙으로 PR 5 의 18 smoke 테스트가 **0.04 초** 안에 8 도메인 + 41 도구 등록 정합성 검증을 한 사이클에 끝냄.
