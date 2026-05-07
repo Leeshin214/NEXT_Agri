@@ -16,6 +16,94 @@ from .._registry import tool
 
 
 # ─────────────────────────────────────────────
+# 내부 헬퍼
+# ─────────────────────────────────────────────
+
+def _trigger_buyer_alternative_on_cancel(supabase, order_id: str) -> None:
+    """주문 취소 시 구매자에게 대체 거래처 탐색 결과를 ai_conversations에 삽입 + 알림."""
+    from app.services.agent.tools.partner import find_alternative_partners
+    from app.services.notification_service import notification_service
+    import asyncio
+
+    # 주문 정보 조회
+    order_res = supabase.table("orders").select("buyer_id, seller_id").eq("id", order_id).single().execute()
+    if not order_res.data:
+        return
+    buyer_id = order_res.data["buyer_id"]
+
+    # 첫 번째 상품 정보 조회
+    items_res = supabase.table("order_items").select("product_id, quantity").eq("order_id", order_id).limit(1).execute()
+    item_rows = items_res.data or []
+    product_name = "상품"
+    product_category = "VEGETABLE"
+    original_quantity = None
+    original_unit = "kg"
+    if item_rows:
+        original_quantity = item_rows[0].get("quantity")
+        pid = item_rows[0].get("product_id")
+        if pid:
+            prod_res = supabase.table("products").select("name, category, unit").eq("id", pid).single().execute()
+            if prod_res.data:
+                product_name = prod_res.data.get("name", "상품")
+                product_category = prod_res.data.get("category", "VEGETABLE")
+                original_unit = prod_res.data.get("unit", "kg")
+
+    # 대체 거래처 탐색
+    alternatives_result = find_alternative_partners(buyer_id, "BUYER", product_category, "주문 취소")
+    alternatives = alternatives_result.get("alternatives", [])
+
+    qty_hint = f" (원래 주문: {original_quantity}{original_unit})" if original_quantity else ""
+    if alternatives:
+        lines = [f"주문이 취소됐습니다. {product_name} 대체 거래처를 찾아드렸어요{qty_hint}!\n"]
+        for i, a in enumerate(alternatives[:5], 1):
+            name = a.get("name") or a.get("company_name") or "판매자"
+            company = a.get("company_name", "")
+            stock = a.get("stock_quantity")
+            trades = a.get("trade_count")
+            line = f"{i}. {name}" + (f" ({company})" if company and company != name else "")
+            if stock is not None:
+                line += f" — 재고 {stock}{a.get('unit', '')}"
+            if trades is not None:
+                line += f", 거래 {trades}회"
+            lines.append(line)
+        lines.append(f'\n👉 AI 도우미에서 "N번째 판매자한테 {product_name} {original_quantity or ""}{original_unit} 견적 요청해줘"라고 입력하세요.')
+        ai_response = "\n".join(lines)
+    else:
+        ai_response = f"주문이 취소됐습니다. 현재 {product_name}을(를) 대체할 거래처를 찾지 못했어요."
+
+    supabase.table("ai_conversations").insert({
+        "user_id": buyer_id,
+        "prompt": f"[자동] {product_name} 주문 취소 — 대체 거래처 탐색",
+        "response": ai_response,
+        "prompt_type": "ORDER_CANCELLED",
+    }).execute()
+
+    # 알림 (동기 컨텍스트에서 비동기 emit 실행)
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(notification_service.emit(
+                user_id=buyer_id,
+                notification_type="ORDER_CANCELLED",
+                title="주문 취소 — 대체 거래처 안내",
+                body=f"{product_name} 주문이 취소됐습니다. AI 도우미에서 대체 거래처를 확인해보세요.",
+                link_url="/buyer/ai-assistant",
+                order_id=order_id,
+            ))
+        else:
+            loop.run_until_complete(notification_service.emit(
+                user_id=buyer_id,
+                notification_type="ORDER_CANCELLED",
+                title="주문 취소 — 대체 거래처 안내",
+                body=f"{product_name} 주문이 취소됐습니다. AI 도우미에서 대체 거래처를 확인해보세요.",
+                link_url="/buyer/ai-assistant",
+                order_id=order_id,
+            ))
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
 # 주문 관련 도구
 # ─────────────────────────────────────────────
 
@@ -69,6 +157,14 @@ from .._registry import tool
                     "완료/취소는 명시적으로 요청한 경우에만 포함."
                 ),
             },
+            "product_keyword": {
+                "type": "string",
+                "description": (
+                    "품목명 키워드 필터 (선택). 사용자가 '돼지고기', '삼겹살', '사과' 등 특정 품목을 언급하면 "
+                    "해당 키워드를 전달해 그 품목만 포함된 주문만 반환한다. "
+                    "예: '돼지고기 주문 취소' → product_keyword='돼지고기'"
+                ),
+            },
         },
         "required": ["user_id", "role"],
     },
@@ -79,6 +175,7 @@ def get_orders(
     role: str,
     status: Optional[str] = None,
     status_in: Optional[list[str]] = None,
+    product_keyword: Optional[str] = None,
 ) -> dict:
     """사용자의 주문 목록을 조회한다. role에 따라 buyer_id / seller_id로 필터링.
 
@@ -183,6 +280,21 @@ def get_orders(
             row["item_summary"] = ", ".join(item_summaries) if item_summaries else None
             row["items_count"] = len(items)
             flattened.append(row)
+
+        # product_keyword 필터 — 품목명에 키워드 포함된 주문만
+        if product_keyword:
+            kw = product_keyword.replace(" ", "").lower()
+            # 돼지고기 → 삼겹살/목살/돼지 등 포함 처리를 위한 동의어 맵
+            _pork_kw = {"돼지고기", "돼지", "pork"}
+            _pork_names = {"삼겹살", "목살", "항정살", "앞다리", "뒷다리", "돼지", "돈육"}
+            def _matches(row: dict) -> bool:
+                names_str = (row.get("product_summary") or "").replace(" ", "").lower()
+                item_str = (row.get("item_summary") or "").replace(" ", "").lower()
+                combined = names_str + item_str
+                if kw in _pork_kw:
+                    return any(p in combined for p in _pork_names) or kw in combined
+                return kw in combined
+            flattened = [r for r in flattened if _matches(r)]
 
         return {
             "success": True,
@@ -426,6 +538,15 @@ def update_order_status(
 
         if inventory_result is not None:
             response["inventory_deduction"] = inventory_result
+
+        # 취소 전환 시 구매자 대체 거래처 탐색 + 알림
+        if new_status == "CANCELLED":
+            try:
+                _trigger_buyer_alternative_on_cancel(supabase, order_id)
+                response["buyer_notified"] = True
+            except Exception as e:
+                print(f"[update_order_status] 대체 거래처 트리거 실패 (무시): {type(e).__name__}: {e}")
+                response["buyer_notified"] = False
 
         return response
 
@@ -760,8 +881,9 @@ def create_order(
             )
             next_action_hint = (
                 "사용자에게 견적이 전달됐고 판매자 응답을 기다리는 중임을 안내하세요. "
-                "사용자가 '채팅방 열어줘'라고 하면 open_chat_room 호출 시 반드시 이 order_id와 "
-                "seller_id를 함께 사용하세요."
+                f"사용자가 '채팅방 열어줘'라고 하면 open_chat_room 호출 시 "
+                f"order_id='{order_id}'(UUID)와 partner_user_id=seller_id를 반드시 사용하세요. "
+                "order_number(ORD-... 형식)는 절대 order_id로 사용하지 마세요."
             )
 
         return {
