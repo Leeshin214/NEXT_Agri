@@ -1652,6 +1652,20 @@ class OrderService:
                 f"{type(e).__name__}: {e}"
             )
 
+        # ────────────────────────────────────────────
+        # 판매자가 활성 주문을 취소한 경우 → 대체 거래처 자동 추천 + 자동 견적 (fire-and-forget)
+        # 협상 결렬·재고 부족 등 어떤 이유로든 SELLER 가 직접 취소하면 BUYER 입장에선
+        # 대안 판매자 후보를 즉시 받아볼 수 있어야 한다 (구매자 오프라인이어도 알림 + DB 저장).
+        # 실패해도 cancel_order 트랜잭션에 영향 없음 — find_and_notify 내부에서 모든 예외 흡수.
+        # ────────────────────────────────────────────
+        if user_role == "SELLER" and updated_order:
+            from app.services.alternative_partner_service import (
+                alternative_partner_service,
+            )
+            asyncio.create_task(
+                alternative_partner_service.find_and_notify(updated_order)
+            )
+
         return updated_order
 
     # ===========================================

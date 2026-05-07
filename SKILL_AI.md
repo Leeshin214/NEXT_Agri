@@ -19,6 +19,7 @@ OpenAI API 를 활용한 AI 업무 도우미 기능을 구현한다.
 | 채팅 합의 감지 | agent_tools.analyze_chat_consensus | 채팅 메시지 → 합의/협상/거절/일반 분류, 합의 시 주문·캘린더 자동 생성 (AgenticPay) |
 | 채팅 협상 의도 감지 | services.negotiation_detection_service | 평문 메시지 → 품목/수량/단가 추출. confidence>=0.7 만 metadata.draft_negotiation 저장 + 발신자 본인에게만 WS push. **자동 등록 X** (사용자 [등록] 클릭 필수). |
 | 메인 오케스트레이터 | POST /ai/agent/chat | tool_use 기반 — DB 조회/수정 도구 자체 선택 |
+| 대체 거래처 자동 추천 | services.alternative_partner_service | 판매자 취소 시 fire-and-forget. 1차 후보 풀 = (category eq) UNION (name ilike) — 같은 상품이 다른 카테고리에 등록된 케이스도 포함 (예: 한 셀러는 감자=GRAIN, 다른 셀러는 감자=VEGETABLE). LLM 으로 본질 상품 동일성 판별 ('창원 감자' = '여주 감자' 통과, '고구마' / '감자전' 차단). 상위 3건 셀러에게 자동 견적 생성 — **가격 결정**(2026-05-07): `effective_unit_price = min(원래 주문가, 새 셀러 표시가)`. 기존이 더 쌈 → 자동 카운터오퍼 (NEGOTIATING), 새 셀러가 더 쌈 → 그 단가로 QUOTE_REQUESTED. order_service.create_order(auto_confirm=True) 분기 활용. + ALTERNATIVE_PARTNERS 알림 emit. JSON-mode (response_format={"type":"json_object"}), temperature=0, fallback: 정규화 substring 일치 |
 
 ---
 
@@ -539,7 +540,7 @@ create_subscription_from_order,
 #### 새 tool 함수 패턴
 - `open_chat_room`: chat_rooms 테이블 직접 조회, 양방향 검색(자신의 role에 따라 seller_id/buyer_id 배치)
 - `get_calendar_events`: `calendar.monthrange(year, month)[1]`로 말일 계산, `.is_("deleted_at", None)` 패턴 준수
-- `create_calendar_event`: order_id 빈 문자열이면 None으로 저장
+- `create_calendar_event`: order_id 빈 문자열이면 None으로 저장. **시간 처리 (2026-05-06)**: `start_time`/`end_time` 파라미터(HH:MM 24시간제) 지원 — 사용자가 시간을 명시하면(예: "오후 2시", "14:00") 반드시 `start_time` 채워야 한다. `start_time` 채워지면 자동으로 `is_allday=False` 세팅되어 시간 표시. `start_time` 생략 시 DB DEFAULT(`is_allday=true`) 적용으로 종일 일정 등록. 도구 description 자체에 "시간 명시 시 start_time 필수" 안내 박혀 있음 — 추가 시스템 프롬프트 가이드 불필요. `update_calendar_event` 도 동일 파라미터 지원 (시간 추가/변경 시 채우면 됨). 이전 버그: 도구 스키마에 시간 파라미터가 없어 LLM이 시간을 받아도 전달 못 해 모든 AI 등록 일정이 종일로 처리되던 문제 수정.
 - `find_alternative_partners`: BUYER→products+partners 조인, SELLER→order_items+partners 조인. 정렬 금지, LLM이 추천 순위 생성
 - `get_user_profile`: **username → company_name → user_id** 우선순위 검색 (2026-05-05 갱신). user_id 는 `username/company_name 모두 비어 있을 때만` 폴백 동작. asyncio 없이 동기 호출. ILIKE 부분 일치는 `limit(5)` 로 쿼리하되 첫 번째 결과만 반환 (동명이인 대비).
 
@@ -639,6 +640,51 @@ create_subscription_from_order,
   - `chat_node` 시스템 프롬프트 — [needs_confirmation 응답 가이드] 직후에 (1) 자연어 협상/납품일 → 카드 도구 매핑, (2) 거래처 등록 / 정기배송 자연어 매핑, (3) 재고 vs 대체 분리 3개 섹션 직접 명시(chat intent 라우팅 시 가장 자주 호출되는 노드라 BASE 와 별도로 보강).
 - 핵심 안전장치: 가격/날짜/주기 같은 필수 정보가 발화에서 빠지면 도구 호출 X → 되묻기. 정보가 명확히 있으면 이중 confirmation 없이 즉시 호출(UX). 카드는 즉시 발송되어 채팅방에 PENDING 으로 노출되므로 도구 호출 직후 "○○으로 카드를 보냈습니다. 상대방이 수락/거절하면 알려드릴게요" 형식의 후속 흐름 안내 강조.
 - 환각 방지: "참치 찾아줘" → product_name='참치'만 정확 검색. 0건이라도 새우/연어 같은 다른 품목 추천 절대 금지. 사용자 명시 동의 후에만 find_alternative_partners 호출. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에 동시 호출 금지.
+- 카테고리 over-narrowing 방어 (2026-05-06): `find_sellers_by_product` 호출 시 사용자가 특정 상품명만 언급했으면 `product_name` 만 채우고 `category` 는 비워둔다(category description 도 강조). 같은 상품명이 다른 카테고리(예: 감자 = VEGETABLE / GRAIN)에 동시에 등록될 수 있어 LLM이 임의 추론한 카테고리로 좁히면 동명 상품이 누락된다. 코드 측 안전장치도 보강됨 — `product_name` 과 `category` 가 둘 다 들어와도 도구 내부에서 카테고리 무관 ILIKE 결과를 추가 union 해 누락 방지(backend/app/services/agent/tools/user.py find_sellers_by_product).
+
+#### history echo 차단 정책 (2026-05-06)
+사용자가 같은/유사 발화를 반복했을 때 LLM(temperature=0)이 직전 응답을 그대로 복제(echo)하면서 도구 재호출을 생략하는 버그가 반복됐다 (예: "감자 상품 조회해줘" 두 번 → 두 번째는 옛 응답 복붙, 그 사이 새로 등록된 상품 누락). 같은 prompt 가 들어와도 항상 fresh 도구 호출이 일어나야 한다는 사용자 정책에 따라 두 레이어로 차단:
+
+**(1) [backend/app/api/v1/ai_assistant.py](backend/app/api/v1/ai_assistant.py) — history 빌드에서 raw 응답 본문 가리기**
+- `tool_context` 가 있는 (= 직전 턴이 도구 호출 결과로 답한) row 의 `assistant_content` 본문은 LLM 에 그대로 넘기지 않고 다음 마킹으로 교체:
+  `[이전 턴 메타: 도구 X 호출됨. 구체적 데이터(가격/재고/목록/잔여 수량 등)는 매 발화마다 도구로 새로 조회해야 한다. 이 메시지를 캐시 답변으로 재사용 금지.]`
+- 직전 조회의 식별자 재활용은 가능하도록 `_extract_uuid_context` UUID hint 는 마킹 끝에 그대로 첨부 ("그 판매자한테 주문해줘" 류 follow-up 의 seller_id 매핑 보존).
+- `tool_context` 없는 row(인사 / GENERAL 답변 / 되묻기 등)는 본문 그대로 보존.
+- 이전에 있던 "동일 prompt 면 history 에서 제거" 로직은 마킹 정책으로 대체되어 제거됨 (히스토리 길이 보존이 컨텍스트 안정성에 유리).
+
+**(2) [orchestrator.py AGENT_BASE_SYSTEM](backend/app/services/orchestrator.py) — LLM 시스템 프롬프트에 강제 가이드 추가**
+- "[컨텍스트 유지와 재검색]" 섹션에 "🚨 history echo 절대 금지" 항목 추가 — "사용자가 데이터(상품/판매자/주문/재고/거래처/정기배송/일정 등) 를 묻거나 작업을 요청한 모든 경우 history 캐시 신뢰 금지, 반드시 해당 도구를 새로 호출해 fresh 결과를 받아라. 같은 prompt 가 직전에 있었더라도 동일 적용."
+- "[이전 턴 메타: ...]" 마킹을 만나면 raw 데이터 추측 금지 + 도구 재호출 명시.
+
+E2E 검증 (실제 OpenAI 호출): 같은 prompt 3연속 호출 → 3회 모두 도구 호출되고 새로 등록된 상품(예: GRAIN 감자) 도 포함됨을 확인.
+
+#### create_order hard guard — 날짜·가격 임의 추정 차단 (2026-05-06)
+LLM 이 시스템 프롬프트와 도구 description 에 명시된 가이드를 무시하고 임의로 날짜/가격을 채우는 사고가 반복됐다 (예: 사용자 "감자 7kg 주문 넣어줘" → LLM 이 delivery_date='2026-05-14'(임의) + unit_price=3000(다른 셀러 가격) 으로 호출 → auto_confirm=True 분기에서 자동 카운터오퍼 발사 → NEGOTIATING + total=21,000 의 의도되지 않은 주문 생성). 사용자 정책: "그냥 주문해달라고 하면 표시가로, 납품일·가격 미언급이면 되묻기" — soft 가이드만으로는 100% 보장 불가능하므로 백엔드 레이어에 hard guard 도입.
+
+**위치**: [orchestrator.py `_guard_create_order_args`](backend/app/services/orchestrator.py) — `inventory_order_node` 의 `_fix_id_params` 직후, `_execute_tool` 직전에 호출. 위반 감지 시 `_execute_tool` 을 skip 하고 LLM 에 거부 응답 JSON 을 돌려보내 다음 라운드에서 사용자에게 되묻도록 유도.
+
+**판정 기준**:
+- **납품일 가드**: `state["message"]` (현재 사용자 발화) 에 날짜 표현 정규식 `_DATE_HINT_RE` (○월/○일/YYYY-MM-DD/M/D/오늘/내일/모레/글피/이번 주·달/다음 주·달/요일) 매칭 없음 + tool 인자에 `delivery_date` 채워짐 → `error: 'delivery_date_not_in_user_message'` 거부.
+- **가격 가드 (cross-contamination 방지)**: 사용자 발화에 가격 표현 정규식 `_PRICE_HINT_RE` (n원/n만원/kg당/박스당/총가/전체로 등) 매칭 없음 + `product_id` 가 UUID 형식 → DB 에서 그 product 의 `price_per_unit` 조회 → LLM 의 `unit_price` 와 다르면 `error: 'unit_price_mismatch_no_user_price'` 거부. (가격 명시 시 가드 skip — 협상 의도는 LLM 자유 통과.)
+- **셀러 매칭 가드**: 가격 가드 호출 중 `product_id.seller_id` 와 tool 인자 `seller_id` 가 다르면 `error: 'seller_product_mismatch'` 거부.
+
+**False positive 방어**: DB 조회 실패 시 가드를 발동시키지 않고 통과 (best-effort), `product_id` 가 UUID 가 아닐 때(상품명 평문 입력) 가격 가드 skip — `agent_tools.create_order` 의 `_find_product_by_name` 단계에서 처리되도록 위임.
+
+**시스템 프롬프트 동시 보강**: `[🚨 구매자 주문/견적 생성 규칙]` 섹션에 (a) 셀러 매칭 강제 (cross-contamination 금지 명시), (b) 가격 단위 모호성 처리 (kg당 vs 총가 → 둘 다 합리적이면 되묻기), (c) hard guard 활성화 안내 (거부 응답 받으면 사용자에게 되묻기 유도).
+
+#### 되묻기 응답 보존 + router follow-up 가드 (2026-05-06)
+이전의 history echo 차단 정책이 의도치 않게 follow-up 컨텍스트를 잃게 만들어 router 가 잘못된 부서로 라우팅하는 사고가 발생했다. 사례: AI 가 "납품일은 언제로 할까요?" 되묻기 후 사용자 답변 "5월 22로 해줘" 가 들어오면, 직전 응답 본문이 마킹으로 가려져 router 가 ORDER follow-up 임을 알 수 없고, 단순히 날짜 표현만 보고 CALENDAR(DATA) 로 분류 → `update_calendar_event` 호출 → 사용자가 등록해 둔 다른 캘린더 일정이 잘못 변경됨.
+
+**Layer 1 — 마킹 정책 세분화** ([ai_assistant.py `_is_followup_question`](backend/app/api/v1/ai_assistant.py)):
+- tool_context 가 있는 응답이라도 본문이 "되묻기" 로 끝나면 마킹 교체 X, 본문 보존.
+- 판정 기준: `_FOLLOWUP_TAIL_RE` (응답 끝 ~120자에 `?` / "언제로 할까요" / "얼마로 할까요" / "알려/말씀해/선택해 주세요" / "어느/어떤/어디로" / "몇 kg/박스/개" 등 의문·요청 패턴 매칭) 또는 tool_results 의 모든 호출이 `success=False` (hard guard 차단 등 — raw 데이터 노출 없음).
+- 둘 다 echo 위험이 낮은 케이스이므로 본문을 그대로 두면 다음 턴 router 가 컨텍스트를 보고 정확히 라우팅.
+
+**Layer 2 — router 시스템 프롬프트 follow-up 가드** ([_build_router_system 의 [모호성 해결] 섹션](backend/app/services/orchestrator.py)):
+- `(주문 후속 답변 보호)`: 직전 assistant 가 주문 진행 중 정보(납품일/가격/수량/판매자) 를 되물었고 사용자가 짧은 답변(날짜/가격/수량/선택) 을 한 경우 무조건 ORDER 분류. "5월 22로 해줘", "내일", "kg당 18000원에", "10kg" 등은 일정/캘린더 키워드가 없으므로 CALENDAR 분류 절대 금지.
+- `(캘린더 후속 답변 보호)`: 직전 assistant 가 캘린더 일정 등록·변경 진행 중 되물은 경우에만 사용자의 짧은 답변을 CALENDAR(DATA) 로. 직전이 단순 "납품일 묻기" 면 ORDER 후속 답변 보호 규칙 적용.
+
+E2E 검증 (실제 OpenAI 호출): "감자 8kg 주문" → hard guard 차단 → "언제 납품 받으실까요?" 되묻기 → 사용자 "5월 22로 해줘" → router ORDER 분류 → create_order(delivery_date='2026-05-22', unit_price=20000, total=160000) 정상. 동시에 사용자가 등록해 둔 5월 14일 직원 미팅 캘린더 이벤트는 손대지 않음. 회귀: "5월 27일 오후 2시에 거래처 미팅 일정 등록해줘" 같은 명시적 캘린더 발화는 여전히 CALENDAR 분기.
 - 도구 시그니처는 실제 함수 정의 그대로 매핑 (notes/proposed_total_amount/proposed_delivery_date/offer_id/change_id 등 실제 키 사용). placeholder 추가 없음 → KeyError 위험 0. AST OK, SELLER/BUYER 합성본 모두 _render_agent_system 통과 확인 완료.
 
 #### 구매자 주문/견적 생성 가이드 (2026-05-04 갱신 — auto_confirm 제거, delivery_date 필수화)
@@ -1109,3 +1155,36 @@ create_subscription_from_order,
 - **핵심 교훈 — 파라미터 description 가이드는 호출 자체를 막을 수 없다**: `order_id` 파라미터 설명 안에 "0개면 안내" 라고 적어도, LLM 이 도구 호출을 결심한 시점에는 이미 늦음. 호출 자체의 게이팅은 **tool 자체 description** (메인 트리거 텍스트) 에 박아야 효과 있음. 파라미터 description 은 보조.
 - **핵심 교훈 — 3중 방어 필요**: (1) tool description 에서 호출 전 필터링 강제, (2) 파라미터 description 에서 "0건이면 호출 자체 금지" 재강조, (3) orchestrator force retry 안전망에서 잘못 호출된 케이스 감지·복구. 1·2 가 뚫려도 3 이 잡아낸다. `_is_counter_fab` 는 "도구 미호출 시" 가드이므로, "도구 잘못 호출됨" 케이스는 별도 변수(`_is_wrong_product_counter`) 가 필요.
 - **검증**: 3곳 Edit 완료 — `backend/app/services/agent/tools/negotiation.py` (description + order_id), `backend/app/services/orchestrator.py` (`_is_wrong_product_counter` + force retry 메시지 분기). force retry 가드는 `_is_order_fab`/`_is_delivery_fab`/`_is_counter_fab` 와 동일한 round 가드 안에서 동작.
+
+#### 특정 판매자의 상품 목록 조회 — find_sellers_by_product 통합 + _fix_id_params 예외 (2026-05-06 추가)
+- **증상**: 구매자가 "행복농산이 파는 상품 알려줘", "test3 판매자가 뭐 팔아?" 처럼 특정 판매자의 상품 라인업을 물으면 답변 못 함. 도구가 0건 반환하거나 LLM 이 `get_user_profile` 만 부르고 상품 정보를 누락한 채 응답.
+- **근본 원인 4가지** (단일 버그가 아니라 4 레이어가 맞물린 구조적 공백):
+  1. `get_products` description 이 "현재 로그인한 판매자 ID" 로 못박혀 있어 LLM 이 "남의 상품 조회"용으로 떠올리지 못함.
+  2. `find_sellers_by_product` 가 `category` required + 판매자 단독 필터 부재 → 카테고리 모르는 발화에서 LLM 이 'ALL' 로 호출 → 전체 판매자 결과를 받아 단일 판매자만 골라내기 어려움.
+  3. 시스템 프롬프트(BUYER_ROLE_APPENDIX, chat_node 프롬프트)에 "특정 판매자 → 상품 목록" 시나리오 매핑 자체가 없음. 기존 `[판매자 정보 단순 조회]` 가이드는 "연락처/회사 정보" 에만 한정.
+  4. `_fix_id_params` 가 비어 있는 `seller_id` 를 현재 사용자 UUID 로 강제 덮어씀. `create_order` 만 예외 처리되어 있어, LLM 이 `find_sellers_by_product(seller_id="")` 로 호출하면 buyer 의 user_id 가 주입 → SELLER role 필터에 걸려 0건 반환.
+- **수정 (3곳 동기 박기)**:
+  1. **`backend/app/services/agent/tools/user.py` `find_sellers_by_product`**: 시그니처 통합 — `category` optional + `seller_id` (UUID) + `seller_name_or_company` (이름/업체명 ILIKE) 신규 파라미터. 최소 1개 필터 강제(없으면 `missing_filter` 에러). 단일 판매자 모드(`is_single_seller_query`)는 재고 0 도 포함해 라인업 전체 노출, category fallback 비활성, products 0건이어도 판매자 정보는 응답에 포함. 응답에 `query_mode: "single_seller" | "category_search"` 메타 필드 추가. `_response_guide` 가 모드/매칭 수에 따라 4분기:
+     - 단일 판매자 1명: "○○ 판매자가 판매 중인 상품 N건입니다" + 1.2.3. 번호로 가격/재고/단위/원산지/상태 풀어쓰기, 영문 enum 한글 변환(NORMAL→정상, LOW_STOCK→재고 부족, OUT_OF_STOCK→품절, SCHEDULED→입하 예정).
+     - 다중 매칭(이름이 여러 명): 각 판매자별 회사명/담당자 + 상품 나열 + "어느 판매자의 상품을 보고 싶으신가요?" 되묻기.
+     - 0건: "○○ 판매자를 찾을 수 없어요. 정확한 이름이나 업체명을 알려주세요" 안내.
+     - 카테고리 검색(기존 동작): 그대로 유지(상위 5개 판매자 + 외 N개 요약).
+  2. **`backend/app/services/orchestrator.py` BUYER_ROLE_APPENDIX 신규 섹션 `[🚨 특정 판매자의 상품 목록 조회]`** (`[판매자 정보 단순 조회]` 직후, `[🚨 주문 대상 판매자 식별 절차]` 직전): "절대 `get_user_profile` 만 부르고 끝내지 마라 — 그러면 상품을 누락한다." 명시. 절차 — (1) 직전 컨텍스트에 seller_id UUID 있으면 `find_sellers_by_product(seller_id=UUID)`, (2) 없으면 `find_sellers_by_product(seller_name_or_company="○○")`, (3) `_response_guide` 안내 그대로 따르기. `query_mode == "single_seller"` 분기 처리 + `seller_count` 별 응답 분기(0/1/2+) + 상품 0건과 재고 0건의 의미 구분 강조.
+  3. **`backend/app/services/orchestrator.py` `_fix_id_params` 예외 추가**: `find_sellers_by_product` 의 `seller_id` 가 UUID 가 아니거나 비어 있으면 `tool_input` 에서 **제거**(현재 user_id 로 덮어쓰지 않음). `create_order` 의 `continue` 와 다른 점은 **명시적 pop** — 빈 문자열/이름/None 모두 제거하여 도구 함수가 깨끗한 None 으로 받음.
+- **핵심 교훈 — _fix_id_params 의 "user_id 자동 주입" 은 양날의 검**: 동일 사용자 ID 가 세 가지 의미(자기 자신, 거래 상대 SELLER, 거래 상대 BUYER)로 쓰이는 도메인에서 "id 비면 user_id 로 채워줘" 패턴은 새 파라미터를 추가할 때마다 의미 충돌 위험을 누적한다. 신규 도구·신규 파라미터에 같은 id 필드명을 쓸 때 반드시 (a) 의미가 "현재 사용자" 인지 "조회 대상" 인지 분류 후 (b) `_fix_id_params` 에 명시적 예외 처리를 추가하고 (c) tool description 에 "현재 사용자 vs 조회 대상" 을 명시. 누락 시 가장 사일런트한 실패 모드("도구는 호출됐는데 0건 반환")가 발생함.
+- **핵심 교훈 — schema 파라미터 4분기 재사용 < 새 도구 신설 사이의 트레이드오프**: 처음에는 "새 `get_seller_products` 도구 신설"도 옵션이었으나 (a) `find_sellers_by_product` 응답 구조(`sellers[].products[]`) 가 단일 판매자 케이스에 그대로 맞고 (b) LLM 이 같은 도구의 다른 파라미터 조합을 학습하는 게 새 도구 트리거를 학습하는 것보다 비용 낮음 (c) `_response_guide` 분기로 응답 형식만 갈라주면 충분 — 3 가지 이유로 통합 채택. 다만 description 이 길어지므로 "(1) 카테고리 검색 (2) 특정 판매자 조회 (3) 결합" 3 시나리오를 description 첫 문단에 명시적으로 박아 LLM 의 트리거 학습 비용 보전.
+- **핵심 교훈 — 단일 판매자 모드의 "상품 0건 vs 재고 0건" 구분**: 단일 판매자에 매칭됐는데 products 가 빈 케이스는 "판매자가 등록한 상품 자체가 없다" 의미. LLM 이 자연어로 "재고가 없습니다" 라고 잘못 답하지 않게 응답 가이드에 명시 분리 필수("재고가 없습니다" 와 "상품 자체가 없습니다" 는 의미 다름). 또한 단일 판매자 모드에서는 `gt("stock_quantity", 0)` 필터를 의도적으로 빼서 품절 상품도 라인업에 포함 — "이 판매자가 어떤 품목을 다루는지" 를 보여주는 게 사용자 의도이므로.
+- **검증**: 7가지 시나리오 직접 호출 통과 — (1) seller_id UUID 단독→1명/10건/single_seller, (2) `seller_name_or_company="QA농산"`→1명/1건, (3) `="test"`→2명/14건 다중 매칭, (4) 없는 이름→0건/단일 판매자 가이드, (5) seller_id+category→FRUIT 2건 결합 필터, (6) category 단독→3명/category_search 기존 동작 유지, (7) 빈 호출→missing_filter 에러. `_fix_id_params` 4가지 케이스(UUID 보존, 빈 문자열 제거, 비-UUID 제거, category-only) 모두 통과. AST 파싱 OK.
+
+#### 사전 안내 stop 자동 재시도 — "잠시만 기다려 주세요" 패턴 force retry (2026-05-06 추가)
+- **증상**: 사용자 "자두 상품 찾아서 5키로 주문해줘" → AI "자두 상품을 찾아보겠습니다. 잠시만 기다려 주세요." 한 줄만 표시되고 그대로 종료. 검색·주문 단계가 아예 일어나지 않음. 백엔드 `/api/v1/ai/agent/chat` 은 비스트리밍 단발 fetch 구조라 (`useAIStream.ts:49-95`) 첫 응답이 곧 최종 응답이 되어 사용자에게 표시된 뒤 호출 종료.
+- **근본 원인**: gpt-4o-mini 가 시스템 프롬프트(`AGENT_BASE_SYSTEM` [핵심 대화 원칙] 4번 — "도구 호출 시 사전 안내 문장 금지: '잠시만 기다려 주세요', '확인해 드릴게요', '처리하겠습니다'") 지시를 어기고 도구 호출 없이 안내 문장만으로 `finish_reason="stop"` 반환. inventory_order_node 의 fabrication 검출 분기(`_is_order_fab` / `_is_delivery_fab` / `_is_counter_fab` / `_is_wrong_product_counter` / `_is_wrong_refusal`)는 "주문/납품일/협상 완료를 위장한 응답" 패턴만 잡고 사전 안내 패턴은 누락 → orchestrator.py 라인 1407-1414 의 `if not all_tool_results: return final_response = final_text` 분기가 그 안내 문장을 그대로 사용자에게 노출.
+- **수정 (`orchestrator.py` 라인 1188-1220, `inventory_order_node` 의 stop 분기 내부 _is_cancel_req 분기 직후)**: 새 가드 `_is_pre_announce` 추가.
+  - 조건: `not all_tool_results` (도구 결과 0건) + `final_text` 에 마커 매칭 + `round_idx < MAX_TOOL_ROUNDS - 1` (다음 라운드 여유 있을 때).
+  - 마커 21종: `잠시만 기다려`, `잠시만요`, `찾아보겠`, `찾아 보겠`, `찾아드리겠`, `찾아 드리겠`, `확인해 드리겠`, `확인해드리겠`, `확인해 보겠`, `확인해보겠`, `확인하겠`, `처리하겠`, `처리해 드리겠`, `처리해드리겠`, `조회하겠`, `조회해 보겠`, `조회해보겠`, `조회해 드리겠`, `조회해드리겠`, `알아보겠`, `알아 보겠`, `검색하겠`, `검색해 보겠`, `검색해보겠`, `도와드리겠`, `도와 드리겠`.
+  - 발동 시 force retry 메시지: "방금 응답은 사전 안내 문장입니다. 시스템 프롬프트 [핵심 대화 원칙] 4번에 따라 안내 문장 없이 즉시 필요한 도구를 호출해 사용자 요청을 처리하라. 도구 결과를 받기 전까지 사용자에게 어떤 텍스트도 보내지 마라. 필요한 정보(예: 납품일, 단가)가 부족하면 안내 문장이 아니라 한 줄짜리 질문으로만 되물어라."
+  - 결과: 다음 라운드에서 LLM 이 도구 호출(`find_sellers_by_product`/`check_stock`/`create_order` 등)로 진행 → 사용자에게는 안내 문장이 안 보이고 도구 결과 기반 최종 응답만 노출.
+- **핵심 교훈 — fabrication 가드는 "완료 위장" 만 잡고 "사전 안내" 는 별도 분기 필수**: 기존 `_is_order_fab` / `_is_delivery_fab` / `_is_counter_fab` 는 모두 "도구 안 부르고 결과를 만들어낸 척"하는 응답을 잡는 데 특화. "잠시만 기다려" 같은 **시작 의도만 표명한 응답**은 마커 패턴이 정반대(완료 어휘 vs 진행 어휘) → 별 분기로 빼야 한다. 두 가드는 호출 강제 메시지도 다르다 — fabrication 은 "방금 응답은 무효, 실제 처리하라", 사전 안내는 "안내 없이 바로 도구만 호출하라".
+- **핵심 교훈 — 비스트리밍 단발 응답 구조에서 "후속 처리 자동화" = 백엔드 라운드 강제 진행**: 프론트가 SSE/WebSocket 이 아니라 단발 fetch (`useAIStream.ts`) 라 한 번의 응답으로 1턴이 종료된다. "사용자가 추가 입력 없이 LLM 이 알아서 후속 처리" 를 구현하려면 프론트에서 자동 재호출 (temperature=0 라 같은 결과 반복 가능성 + 두 번째 호출의 컨텍스트 손실 위험) 보다 **백엔드 노드의 round 루프 안에서 force retry 메시지로 강제 진행**이 정답. inventory_order_node 의 `for round_idx in range(MAX_TOOL_ROUNDS)` 루프가 이미 그 채널이고, 새 가드는 거기에 트리거 한 종류를 추가한 것뿐.
+- **검증 포인트 (배포 후)**: 백엔드 콘솔에 `🤖 [AI의 선택] 행동: stop`, `🤖 [AI의 변명] 자두 상품을 찾아보겠습니다...` 가 찍힌 직후 force retry 메시지가 들어가고 다음 라운드에서 `🕵️‍♂️ [ORDER/INVENTORY TOOL] tool_name = find_sellers_by_product/check_stock/...` 로 이어지는지 확인. `ai_conversations` 테이블의 `prompt_type` 컬럼이 비어 있으면(=`tools_used` 빈 배열) 가드가 실패해 안내 문장 그대로 노출된 케이스이므로 마커 누락 후보로 검토.
+- **재발 방지**: 새 안내 패턴이 발견되면 `_pre_announce_markers` 리스트에 추가만 하면 됨(다른 곳 변경 불필요). 마커 후보는 운영 로그의 `🤖 [AI의 변명]` + `tools_used == []` 조합을 정기적으로 샘플링해 확장.

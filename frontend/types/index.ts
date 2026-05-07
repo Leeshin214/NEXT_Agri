@@ -62,3 +62,8 @@ export type {
   BuyerInventoryListParams,
   BuyerInventorySortBy,
 } from './inventory';
+export type {
+  AlternativeRecommendation,
+  AlternativeCandidate,
+  AlternativePriceStrategy,
+} from './alternative';

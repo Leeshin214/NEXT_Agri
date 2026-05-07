@@ -3,6 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import type {
+  AlternativeRecommendation,
   CancelRequest,
   CounterOffer,
   CounterOfferCreate,
@@ -199,5 +200,26 @@ export function useNegotiationHistory(orderId: string) {
         `/orders/${orderId}/counter-offers`
       ),
     enabled: !!orderId,
+  });
+}
+
+/**
+ * 대체 거래처 자동 추천 조회.
+ * - 판매자가 활성 주문을 취소하면 백엔드가 fire-and-forget 으로 추천을 생성.
+ * - 추천이 아직 없으면 data: null 로 응답 (404 가 아님).
+ * - 주문 상태가 CANCELLED 일 때만 의미가 있으므로 호출처에서 enabled 가드 권장.
+ */
+export function useAlternativeRecommendations(
+  orderId: string,
+  options?: { enabled?: boolean }
+) {
+  const enabled = (options?.enabled ?? true) && !!orderId;
+  return useQuery({
+    queryKey: ['alternatives', orderId],
+    queryFn: () =>
+      api.get<SuccessResponse<AlternativeRecommendation | null>>(
+        `/orders/${orderId}/alternatives`
+      ),
+    enabled,
   });
 }
