@@ -454,6 +454,7 @@ def open_chat_room(user_id: str, partner_user_id: str, order_id: Optional[str] =
                 "is_new": False,
                 "partner_name": partner_name,
                 "order_id": order_id,
+                "_response_guide": f"'{partner_name}'과의 기존 채팅방으로 연결됐습니다. 사용자에게 '왼쪽 채팅 탭에서 확인하세요'라고 안내하세요. 다른 말 붙이지 마세요.",
             }
 
         # 새 채팅방 생성
@@ -480,6 +481,7 @@ def open_chat_room(user_id: str, partner_user_id: str, order_id: Optional[str] =
             "is_new": True,
             "partner_name": partner_name,
             "order_id": order_id,
+            "_response_guide": f"'{partner_name}'과의 채팅방이 새로 생성됐습니다. 사용자에게 '왼쪽 채팅 탭에서 확인하세요'라고 안내하세요. 다른 말 붙이지 마세요.",
         }
 
     except Exception as e:

@@ -1652,6 +1652,89 @@ class OrderService:
                 f"{type(e).__name__}: {e}"
             )
 
+        # 주문 취소 시 구매자에게 대체 거래처 자동 탐색 — AI 대화 히스토리에 삽입
+        try:
+            from app.services.agent.tools.partner import find_alternative_partners
+            from app.core.supabase import get_supabase_client as _get_sb
+
+            buyer_id_str = str(order["buyer_id"])
+            _sb = _get_sb()
+
+            # order_items에서 첫 번째 상품 정보 조회
+            items_res = await asyncio.to_thread(
+                lambda: _sb.table("order_items")
+                .select("product_id, quantity")
+                .eq("order_id", str(order_id))
+                .limit(1)
+                .execute()
+            )
+            item_rows = items_res.data or []
+
+            product_name = "상품"
+            product_category = "VEGETABLE"
+            original_quantity = None
+            original_unit = "kg"
+            if item_rows:
+                original_quantity = item_rows[0].get("quantity")
+                pid = item_rows[0].get("product_id")
+                if pid:
+                    prod_res = await asyncio.to_thread(
+                        lambda: _sb.table("products").select("name, category, unit").eq("id", pid).single().execute()
+                    )
+                    if prod_res.data:
+                        product_name = prod_res.data.get("name", "상품")
+                        product_category = prod_res.data.get("category", "VEGETABLE")
+                        original_unit = prod_res.data.get("unit", "kg")
+
+            alternatives_result = await asyncio.to_thread(
+                find_alternative_partners,
+                buyer_id_str,
+                "BUYER",
+                product_category,
+                "주문 취소",
+            )
+            alternatives = alternatives_result.get("alternatives", [])
+
+            qty_hint = f" (원래 주문: {original_quantity}{original_unit})" if original_quantity else ""
+            if alternatives:
+                lines = [f"주문이 취소됐습니다. {product_name} 대체 거래처를 찾아드렸어요{qty_hint}!\n"]
+                for i, a in enumerate(alternatives[:5], 1):
+                    name = a.get("name") or a.get("company_name") or "판매자"
+                    company = a.get("company_name", "")
+                    stock = a.get("stock_quantity")
+                    trades = a.get("trade_count")
+                    line = f"{i}. {name}" + (f" ({company})" if company and company != name else "")
+                    if stock is not None:
+                        line += f" — 재고 {stock}{a.get('unit', '')}"
+                    if trades is not None:
+                        line += f", 거래 {trades}회"
+                    lines.append(line)
+                lines.append(f'\n👉 이 AI 도우미 창에 "N번째 판매자한테 {product_name} N{original_unit} 견적 요청해줘"라고 입력하세요.')
+                ai_response = "\n".join(lines)
+            else:
+                ai_response = f"주문이 취소됐습니다. 현재 {product_name}을(를) 대체할 거래처를 찾지 못했어요."
+
+            await asyncio.to_thread(
+                lambda: _sb.table("ai_conversations").insert({
+                    "user_id": buyer_id_str,
+                    "prompt": f"[자동] {product_name} 주문 취소 — 대체 거래처 탐색",
+                    "response": ai_response,
+                    "prompt_type": "ORDER_CANCELLED",
+                }).execute()
+            )
+
+            # 구매자 알림 — 로그인 여부 무관하게 알림 뱃지에 남김
+            await notification_service.emit(
+                user_id=buyer_id_str,
+                notification_type="ORDER_CANCELLED",
+                title="주문 취소 — 대체 거래처 안내",
+                body=f"{product_name} 주문이 취소됐습니다. AI 도우미에서 대체 거래처를 확인해보세요.",
+                link_url=f"/buyer/ai-assistant",
+                order_id=str(order_id),
+            )
+        except Exception as e:
+            print(f"[order_service.cancel_order] 대체 거래처 탐색 실패 (무시): {type(e).__name__}: {e}")
+
         return updated_order
 
     # ===========================================

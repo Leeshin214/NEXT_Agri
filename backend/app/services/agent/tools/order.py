@@ -746,8 +746,9 @@ def create_order(
             )
             next_action_hint = (
                 "사용자에게 견적이 전달됐고 판매자 응답을 기다리는 중임을 안내하세요. "
-                "사용자가 '채팅방 열어줘'라고 하면 open_chat_room 호출 시 반드시 이 order_id와 "
-                "seller_id를 함께 사용하세요."
+                f"사용자가 '채팅방 열어줘'라고 하면 open_chat_room 호출 시 "
+                f"order_id='{order_id}'(UUID)와 partner_user_id=seller_id를 반드시 사용하세요. "
+                "order_number(ORD-... 형식)는 절대 order_id로 사용하지 마세요."
             )
 
         return {
