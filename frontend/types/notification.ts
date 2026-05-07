@@ -13,7 +13,8 @@ export type NotificationType =
   | 'DELIVERY_DATE_CHANGE'
   | 'DELIVERY_DATE_ACCEPTED'
   | 'DELIVERY_DATE_REJECTED'
-  | 'ORDER_STATUS';
+  | 'ORDER_STATUS'
+  | 'ALTERNATIVE_PARTNERS';
 
 export interface Notification {
   id: string;

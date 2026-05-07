@@ -17,6 +17,7 @@ NotificationType = Literal[
     "DELIVERY_DATE_ACCEPTED",
     "DELIVERY_DATE_REJECTED",
     "ORDER_STATUS",
+    "ALTERNATIVE_PARTNERS",
 ]
 
 

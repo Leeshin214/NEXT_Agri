@@ -11,6 +11,7 @@ import NegotiationHistory from '@/components/common/NegotiationHistory';
 import DeliveryDateChangeSection from '@/components/common/DeliveryDateChangeSection';
 import CancelOrderModal from '@/components/common/CancelOrderModal';
 import CancelRequestModal from '@/components/common/CancelRequestModal';
+import AlternativePartnersSection from '@/components/buyer/AlternativePartnersSection';
 import CreateOrderModal from '@/components/buyer/CreateOrderModal';
 import EditOrderModal from '@/components/buyer/EditOrderModal';
 import PartnerDetailModal from '@/components/partners/PartnerDetailModal';
@@ -675,6 +676,11 @@ export default function BuyerOrdersPage() {
                     </p>
                   )}
                 </div>
+              )}
+
+              {/* 대체 거래처 자동 추천 — 판매자 취소 시 백엔드가 자동 생성한 견적 결과 */}
+              {selectedOrder.status === 'CANCELLED' && (
+                <AlternativePartnersSection orderId={selectedOrder.id} />
               )}
 
               {selectedOrder.items.length > 0 && (

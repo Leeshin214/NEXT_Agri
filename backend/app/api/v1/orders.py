@@ -4,7 +4,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+import asyncio
+
+from app.core.supabase import get_supabase_client
 from app.dependencies import get_current_user, require_buyer
+from app.schemas.alternative import AlternativeRecommendationResponse
 from app.schemas.common import SuccessResponse
 from app.schemas.order import (
     CancelRequestCreate,
@@ -372,3 +376,47 @@ async def list_delivery_date_changes(
         user=current_user,
     )
     return {"data": history}
+
+
+# ===========================================
+# 대체 거래처 자동 추천 — SELLER 가 주문을 취소했을 때 background 로 생성된 결과 조회
+# ===========================================
+
+
+@router.get(
+    "/{order_id}/alternatives",
+    response_model=SuccessResponse[Optional[AlternativeRecommendationResponse]],
+)
+async def get_alternative_recommendations(
+    order_id: UUID,
+    current_user: dict = Depends(get_current_user),
+):
+    """주문에 대한 대체 거래처 추천(자동 견적 포함) 결과 조회.
+
+    - 본인이 buyer 인 주문만 조회 가능 (RLS 가 한 번 더 가드).
+    - 추천이 아직 생성 안 된 주문이면 data: null 로 반환 (404 가 아님 — 클라이언트
+      side-effect 없는 정상 케이스).
+    - candidates JSONB 는 alternative_partner_service 가 정규화한 키 셋 그대로.
+    """
+    # 권한 — 본인이 관련된 주문이고 BUYER 역할일 때만 의미 있음
+    order = await order_service.get_order(order_id)
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Order not found"
+        )
+    if order["buyer_id"] != current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="대체 거래처 추천은 구매자 본인만 조회할 수 있습니다.",
+        )
+
+    sb = get_supabase_client()
+    result = await asyncio.to_thread(
+        lambda: sb.table("alternative_partner_recommendations")
+        .select("*")
+        .eq("cancelled_order_id", str(order_id))
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return {"data": rows[0] if rows else None}
