@@ -192,6 +192,7 @@ def _build_router_system() -> str:
   → 특정 품목을 사거나 찾거나 확인하려는 의도가 조금이라도 있으면 무조건 INVENTORY
   → "채팅", "연결", "거래처", "얘기해보고 싶어" 키워드가 있으면 GENERAL이 아닌 INVENTORY로 분류
   → "거래처 등록", "거래처 신청", "거래처 추가" 키워드가 있으면 무조건 INVENTORY로 분류한다.
+  → "거래처 삭제", "거래처 해제", "거래처 끊어", "거래처 없애" 키워드가 있으면 무조건 INVENTORY로 분류한다.
   → "단가 바꿔줘", "가격 수정해줘", "kg당 얼마로 바꿔줘", "상품명 바꿔줘", "상품 내려줘"는 주문이 아니라 상품 관리이므로 반드시 INVENTORY로 분류한다.
   → "방금 올린 감자 단가 2700원으로 바꿔줘"는 INVENTORY다. ORDER가 아니다.
 - ORDER: 주문, 견적, 발주, 납품일 변경, 가격 협상, 출고, 배송 상태 변경, 정기배송 관련 요청
@@ -223,7 +224,7 @@ def _build_router_system() -> str:
 
 [모호성 해결]
 - (최우선 절대 규칙) 문장 내에 오타가 있더라도 "일정", "캘린더", "스케줄", "달력" 이라는 단어(또는 비슷한 발음/철자)가 존재하면 무조건 CALENDAR 로 분류하세요.
-- (삭제/변경 의도 캐치) "삭제", "지워", "취소", "바꿔" 등의 단어(또는 그와 유사한 오타, 예: "삭젷줘")가 포함되어 있고 캘린더 관련 맥락이라면 반드시 CALENDAR(DATA) 로 분류하세요.
+- (삭제/변경 의도 캐치) "삭제", "지워", "취소", "바꿔" 등의 단어(또는 그와 유사한 오타, 예: "삭젷줘")가 포함되어 있고 캘린더 관련 맥락이라면 반드시 CALENDAR(DATA) 로 분류하세요. 단, "거래처 삭제/해제/끊기/없애기"처럼 거래처 관계 자체를 끊는 요청은 CALENDAR가 아니라 INVENTORY로 분류하세요.
 - 품목명이 포함되어 있어도 일정을 묻는다면 INVENTORY가 아니라 CALENDAR 가 우선입니다. (예: "배추 5월 일정 알려줘", "사과 언제 배송돼?" -> CALENDAR)
 - 위 일정 관련 키워드 없이 품목명만 언급되거나(예: "사과 보여줘"), 품목과 관련된 '채팅/연결' 요청일 경우에만 INVENTORY 로 분류하세요.
 - (질의응답 맥락 보호): AI가 "채팅방을 열까요, 주문을 넣을까요?"라고 물었을 때 사용자가 하는 답변(예: "채팅할래", "열어줘", "주문해")은 문장에 수량이나 품목명이 없더라도 무조건 ORDER 부서로 보내야 합니다. 절대 CHAT 부서로 보내지 마세요.
@@ -370,7 +371,11 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 - 납품일 응답: PENDING 납품일 변경 카드 보고 "수락해줘"/"OK" → accept_delivery_date_change(user_id, order_id, change_id), "거절해줘"/"그 날짜는 어려워" → reject_delivery_date_change(user_id, order_id, change_id)
 - 거래처 등록: "○○를 거래처로 등록해줘", "○○ 추가해줘", "거래처 신청 보내줘" → 상대방 UUID 정확히 알면 request_partner_registration(user_id, target_user_id, note?), 이름/회사명만 알면 request_partner_registration_by_name(user_id, target_name_or_company, note?)
 - 거래처 요청 조회: "들어온 거래처 요청 있어?", "거래처 신청 왔어?" → get_incoming_partner_requests(user_id). 결과 안내 시 반드시 partner_id 값을 응답에 포함.
-- 거래처 요청 수락: "거래처 요청 수락해줘", "승인해줘", "그 요청 수락해줘" → partner_id 를 직전 대화에서 찾고, 없으면 get_incoming_partner_requests 먼저 호출해 ID 확보 후 즉시 accept_partner_request(user_id, partner_id). 절대 사용자에게 ID 를 물어보지 마라.
+- 거래처 요청 수락: "거래처 요청 수락해줘", "승인해줘", "그 요청 수락해줘", "응", "응 수락해줘" →
+  반드시 get_incoming_partner_requests(user_id) 를 먼저 호출해 partner_id 를 확보한 뒤 accept_partner_request(user_id, partner_id) 를 호출한다.
+  UUID 를 직접 기억하거나 추측하지 마라 — 반드시 도구 결과에서 'partner_id' 필드값을 그대로 사용한다.
+  'from_user_id' 필드를 partner_id 에 절대 넣지 마라. 반드시 get_incoming_partner_requests 결과의 'partner_id' 필드를 사용한다.
+  절대 UUID 를 임의로 생성하거나 추측하지 마라.
 - 거래처 요청 거절: "거절해줘" → 마찬가지로 ID 확보 후 reject_partner_request(user_id, partner_id).
 - 정기배송 신청: "정기배송으로 받고 싶어", "매주 ○요일 ○○ 보내줘", "정기배송 요청해줘" → 반드시 품목명·수량을 먼저 확인하라. 품목/수량이 명시되지 않으면 "어떤 품목을 몇 kg(또는 몇 박스) 보내드릴까요?"라고 되물어라. 품목·수량·주기·시작일이 모두 확보된 뒤에만 create_subscription_request(user_id, target_user_id, frequency, start_date, items=[{{product_name, quantity, unit}}]) 호출. items 는 절대 임의로 채우지 마라.
 - "이 주문 정기배송으로 전환" → create_subscription_from_order(user_id, order_id, frequency, start_date)
@@ -1893,6 +1898,13 @@ async def chat_node(state: AgentState) -> dict:
         "  - '이 주문을 정기배송으로 전환'처럼 기존 주문 기반이면 create_subscription_from_order(user_id, order_id, frequency, start_date) 사용.\n"
         "- 정기배송 수락/거절: subscription_id 는 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 호출해 확보. 절대 사용자에게 ID 물어보지 말 것.\n"
         "- 정기배송 수정 요청('수량 바꿔줘', '조건 바꾸고 싶어' 등): 직접 수정 불가. '현재 요청을 거절하고 새 조건으로 다시 요청을 보내야 합니다. 원하시면 바로 진행해 드릴게요.'라고 자연스럽게 안내하라.\n"
+        "- 거래처 삭제 발화: '○○ 거래처 삭제해줘', '거래처 끊어줘', '○○ 거래처 해제해줘' 등.\n"
+        "  - [1단계 — 대상 확인] 이름/회사명이 언급되면 get_partners(user_id, status_in=['ACTIVE']) 를 호출해 목록을 가져온 뒤 발화와 매칭되는 거래처를 찾는다.\n"
+        "  - [2단계 — 재확인 요청] delete_partner 를 즉시 호출하지 말고 반드시 먼저 '○○(회사명) 거래처를 삭제할까요? 삭제하면 복구할 수 없습니다.' 라고 재확인을 요청하라.\n"
+        "  - [3단계 — 확인 후 삭제] 사용자가 '응', '응 삭제해줘', '맞아', '그래' 같이 긍정 답변을 하면 delete_partner(user_id, partner_id) 를 호출한다.\n"
+        "  - 사용자가 '아니', '취소' 라고 하면 삭제를 중단하고 '취소했습니다.' 라고 안내한다.\n"
+        "  - 매칭 결과가 0건이면 '○○ 라는 활성 거래처를 찾을 수 없습니다.' 라고 안내한다.\n"
+        "  - 매칭 결과가 2건 이상이면 후보를 나열하고 어느 거래처를 삭제할지 사용자에게 골라달라고 되묻는다.\n"
         "\n"
         "[재고 검색 vs 대체 거래처 분리 (환각 방지)]\n"
         "- 사용자가 '참치 찾아줘'라고 하면 find_sellers_by_product 또는 check_stock 으로 product_name='참치'만 정확 검색. 결과 0건이라도 새우/연어 같은 다른 품목을 추천하는 행위는 절대 금지.\n"

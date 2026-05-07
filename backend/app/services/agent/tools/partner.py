@@ -815,13 +815,15 @@ def get_incoming_partner_requests(user_id: str) -> dict:
     description=(
         "들어온 거래처 등록 요청을 수락한다. "
         "'거래처 요청 수락해줘', '○○ 거래처 수락', '승인해줘' 같은 요청 시 호출. "
-        "partner_id 를 모르면 get_incoming_partner_requests 로 먼저 조회하라."
+        "partner_id 를 모르면 get_incoming_partner_requests 로 먼저 조회하라. "
+        "중요: partner_id 는 get_incoming_partner_requests 결과의 'partner_id' 필드값을 사용한다. "
+        "'from_user_id' 필드가 아님에 주의."
     ),
     parameters={
         "type": "object",
         "properties": {
             "user_id": {"type": "string", "description": "현재 로그인 사용자 UUID"},
-            "partner_id": {"type": "string", "description": "수락할 partners 테이블 row UUID"},
+            "partner_id": {"type": "string", "description": "수락할 partners 테이블 row UUID. get_incoming_partner_requests 결과의 'partner_id' 필드값. 'from_user_id' 가 아님."},
         },
         "required": ["user_id", "partner_id"],
     },
@@ -893,5 +895,57 @@ def reject_partner_request(user_id: str, partner_id: str) -> dict:
         supabase.table("partners").update({"deleted_at": now}) \
             .eq("user_id", my_row["partner_user_id"]).eq("partner_user_id", user_clean).is_("deleted_at", None).execute()
         return {"success": True, "message": "거래처 등록 요청을 거절했습니다."}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@tool(
+    name="delete_partner",
+    description=(
+        "활성 거래처 관계를 삭제(해제)한다. "
+        "'거래처 삭제해줘', '○○ 거래처 끊어줘', '거래처 해제해줘', '거래처 없애줘' 같은 요청 시 호출. "
+        "partner_id 를 모르면 get_partners 로 먼저 조회하여 id를 확인하라. "
+        "양측 row 를 모두 soft-delete 한다."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string", "description": "현재 로그인 사용자 UUID"},
+            "partner_id": {"type": "string", "description": "삭제할 partners 테이블 row UUID"},
+        },
+        "required": ["user_id", "partner_id"],
+    },
+    groups=("inventory_order",),
+)
+def delete_partner(user_id: str, partner_id: str) -> dict:
+    """활성 거래처를 soft-delete. 양측(내 row + 상대방 row) 모두 deleted_at 설정."""
+    from .._shared import _UUID_PATTERN
+
+    user_clean = (user_id or "").strip()
+    partner_clean = (partner_id or "").strip()
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id"}
+    if not partner_clean or not _UUID_PATTERN.match(partner_clean):
+        return {"success": False, "error": "invalid_partner_id", "message": "partner_id가 필요합니다. get_partners로 먼저 조회하세요."}
+    try:
+        supabase = get_supabase_client()
+        my_row = (
+            supabase.table("partners")
+            .select("*")
+            .eq("id", partner_clean)
+            .eq("user_id", user_clean)
+            .is_("deleted_at", None)
+            .single()
+            .execute()
+            .data
+        )
+        if not my_row:
+            return {"success": False, "error": "not_found", "message": "해당 거래처를 찾을 수 없습니다."}
+        now = datetime.utcnow().isoformat()
+        supabase.table("partners").update({"deleted_at": now}).eq("id", partner_clean).execute()
+        supabase.table("partners").update({"deleted_at": now}) \
+            .eq("user_id", my_row["partner_user_id"]).eq("partner_user_id", user_clean).is_("deleted_at", None).execute()
+        partner_name = my_row.get("partner_name") or my_row.get("partner_user_id", "")
+        return {"success": True, "message": f"거래처 '{partner_name}'를 삭제했습니다."}
     except Exception as e:
         return {"success": False, "error": str(e)}
