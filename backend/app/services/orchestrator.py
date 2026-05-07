@@ -235,6 +235,8 @@ def _build_router_system() -> str:
 - "오늘 들어온 80kg 옥수수건 출고 준비 완료됐고 방금 배송 보냈어"처럼 특정 주문의 진행 상태를 보고하는 문장은 CALENDAR가 아니라 ORDER다. 반드시 get_orders 또는 get_order_detail로 해당 주문을 찾고 update_order_status를 호출해야 한다.
 - "방금 올린 감자 단가 2700원으로 바꿔줘"처럼 상품 자체의 가격·단가·이름·설명·재고를 바꾸는 요청은 반드시 INVENTORY다. 주문 상태 변경이나 주문 수정으로 해석하지 마라.
 - (채팅방 선택 맥락 보호): AI가 "어느 방으로 메시지를 보낼까요?"라고 물은 직후 사용자가 답변(예: "1", "1번", "첫 번째")을 하는 경우에는 문장에 품목명이 없더라도 무조건 CHAT 부서로 분류하세요. 절대 GENERAL로 보내지 마세요.
+- 🚨 (주문 후속 답변 보호 — 매우 중요): 직전 assistant 메시지가 주문/견적 진행 중에 사용자에게 정보를 되묻는 질문으로 끝났고 (예: "납품일은 언제로 할까요?", "납품일은 언제로 드릴까요?", "가격은 얼마로 할까요?", "수량을 알려주세요", "어느 판매자로 진행할까요?"), 사용자가 그 질문에 대한 짧은 답변(날짜 표현 / 가격 표현 / 수량 표현 / 판매자 선택)을 한 경우 — 무조건 ORDER 로 분류하세요. 예시: 직전이 "납품일은 언제로 할까요?" 면 사용자의 "5월 22로 해줘", "5/22", "내일", "다음 주 월요일", "2026-05-22" 같은 답변은 모두 ORDER 분류 (CALENDAR 절대 금지). "kg당 18000원에", "총 14만원에" 같은 가격 답변도 동일하게 ORDER. 이 답변에 일정/캘린더 키워드가 없는데 단지 날짜 표현이 있다는 이유만으로 CALENDAR 로 보내면 사용자가 등록해 둔 다른 캘린더 일정이 잘못 수정되는 사고가 발생한다.
+- (캘린더 후속 답변 보호): 직전 assistant 가 캘린더 일정 등록/변경/삭제 진행 중 정보를 되물은 경우(예: "어떤 일정을 변경할까요?", "몇 시로 등록할까요?") 사용자의 짧은 답변은 CALENDAR(DATA) 로 분류한다. 직전 발화에 명시적인 일정/캘린더/스케줄 키워드 또는 일정 등록·변경 의도가 분명히 있어야 이 케이스에 해당한다 — 단순히 직전이 "납품일 묻기" 였으면 위의 ORDER 후속 답변 보호 규칙을 적용하라.
 [CALENDAR 시점 추출 (target_year, target_month)]
 - 사용자가 시점을 명시하면 그 값 사용 (예: "5월" → 현재 연도의 5월).
 - 명시하지 않은 경우:
@@ -339,6 +341,8 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 6. 컨텍스트 유지와 재검색 (매우 중요):
    - 사용자가 "ㄱㄱ", "ㅇㅇ", "진행해" 등 짧게 대답하더라도 직전 대화의 상품명(예: 청사과)과 맥락을 절대 잊지 마세요.
    - 주문(create_order)이나 수정 등을 해야 하는데 '단가', '상품 ID' 같은 필수 데이터가 메모리에서 날아갔다면, 당황해서 "없다"고 거짓말하지 마세요. 직전 대화의 품목명으로 조회 도구(check_stock, find_sellers_by_product 등)를 조용히 다시 호출하여 데이터를 확보한 뒤 작업을 이어서 진행하세요.
+   - 🚨 history echo 절대 금지 (매우 중요): 사용자가 새 발화를 한 시점에는 직전 history 의 응답이 같은 질문에 대한 것처럼 보여도 그 답변을 그대로 복제(echo)해서 답하지 말 것. 데이터가 그 사이 변경되었을 가능성이 항상 있다(새 상품 등록, 재고 변동, 새 주문 등). 사용자가 데이터(상품/판매자/주문/재고/거래처/정기배송/일정 등)를 묻거나 작업을 요청한 모든 경우 history 의 캐시된 답을 신뢰하지 말고 반드시 해당 도구(find_sellers_by_product, get_orders, get_partners, check_stock, get_subscriptions 등)를 새로 호출해 fresh 결과를 받아와 응답해야 한다. 같은 prompt 가 직전에 있었더라도 동일하게 적용 — 사용자는 매번 최신 상태를 받아야 한다.
+   - history 의 assistant 메시지가 "[이전 턴 메타: 도구 X 호출됨. 데이터 캐시 사용 금지 — 매 발화마다 도구로 새로 조회...]" 형태로 마킹되어 있다면, 그 마킹은 시스템이 의도적으로 raw 데이터를 가린 것이다. 그 본문에서 가격·재고·목록 같은 구체 데이터를 추측해서 답하지 말고 반드시 도구를 새로 호출하라. 마킹 끝의 [직전 조회에서 확인된 UUID 참고] 블록의 식별자(seller_id/user_id/product_id)는 그대로 재활용해도 된다.
 7. 응답 형식(채팅창 가독성, 매우 중요):
    - 이 응답은 마크다운이 렌더링되지 않는 일반 채팅창에 그대로 노출됩니다. 따라서 마크다운 강조 표기(`**굵게**`, `*기울임*`, `__밑줄__`)는 절대 사용하지 마세요. 별표가 그대로 글자로 보입니다.
    - 표(`|`로 칸을 나누는 표), 코드 블록(``` ``` ```), 헤더(`#`, `##`)도 사용하지 마세요. 채팅에 어울리지 않습니다.
@@ -446,6 +450,7 @@ C. 후보 2개 이상:
 
 [재고 검색 vs 대체 거래처 추천 분리 원칙 (환각 방지)]
 - 1차 검색은 사용자가 명시한 품목명만 사용해서 정확 검색을 한다. 예: "참치 찾아줘" → find_sellers_by_product 또는 check_stock 으로 product_name='참치' 만 조회. 1차 결과 0건이거나 모두 OUT_OF_STOCK 인 경우라도 절대로 LLM 임의로 새우/연어/다른 품목을 끼워 넣지 말 것 (환각 = 신뢰 파탄).
+- find_sellers_by_product 호출 시 사용자가 특정 상품명만 언급했으면 product_name 만 채우고 category 는 비워둔다. category 를 임의 추론(예: '감자' → 'VEGETABLE')해 같이 넘기면 같은 상품이 다른 카테고리(예: GRAIN)로 등록된 경우 누락된다 — 누락은 환각만큼 심각한 신뢰 손상이다.
 - 결과 0건 또는 전부 품절이면 사용자에게 그 사실을 명시적으로 안내하고("참치 판매자가 검색되지 않았습니다") "다른 품목이나 비슷한 카테고리로 대체 거래처를 찾아볼까요?"라고 묻는다.
 - 사용자가 명시 동의("응", "찾아줘", "그래") 한 뒤에만 find_alternative_partners 를 호출한다. 1차 검색 도구와 대체 거래처 도구를 같은 라운드에서 동시에 호출해 다른 품목을 추천하는 행위는 금지.
 
@@ -698,6 +703,7 @@ LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대�
 발화 패턴별 처리:
 1) 납품일 + 수량이 모두 명시된 경우 ("망고 2kg 5월 20일에 받게 주문해줘", "사과 5박스 6월 3일에 받을 수 있게 발주"):
    먼저 check_stock 또는 find_sellers_by_product 로 해당 상품을 조회해 price_per_unit 을 확보한다.
+   ⚠️ 셀러 매칭 강제 (cross-contamination 방지): 사용자가 특정 셀러(이름/회사명/UUID)를 지정했다면 find_sellers_by_product 응답 중 그 셀러의 row 만 선택해 거기서 price_per_unit 을 가져와라. 같은 상품을 파는 다른 셀러의 가격을 절대 unit_price 에 끌어오지 마라 (예: 판매자A 감자=20,000원/kg, 판매자B 감자=3,000원/kg 인데 사용자가 "판매자A에게 주문" 했으면 반드시 20,000을 unit_price 로 사용. 3,000원을 가져오면 자동 카운터오퍼가 잘못 발사돼 사용자 의도가 왜곡된다).
    그 값을 그대로 unit_price 로 채우고 delivery_date 는 사용자가 말한 날짜를 'YYYY-MM-DD' 형식으로 정규화해서 create_order 를 호출한다.
    백엔드가 가격 일치로 판단하면 QUOTE_REQUESTED 로 시작해 판매자 수락 대기, 가격이 낮으면 NEGOTIATING + 자동 카운터오퍼로 전환된다.
 
@@ -707,11 +713,19 @@ LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대�
    - 단가가 낮으면 NEGOTIATING + 자동 카운터오퍼 카드(PENDING) 발송. 채팅방에 카드가 노출된다.
    "단가가 낮은데 보낼까요?"처럼 되묻지 말고 그대로 호출한다.
 
-3) 납품일이 빠진 경우 ("망고 2kg 주문해줘", "사과 한 박스 발주해줘"):
-   create_order 호출 절대 금지.
-   사용자에게 "납품일은 언제로 할까요? (예: 5월 20일)" 라고 자연체로 물어봐라.
-   사용자가 "YYYY-MM-DD" 또는 "○월 ○일" 형식으로 정확한 날짜를 직접 말하기 전까지는 create_order 를 절대 호출하지 마라.
-   ▶ 금지 행동: "오늘+7일", "내일", "다음 주 월요일" 처럼 LLM 이 스스로 날짜를 추측하거나 변환해서 delivery_date 에 채우는 것. 사용자 발화에 날짜가 없으면 delivery_date 필드 자체를 비워두고 도구를 호출하지 마라.
+   ⚠️ 가격 단위 모호성 처리 (kg당 vs 총 가격): 사용자가 "21만원에 감자 7kg 주문해줘" 같이 단위를 명시하지 않은 경우, 21만원이 kg당(21만 × 7 = 147만원) 인지 총 가격(21만 ÷ 7 ≈ 3만원/kg) 인지 모호하다. 판단 절차:
+     (a) 두 해석을 각각 product.price_per_unit 과 비교한다.
+     (b) 한쪽만 합리적이면 (예: kg당 해석은 시세의 10배, 총가 해석은 시세와 비슷) 합리적인 쪽 채택해서 호출.
+     (c) 둘 다 합리적이거나 어느 쪽도 명확하지 않으면 절대 추측 X — "말씀하신 21만원이 kg당 가격인지, 7kg 전체 가격인지 알려주세요" 라고 자연체로 되묻고 사용자 답변을 받은 뒤 호출.
+     (d) 사용자가 명시적으로 "kg당", "박스당", "키로당", "전체", "총" 같은 단위를 붙였으면 그대로 따른다.
+
+3) 납품일이 빠진 경우 ("망고 2kg 주문해줘", "사과 한 박스 발주해줘", "감자 7키로 주문 넣어줘"):
+   🚨 create_order 호출 절대 금지. 백엔드 hard guard 가 활성화되어 있어 사용자 발화에 날짜 표현이 없는데 delivery_date 를 채워 호출하면 도구가 즉시 거부한다 (error: 'delivery_date_not_in_user_message'). 거부되면 결과를 "주문이 안 됐다"고 안내하지 말고 자연체로 사용자에게 "납품일은 언제로 할까요? (예: 5월 20일)" 라고 먼저 물어보고 답변을 받은 뒤 다시 호출하라.
+   사용자가 "YYYY-MM-DD" 또는 "○월 ○일", "내일", "다음 주", "모레", 요일 표현 등 명확한 날짜 표현을 직접 말하기 전까지는 create_order 를 절대 호출하지 마라.
+   ▶ 금지 행동: "오늘+7일", LLM 이 스스로 날짜를 추측하거나 변환해서 delivery_date 에 채우는 것. 사용자 발화에 날짜 표현이 없으면 delivery_date 필드 자체를 비워두고 도구를 호출하지 마라.
+
+3-1) 가격이 빠진 경우 ("판매자테스트한테 감자 7kg 주문 넣어줘"):
+   🚨 백엔드 hard guard 가 활성화되어 있어 사용자가 가격을 명시하지 않았는데 unit_price 가 그 셀러의 그 상품의 표시가(price_per_unit) 와 다르게 호출되면 즉시 거부한다 (error: 'unit_price_mismatch_no_user_price'). 가격 미명시 시 반드시 find_sellers_by_product / check_stock 응답에서 사용자가 지정한 셀러의 그 상품 price_per_unit 을 정확히 가져와 unit_price 에 그대로 사용하라. 다른 셀러 가격이나 일반 추정 가격을 사용하면 hard guard 가 차단한다.
 
 4) 협상 명시 ("그 가격은 좀 깎아줘", "할인 받고 싶어", "협상해줘"):
    create_order 가 아니라 submit_counter_offer 를 사용한다. 허용 여부는 서버가 검증하므로 주문 상태를 사전에 확인하거나 판단하지 말고 즉시 호출하라. 가격이 함께 언급된 새 주문이면 납품일까지 받아낸 뒤 그 가격으로 create_order 호출해 자동 협상 분기에 태운다.
@@ -720,11 +734,31 @@ LLM 은 단가 비교를 직접 흉내 내지 말고 백엔드 분기를 그대�
    바로 create_order 를 부르지 말고 "바로 주문할지, 판매자와 채팅방에서 조율할지" 한 번 확인하고, 주문이 맞다면 납품일도 함께 받아낸다.
 
 [판매자 정보 단순 조회]
-사용자가 품목 없이 판매자 이름/업체명으로 정보를 요청할 때:
+사용자가 품목 없이 판매자 이름/업체명으로 정보(연락처/회사 정보)를 요청할 때:
   예: "QA판매자 정보 찾아줘", "○○농산 연락처 알려줘", "test2 판매자 누구야"
   → get_user_profile(username="○○" 또는 company_name="○○") 즉시 호출
   → find_sellers_by_product 호출 불필요 (상품 조회가 목적이 아님)
   → 조회 결과로 이름, 회사명, 연락처를 자연스럽게 안내
+
+[🚨 특정 판매자의 상품 목록 조회 — 매우 중요]
+사용자가 "○○ 판매자가 파는 상품 알려줘", "행복농산 상품 보여줘", "test3이 뭐 팔아?", "○○농가 판매 품목 뭐 있어?", "그 판매자 상품 라인업 보여줘" 처럼 "특정 한 판매자의 전체 상품 목록"을 요청하면 다음 절차를 따른다. 절대 get_user_profile 만 부르고 끝내지 마라 — 그러면 상품을 누락한다.
+
+절차:
+1) 직전 대화 컨텍스트에 그 판매자의 seller_id(UUID) 가 있으면 (예: 직전에 find_sellers_by_product 또는 create_order 응답에 노출됐던 UUID): find_sellers_by_product(seller_id="그_UUID") 즉시 호출. category 는 비워둔다.
+2) 직전 컨텍스트에 UUID 가 없으면: find_sellers_by_product(seller_name_or_company="○○") 호출. 이름/업체명으로 ILIKE 매칭하여 그 판매자의 전체 상품 라인업을 한 번에 받는다. category 는 비워둔다.
+3) 응답의 sellers[0].products 배열을 자연체 한국어로 풀어서 1. 2. 3. 번호로 모두 나열한다(가격, 재고, 단위, 원산지, 상태). _response_guide 필드의 안내를 그대로 따르되, 표/별표/헤더는 절대 사용하지 마라.
+
+응답 처리 규칙:
+- query_mode="single_seller" 가 응답에 들어있으면 단일 판매자 모드다. _response_guide 의 단일 판매자용 안내를 그대로 따라라.
+- seller_count==0 (지정 판매자 매칭 0건): "○○ 판매자를 찾을 수 없어요. 정확한 이름이나 업체명을 알려주세요"라고 자연체로 안내. 다른 판매자/상품 임의 추천 금지.
+- seller_count>=2 (이름/업체명이 여러 명에 매칭): 각 후보의 회사명/담당자를 보여주고 "어느 판매자의 상품을 보고 싶으신가요?"라고 자연스럽게 되묻기. 임의로 한 명을 골라 답하지 마라.
+- 단일 판매자에 매칭됐는데 products 배열이 빈 경우(sellers[0].products==[]): "○○ 판매자가 현재 등록한 상품이 없습니다"라고 정확히 안내. "재고가 없습니다"라고 잘못 답하지 마라(상품 자체가 없는 것과 재고가 없는 것은 다르다).
+- 상태 표기: NORMAL→생략 또는 "정상", LOW_STOCK→"재고 부족", OUT_OF_STOCK→"품절", SCHEDULED→"입하 예정". 영문 enum 그대로 노출 금지.
+
+금지:
+- get_user_profile 만 호출하고 상품 정보 없이 답변 마무리하기 (사용자는 상품을 물어봤으므로 누락임).
+- find_sellers_by_product 를 category 만으로 호출해서 그 판매자가 안 다루는 카테고리만 보여주거나 다른 판매자까지 함께 노출하기.
+- LLM 이 임의로 추측한 상품/가격을 응답에 끼워 넣기 (도구 응답에 없는 정보는 절대 만들지 말 것).
 
 [🚨 주문 대상 판매자 식별 절차 — 매우 중요]
 create_order 호출 시 seller_id 는 반드시 UUID 형식이어야 한다. 사용자가 "test3", "○○ 농가", "○○ 도매상" 같이 판매자를 이름/회사명으로 지칭한 경우 다음 우선순위로 UUID 를 확보한다. 이 순서를 절대 어기지 마라.
@@ -919,6 +953,152 @@ AGENT_BUYER_SYSTEM = (
 
 
 # ─────────────────────────────────────────────
+# 헬퍼: hard guard — 사용자 발화 ↔ tool 인자 일관성 검증
+# ─────────────────────────────────────────────
+
+# 한국어 / ISO 날짜 표현 (사용자 발화에 날짜가 포함되었는지 판정)
+# 매칭 예: "5월 20일", "5/20", "2026-05-20", "오늘", "내일", "모레", "글피",
+#         "이번 주", "다음 주", "이번 달", "다음 달", "월요일~일요일"
+_DATE_HINT_RE = __import__("re").compile(
+    r"(\d{1,2}\s*월|\d{1,2}\s*일|\d{1,2}/\d{1,2}|\d{4}-\d{2}-\d{2}|"
+    r"오늘|내일|모레|글피|이번\s*주|다음\s*주|이번\s*달|다음\s*달|"
+    r"월요일|화요일|수요일|목요일|금요일|토요일|일요일)"
+)
+
+# 한국어 가격 표현 (kg당/총가 명시 포함)
+# 매칭 예: "21만원", "3000원", "kg당", "키로당", "박스당", "총", "전체로"
+_PRICE_HINT_RE = __import__("re").compile(
+    r"(\d[\d,]*\s*(원|만\s*원|만원|천\s*원|천원)|"
+    r"kg\s*당|키로\s*당|키로당|박스\s*당|박스당|개\s*당|개당|"
+    r"포대\s*당|포대당|총\s*가|전체\s*가|전체로|총\s*가격)",
+    flags=__import__("re").IGNORECASE,
+)
+
+
+def _guard_create_order_args(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    user_message: str,
+) -> Optional[str]:
+    """create_order tool 의 사용자 발화 ↔ 인자 일관성 hard guard.
+
+    위반 시 LLM 에 돌려줄 error JSON 문자열을 반환 (즉시 _execute_tool 대체).
+    위반이 없으면 None.
+
+    검사 항목:
+      1. 납품일 가드 — 사용자 발화에 날짜 표현 없는데 delivery_date 가 채워져 호출되면 거부.
+      2. 가격 가드 — 사용자 발화에 가격 표현 없는데 unit_price 가 그 셀러의 그 상품의
+         products.price_per_unit 과 다르면 거부 (LLM cross-contamination 방지).
+
+    가격 가드는 product_id 가 UUID 일 때만 작동. product_id 가 상품명 평문이면
+    create_order 함수 내부의 _find_product_by_name 검증에 위임 (가격 가드는 skip).
+    DB 조회 실패는 가드를 발동시키지 않음 (false positive 방지 — 본 호출은 통과시키고
+    create_order 도구 자체에서 검증되도록 둠).
+    """
+    if tool_name != "create_order":
+        return None
+
+    msg = user_message or ""
+
+    # 1) 납품일 가드
+    delivery_date = tool_input.get("delivery_date")
+    if delivery_date and not _DATE_HINT_RE.search(msg):
+        return json.dumps(
+            {
+                "success": False,
+                "error": "delivery_date_not_in_user_message",
+                "detail": (
+                    f"사용자 발화에 납품일이 명시되지 않았습니다. "
+                    f"delivery_date='{delivery_date}' 를 임의 추정해 호출하지 말고, "
+                    f"사용자에게 '납품일은 언제로 할까요? (예: 5월 20일)' 라고 자연체로 "
+                    f"먼저 물어보고 답변(○월 ○일/내일/다음 주 등)을 받은 뒤 다시 호출하세요."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    # 2) 가격 가드
+    unit_price = tool_input.get("unit_price")
+    if unit_price is not None and not _PRICE_HINT_RE.search(msg):
+        # 사용자 가격 미명시 — unit_price 가 그 셀러의 그 상품 표시가와 일치해야 함
+        from app.services.agent._shared import _UUID_PATTERN as _PROD_UUID_PATTERN
+
+        product_id = (tool_input.get("product_id") or "").strip()
+        seller_id = (tool_input.get("seller_id") or "").strip()
+
+        if _PROD_UUID_PATTERN.match(product_id):
+            try:
+                from app.core.supabase import get_supabase_client
+                _sb = get_supabase_client()
+                q = (
+                    _sb.table("products")
+                    .select("price_per_unit, name, seller_id")
+                    .eq("id", product_id)
+                    .is_("deleted_at", None)
+                    .limit(1)
+                )
+                _r = q.execute()
+                rows = _r.data or []
+                if rows:
+                    row = rows[0]
+                    listed = row.get("price_per_unit")
+                    listed_int = int(listed) if listed is not None else None
+                    try:
+                        llm_price = int(unit_price)
+                    except (TypeError, ValueError):
+                        llm_price = None
+
+                    # seller_id 도 일치하는지 확인 (cross-contamination 방어)
+                    seller_mismatch = (
+                        seller_id
+                        and row.get("seller_id")
+                        and seller_id != str(row.get("seller_id"))
+                    )
+
+                    if (
+                        listed_int is not None
+                        and llm_price is not None
+                        and llm_price != listed_int
+                    ):
+                        return json.dumps(
+                            {
+                                "success": False,
+                                "error": "unit_price_mismatch_no_user_price",
+                                "detail": (
+                                    f"사용자 발화에 가격이 명시되지 않았는데 "
+                                    f"unit_price={llm_price} 로 호출됐습니다. "
+                                    f"하지만 product_id={product_id[:8]}... "
+                                    f"(상품명 '{row.get('name')}') 의 표시가는 {listed_int}입니다. "
+                                    "가격 미명시 시 반드시 사용자가 지정한 그 셀러의 그 상품의 "
+                                    "표시가(price_per_unit)를 정확히 그대로 unit_price 에 사용하세요. "
+                                    "다른 셀러의 가격을 가져오면 cross-contamination 으로 자동 카운터오퍼가 "
+                                    "잘못 발사됩니다."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+
+                    if seller_mismatch:
+                        return json.dumps(
+                            {
+                                "success": False,
+                                "error": "seller_product_mismatch",
+                                "detail": (
+                                    f"product_id 가 가리키는 상품의 seller_id 와 호출 인자 seller_id 가 "
+                                    "일치하지 않습니다. 사용자가 지정한 셀러의 상품 product_id 를 "
+                                    "find_sellers_by_product 응답에서 정확히 매칭해 사용하세요."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+            except Exception:
+                # DB 조회 실패는 본 호출을 막지 않음 (가드는 best-effort, false positive 차단)
+                pass
+
+    return None
+
+
+# ─────────────────────────────────────────────
 # 헬퍼: tool 실행
 # ─────────────────────────────────────────────
 
@@ -993,6 +1173,13 @@ def _fix_id_params(tool_name: str, tool_input: dict[str, Any], user_id: str) -> 
             # seller_id가 없거나 UUID가 아니면 tool이 실패하게 두고,
             # LLM이 get_user_profile / find_sellers_by_product로 판매자 UUID를 다시 찾도록 유도한다.
             if tool_name == "create_order" and id_field == "seller_id":
+                continue
+
+            # find_sellers_by_product 의 seller_id 는 "조회 대상 판매자" UUID 필터다.
+            # LLM 이 비워두면 (seller_name_or_company / category 만 사용) 그대로 두어야 한다.
+            # 현재 사용자(주로 BUYER) 의 user_id 로 덮어쓰면 SELLER role 필터에 걸려 0건이 나온다.
+            if tool_name == "find_sellers_by_product" and id_field == "seller_id":
+                tool_input.pop(id_field, None)
                 continue
 
             tool_input[id_field] = user_id
@@ -1207,6 +1394,40 @@ async def inventory_order_node(state: AgentState) -> dict:
                     agent_messages.append({
                         "role": "user",
                         "content": "즉시 update_order_status 도구를 호출해서 취소를 완료하라. 추가 설명 없이 도구만 호출하라.",
+                    })
+                    continue
+
+                # ── 사전 안내 stop 감지 ─────────────────────────────
+                # LLM 이 도구 호출 없이 "잠시만 기다려 / 찾아보겠습니다 / 확인해 드릴게요" 같은
+                # 사전 안내 문장으로 stop 한 경우. 시스템 프롬프트(AGENT_BASE_SYSTEM 4번)가
+                # 금지하지만 gpt-4o-mini 가 종종 어김 → 도구 호출 강제 후 다음 라운드 진행.
+                # 이 분기는 응답이 "안내 문장으로만" 끝났을 때 동작해야 하므로
+                # 도구 결과가 하나도 없는 경우(`not all_tool_results`)에만 발동한다.
+                _pre_announce_markers = [
+                    "잠시만 기다려", "잠시만요",
+                    "찾아보겠", "찾아 보겠", "찾아드리겠", "찾아 드리겠",
+                    "확인해 드리겠", "확인해드리겠", "확인해 보겠", "확인해보겠", "확인하겠",
+                    "처리하겠", "처리해 드리겠", "처리해드리겠",
+                    "조회하겠", "조회해 보겠", "조회해보겠", "조회해 드리겠", "조회해드리겠",
+                    "알아보겠", "알아 보겠",
+                    "검색하겠", "검색해 보겠", "검색해보겠",
+                    "도와드리겠", "도와 드리겠",
+                ]
+                _is_pre_announce = (
+                    not all_tool_results
+                    and any(m in final_text for m in _pre_announce_markers)
+                    and round_idx < MAX_TOOL_ROUNDS - 1
+                )
+                if _is_pre_announce:
+                    agent_messages.append(assistant_stop_msg)
+                    agent_messages.append({
+                        "role": "user",
+                        "content": (
+                            "방금 응답은 사전 안내 문장입니다. 시스템 프롬프트 [핵심 대화 원칙] 4번에 따라 "
+                            "안내 문장 없이 즉시 필요한 도구를 호출해 사용자 요청을 처리하라. "
+                            "도구 결과를 받기 전까지 사용자에게 어떤 텍스트도 보내지 마라. "
+                            "필요한 정보(예: 납품일, 단가)가 부족하면 안내 문장이 아니라 한 줄짜리 질문으로만 되물어라."
+                        ),
                     })
                     continue
 
@@ -1520,8 +1741,17 @@ async def inventory_order_node(state: AgentState) -> dict:
                     if tool_name not in tools_used:
                         tools_used.append(tool_name)
 
-                    # tool 실행
-                    result_content = _execute_tool(tool_name, tool_input)
+                    # 🚨 Hard guard — create_order 의 사용자 발화 ↔ 인자 일관성 검증
+                    # (LLM 의 임의 날짜·가격 추정 / 셀러 cross-contamination 차단).
+                    # guard 가 위반을 감지하면 _execute_tool 을 호출하지 않고 거부 응답으로 대체.
+                    _guard_error = _guard_create_order_args(
+                        tool_name, tool_input, state.get("message", "")
+                    )
+                    if _guard_error is not None:
+                        result_content = _guard_error
+                    else:
+                        # tool 실행
+                        result_content = _execute_tool(tool_name, tool_input)
                     
                     print(f"\n🕵️‍♂️ [ORDER/INVENTORY TOOL]")
                     print(f"🛠️ tool_name = {tool_name}")

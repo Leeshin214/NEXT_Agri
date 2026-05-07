@@ -132,7 +132,11 @@ def get_calendar_events(user_id: str, year: int, month: int) -> dict:
 
 @tool(
     name="create_calendar_event",
-    description="캘린더에 새 일정을 등록한다. 호출 전 반드시 get_calendar_events로 동일 날짜 중복 여부를 확인한다.",
+    description=(
+        "캘린더에 새 일정을 등록한다. 호출 전 반드시 get_calendar_events로 동일 날짜 중복 여부를 확인한다. "
+        "사용자가 시간을 명시한 경우(예: '오후 2시', '14:00', '오전 9시 30분')에는 반드시 start_time을 채워야 한다. "
+        "시간이 명시되지 않았다면 start_time/end_time을 생략하여 종일 일정으로 등록한다."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -146,6 +150,20 @@ def get_calendar_events(user_id: str, year: int, month: int) -> dict:
             },
             "description": {"type": "string", "description": "상세 설명"},
             "order_id": {"type": "string", "description": "연관된 주문 UUID"},
+            "start_time": {
+                "type": "string",
+                "description": (
+                    "시작 시각 (24시간제 HH:MM 형식, 예: '14:00', '09:30'). "
+                    "사용자가 시간을 명시한 경우에만 채운다 — 생략하면 종일 일정으로 등록된다."
+                ),
+            },
+            "end_time": {
+                "type": "string",
+                "description": (
+                    "종료 시각 (24시간제 HH:MM 형식, 예: '15:30'). "
+                    "start_time이 있을 때만 의미가 있다. 종료 시각이 명시되지 않으면 생략한다."
+                ),
+            },
         },
         "required": ["user_id", "title", "event_date", "event_type"],
     },
@@ -158,10 +176,13 @@ def create_calendar_event(
     event_type: str,
     description: str = "",
     order_id: str = "",
+    start_time: str = "",
+    end_time: str = "",
 ) -> dict:
     """캘린더 일정을 등록한다.
     event_type: SHIPMENT | DELIVERY | MEETING | QUOTE_DEADLINE | ORDER | OTHER
     event_date: "YYYY-MM-DD" 형식
+    start_time/end_time: "HH:MM" (24시간제). start_time 이 비어있으면 종일 일정으로 등록.
     order_id가 빈 문자열이면 NULL로 저장한다.
     반환: {success, event_id, title}
     """
@@ -199,7 +220,9 @@ def create_calendar_event(
                     title=title,
                     event_date=event_date,
                     event_type=event_type,
-                    description=description
+                    description=description,
+                    start_time=start_time or None,
+                    end_time=end_time or None,
                 )
 
         # 2. 신규 등록 로직 (주문은 같아도 '배송', '출하' 등 유형이 다르면 이쪽으로 빠져서 새로 생성됨)
@@ -211,6 +234,14 @@ def create_calendar_event(
             "description": description or None,
             "order_id": order_id if order_id else None,
         }
+
+        # 시간 명시 시: start_time/end_time 채우고 is_allday=False.
+        # 미명시 시: 시간 필드 미추가 → DB DEFAULT(is_allday=true) 유지하여 종일 일정으로 등록.
+        if start_time:
+            payload["start_time"] = start_time
+            payload["is_allday"] = False
+            if end_time:
+                payload["end_time"] = end_time
 
         result = supabase.table("calendar_events").insert(payload).execute()
 
@@ -230,7 +261,11 @@ def create_calendar_event(
 
 @tool(
     name="update_calendar_event",
-    description="기존 캘린더 일정을 수정한다. 수정할 일정의 event_id와 변경할 내용만 전달한다. event_id를 모르면 먼저 get_calendar_events를 호출해서 찾아라.",
+    description=(
+        "기존 캘린더 일정을 수정한다. 수정할 일정의 event_id와 변경할 내용만 전달한다. "
+        "event_id를 모르면 먼저 get_calendar_events를 호출해서 찾아라. "
+        "시간을 새로 지정/변경하려면 start_time(필요 시 end_time)을 채운다 — start_time이 채워지면 자동으로 종일 해제된다."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -240,6 +275,14 @@ def create_calendar_event(
             "event_date": {"type": "string", "description": "YYYY-MM-DD"},
             "event_type": {"type": "string"},
             "description": {"type": "string"},
+            "start_time": {
+                "type": "string",
+                "description": "시작 시각 (24시간제 HH:MM, 예: '14:00'). 시간을 추가/변경할 때만 채운다.",
+            },
+            "end_time": {
+                "type": "string",
+                "description": "종료 시각 (24시간제 HH:MM, 예: '15:30'). start_time과 함께 사용한다.",
+            },
         },
         "required": ["user_id", "event_id"],
     },
@@ -252,6 +295,8 @@ def update_calendar_event(
     event_date: Optional[str] = None,
     event_type: Optional[str] = None,
     description: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
 ) -> dict:
     """캘린더 일정을 수정한다."""
     VALID_EVENT_TYPES = {"SHIPMENT", "DELIVERY", "MEETING", "QUOTE_DEADLINE", "ORDER", "OTHER"}
@@ -287,6 +332,13 @@ def update_calendar_event(
         if event_date is not None: update_data["event_date"] = event_date
         if event_type is not None: update_data["event_type"] = event_type
         if description is not None: update_data["description"] = description
+        # 시간 갱신: start_time 이 비어있지 않은 문자열이면 시간 등록 + is_allday=False.
+        # None 또는 빈 문자열이면 시간 미변경 (기존 종일 여부 유지).
+        if start_time:
+            update_data["start_time"] = start_time
+            update_data["is_allday"] = False
+        if end_time:
+            update_data["end_time"] = end_time
 
         if not update_data:
             return {"success": False, "error": "수정할 내용이 없습니다."}

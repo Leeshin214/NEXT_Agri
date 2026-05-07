@@ -115,45 +115,106 @@ def get_user_profile(
 @tool(
     name="find_sellers_by_product",
     description=(
-        "특정 카테고리의 모든 판매자 및 상품 목록을 조회한다. "
-        "구매자가 특정 품목(예: 풋사과, 청사과)을 찾을 때, 이 도구로 상위 카테고리(예: FRUIT) 전체를 조회한 후 "
-        "LLM이 직접 결과값을 읽고 사용자가 원하는 세부 품목 조건에 맞는 것만 필터링해서 답변해야 한다. "
-        "정확한 상품명을 알고 있는 경우 product_name을 함께 전달하면 더 정확한 결과를 반환한다. "
-        "응답의 seller_id 는 UUID 형식이라 create_order 의 seller_id 에 그대로 사용 가능. 사용자가 직후 발화에서 회사명/담당자만 언급해도 이 응답을 컨텍스트로 활용해 다시 get_user_profile 을 호출할 필요 없이 매칭되는 항목의 seller_id 를 그대로 쓸 것."
+        "판매자와 상품을 함께 조회하는 통합 도구. 세 가지 시나리오를 한 번에 처리한다. "
+        "(1) 카테고리 검색: 사용자가 '사과 파는 곳', '과일 판매자' 같이 품목/카테고리로 물으면 category 만 전달 → 해당 카테고리의 판매자+상품 목록 반환. "
+        "(2) 특정 판매자의 상품 목록 조회: 사용자가 '○○농산이 파는 상품', 'test3 판매자가 뭐 팔아?', '행복농산 상품 보여줘' 같이 특정 판매자의 상품 목록을 물으면 seller_id(UUID 알면) 또는 seller_name_or_company(이름/업체명)를 전달 → 그 판매자 한 곳의 전체 상품 반환. category 는 생략 가능. "
+        "(3) 결합 검색: 특정 판매자 + 특정 카테고리/상품명을 동시에 필터링 가능. "
+        "category, seller_id, seller_name_or_company 중 최소 1개는 반드시 전달해야 한다. "
+        "응답의 seller_id 는 UUID 형식이라 create_order 의 seller_id 에 그대로 사용 가능. "
+        "사용자가 직후 발화에서 회사명/담당자만 언급해도 이 응답을 컨텍스트로 활용해 다시 get_user_profile 을 호출할 필요 없이 매칭되는 항목의 seller_id 를 그대로 쓸 것."
     ),
     parameters={
         "type": "object",
         "properties": {
             "category": {
                 "type": "string",
-                "description": "조회할 상위 카테고리명. 허용값: FRUIT, VEGETABLE, GRAIN, MUSHROOM, SEAFOOD, MEAT, DAIRY, HERB, LEGUME, ROOT, LEAF, PROCESSED, OTHER. 사용자가 어떤 표현을 써도 가장 가까운 카테고리로 자동 변환할 것. 카테고리가 모호하거나 전체를 뒤져야 하면 'ALL'을 입력하세요.",
+                "description": "조회할 상위 카테고리명 (선택). 허용값: FRUIT, VEGETABLE, GRAIN, MUSHROOM, SEAFOOD, MEAT, DAIRY, HERB, LEGUME, ROOT, LEAF, PROCESSED, OTHER. 사용자가 카테고리 단위로 묻는 경우(예: '과일 판매자', '곡물 보여줘')에만 채운다. 사용자가 특정 상품명만 언급한 경우(예: '감자 찾아줘')에는 product_name 만 사용하고 이 필드는 비워둘 것 — 카테고리를 임의 추론하면 다른 카테고리에 등록된 동명 상품이 누락된다(예: 같은 '감자' 가 한 곳은 VEGETABLE, 다른 곳은 GRAIN 으로 등록될 수 있음). 전체 카테고리를 보려면 'ALL' 또는 생략. seller_id/seller_name_or_company 를 지정해 특정 판매자 상품만 보려면 이 필드는 비워두는 것이 자연스럽다.",
             },
             "product_name": {
                 "type": "string",
                 "description": "검색할 상품명 (선택). 예: 당근, 사과. 특정 상품을 찾을 때 입력하면 정확한 결과를 반환한다.",
             },
+            "seller_id": {
+                "type": "string",
+                "description": "특정 판매자의 UUID (선택). 직전 대화에서 받은 seller_id 가 있거나 get_user_profile 응답으로 얻은 UUID 가 있으면 이 값을 전달한다. 이 필드를 채우면 그 판매자 한 곳의 상품만 반환한다.",
+            },
+            "seller_name_or_company": {
+                "type": "string",
+                "description": "판매자 이름 또는 회사명 (선택, 부분 일치 검색). 사용자가 '○○농산이 파는 상품'처럼 UUID 없이 이름/업체명만 말한 경우 이 필드를 사용. 내부적으로 users.name 또는 users.company_name 에 ILIKE 매칭한다. 매칭이 여러 명이면 모두 합쳐 반환한다(LLM 이 응답에서 사용자가 의도한 후보를 골라야 함).",
+            },
         },
-        "required": ["category"],
+        "required": [],
     },
     groups=("inventory_order",),
 )
-def find_sellers_by_product(category: str, product_name: Optional[str] = None) -> dict:
-    """users 테이블 기준으로 판매자를 조회하고, products 테이블을 부가적으로 조인한다."""
+def find_sellers_by_product(
+    category: Optional[str] = None,
+    product_name: Optional[str] = None,
+    seller_id: Optional[str] = None,
+    seller_name_or_company: Optional[str] = None,
+) -> dict:
+    """users 테이블 기준으로 판매자를 조회하고, products 테이블을 부가적으로 조인한다.
+
+    필터 우선순위:
+      1) seller_id (UUID) 가 있으면 그 한 명만.
+      2) seller_name_or_company 가 있으면 name/company_name ILIKE 매칭으로 후보 판매자(들).
+      3) 둘 다 없으면 전체 SELLER role 사용자.
+    그 위에 category, product_name 으로 상품 필터를 추가 적용한다.
+
+    최소 1개 필터(category / seller_id / seller_name_or_company / product_name) 가 필요.
+    아무 조건도 없으면 너무 광범위한 조회가 되므로 거부.
+    """
+    from collections import defaultdict
+
+    # 모두 비어있으면 거부
+    if not any([category, seller_id, seller_name_or_company, product_name]):
+        return {
+            "success": False,
+            "error": "missing_filter",
+            "detail": "category, seller_id, seller_name_or_company, product_name 중 최소 1개를 전달해야 합니다.",
+            "sellers": [],
+            "seller_count": 0,
+        }
+
+    # 단일 판매자 조회 모드 여부
+    is_single_seller_query = bool(seller_id) or bool(seller_name_or_company)
+
     try:
         supabase = get_supabase_client()
 
-        # 1단계: users 테이블에서 SELLER 전체 조회
-        sellers_result = (
+        # 1단계: 판매자 후보 결정
+        sellers_query = (
             supabase.table("users")
             .select("id, name, company_name, phone")
             .eq("role", "SELLER")
             .eq("is_active", True)
             .is_("deleted_at", None)
-            .execute()
         )
+
+        if seller_id:
+            sellers_query = sellers_query.eq("id", seller_id)
+        elif seller_name_or_company:
+            q = seller_name_or_company.strip()
+            sellers_query = sellers_query.or_(
+                f"name.ilike.%{q}%,company_name.ilike.%{q}%"
+            )
+
+        sellers_result = sellers_query.execute()
         all_sellers = sellers_result.data or []
 
         if not all_sellers:
+            # 판매자 후보가 0건인 경우 — single_seller 모드면 더 명확한 메시지
+            if is_single_seller_query:
+                return {
+                    "success": True,
+                    "seller_count": 0,
+                    "sellers": [],
+                    "_response_guide": (
+                        "지정한 판매자(이름/업체명/UUID) 와 매칭되는 활성 SELLER 가 없습니다. "
+                        "사용자에게 '○○ 라는 판매자를 찾을 수 없어요. 정확한 이름이나 업체명을 알려주세요'라고 자연체로 안내하세요. "
+                        "다른 판매자나 상품을 임의로 추천하지 마세요."
+                    ),
+                }
             return {
                 "success": True,
                 "seller_count": 0,
@@ -168,9 +229,13 @@ def find_sellers_by_product(category: str, product_name: Optional[str] = None) -
             supabase.table("products")
             .select("seller_id, name, price_per_unit, stock_quantity, unit, origin, spec, status, category")
             .in_("seller_id", seller_ids)
-            .gt("stock_quantity", 0)
             .is_("deleted_at", None)
         )
+
+        # 단일 판매자 조회는 재고 0 도 포함해 "어떤 상품 라인업이 있는지" 보여준다.
+        # 카테고리 검색은 기존 동작 유지(재고 있는 상품만).
+        if not is_single_seller_query:
+            products_query = products_query.gt("stock_quantity", 0)
 
         if category and category.upper() != "ALL":
             products_query = products_query.eq("category", category.upper())
@@ -181,8 +246,49 @@ def find_sellers_by_product(category: str, product_name: Optional[str] = None) -
         products_result = products_query.execute()
         products = products_result.data or []
 
-        # category 필터 결과가 없으면 ALL로 재시도
-        if not products and category and category.upper() != "ALL":
+        # ────────────────────────────────────────────
+        # robust 화 (2026-05-06): product_name 이 명시되면 카테고리 over-narrowing 방어
+        #
+        # 배경: LLM 이 "감자 찾아줘" 같은 발화에 대해 product_name='감자' + category='VEGETABLE'
+        # 식으로 둘 다 채워 넘기는 경우가 있다. 이 때 같은 이름의 상품이 다른 카테고리(GRAIN 등)
+        # 로 등록되어 있으면 1차 결과에서 누락된다. 기존 fallback 은 `not products` 일 때만
+        # 발동해 1차에 한 건이라도 잡히면 다른 카테고리 동명 상품이 영원히 누락됐다.
+        #
+        # 새 정책: product_name 이 있고 category 도 같이 좁혀진 경우, 카테고리 무관 ILIKE 결과를
+        # 추가로 가져와 union 한다. (seller_id, name) 키로 중복 제거.
+        # 단일 판매자 조회는 그 판매자만 봐야 하므로 그대로 유지.
+        # ────────────────────────────────────────────
+        if (
+            product_name
+            and category
+            and category.upper() != "ALL"
+            and not is_single_seller_query
+        ):
+            extra_query = (
+                supabase.table("products")
+                .select("seller_id, name, price_per_unit, stock_quantity, unit, origin, spec, status, category")
+                .in_("seller_id", seller_ids)
+                .gt("stock_quantity", 0)
+                .is_("deleted_at", None)
+                .ilike("name", f"%{product_name}%")
+            )
+            extra_result = extra_query.execute()
+            extra = extra_result.data or []
+            seen = {(p.get("seller_id"), p.get("name")) for p in products}
+            for p in extra:
+                key = (p.get("seller_id"), p.get("name"))
+                if key not in seen:
+                    products.append(p)
+                    seen.add(key)
+
+        # category 필터 결과가 없으면 ALL로 재시도 (단일 판매자 모드에는 적용하지 않음 —
+        # 그 판매자가 그 카테고리를 안 다루는 게 명확한 정보이므로 fallback 하지 않는다)
+        if (
+            not products
+            and category
+            and category.upper() != "ALL"
+            and not is_single_seller_query
+        ):
             fallback_query = (
                 supabase.table("products")
                 .select("seller_id, name, price_per_unit, stock_quantity, unit, origin, spec, status, category")
@@ -196,7 +302,6 @@ def find_sellers_by_product(category: str, product_name: Optional[str] = None) -
             products = products_result.data or []
 
         # 3단계: 판매자별로 상품 그룹화
-        from collections import defaultdict
         products_by_seller: dict = defaultdict(list)
         for p in products:
             sid = p.get("seller_id")
@@ -215,7 +320,9 @@ def find_sellers_by_product(category: str, product_name: Optional[str] = None) -
         sellers_with_products = []
         for sid in seller_ids:
             seller_products = products_by_seller.get(sid, [])
-            if not seller_products:
+            # 단일 판매자 모드: 상품 0건이어도 판매자 정보 자체는 응답에 포함
+            # (LLM 이 "상품이 등록되지 않았습니다"라고 정확히 답할 수 있게)
+            if not seller_products and not is_single_seller_query:
                 continue
             seller_info = seller_map[sid]
             sellers_with_products.append({
@@ -226,17 +333,48 @@ def find_sellers_by_product(category: str, product_name: Optional[str] = None) -
                 "products": seller_products,
             })
 
-        return {
-            "success": True,
-            "seller_count": len(sellers_with_products),
-            "sellers": sellers_with_products,
-            "_response_guide": (
+        # 응답 가이드는 모드에 따라 분기
+        if is_single_seller_query:
+            if not sellers_with_products or all(
+                len(s["products"]) == 0 for s in sellers_with_products
+            ):
+                response_guide = (
+                    "지정 판매자가 등록한 상품이 없습니다. "
+                    "사용자에게 '○○ 판매자가 현재 등록한 상품이 없습니다'라고 자연체로 정확히 안내하세요. "
+                    "다른 판매자나 상품을 임의로 추천하지 마세요."
+                )
+            elif len(sellers_with_products) == 1:
+                response_guide = (
+                    "단일 판매자의 상품 라인업입니다. "
+                    "첫 문장에 '○○(회사명) 판매자가 판매 중인 상품 N건입니다.' 형식으로 안내하고, "
+                    "products 배열의 상품을 1. 2. 3. 번호로 모두 나열하세요(많아도 최대 15개까지). "
+                    "각 상품은 '품명 — 가격(원/단위), 재고 수량(단위), 원산지(있으면), 상태' 순으로 자연체 한국어로 풀어 쓰세요. "
+                    "상태가 OUT_OF_STOCK 이면 '품절'로, LOW_STOCK 이면 '재고 부족'으로 한글 표기. "
+                    "표/별표/헤더 사용 금지. 16개 이상이면 '외 N개 상품이 더 있습니다'로 요약."
+                )
+            else:
+                response_guide = (
+                    "이름/업체명 검색이 여러 판매자에 매칭됐습니다. "
+                    "첫 문장에 '○○ 와 매칭되는 판매자가 N명입니다.' 형식으로 안내하고, "
+                    "각 판매자별로 회사명/담당자를 명시한 뒤 그 판매자의 상품을 1. 2. 3. 으로 나열하세요. "
+                    "사용자에게 '어느 판매자의 상품을 보고 싶으신가요?'라고 마지막에 자연스럽게 묻기. "
+                    "표/별표/헤더 사용 금지."
+                )
+        else:
+            response_guide = (
                 "seller_count가 실제 판매자 수입니다. 첫 문장에 전체 판매자 수(seller_count)를 안내하세요. "
                 "반드시 상위 5개 판매자를 1. 2. 3. 4. 5. 번호를 붙여 표시하세요. 판매자가 5개 미만이면 전체를 번호와 함께 표시하세요. "
                 "각 판매자 아래에 products 배열의 상품들을 들여쓰기로 나열하세요. "
                 "나머지 판매자는 '외 N개 판매처가 더 있습니다'로 요약하세요. "
                 "상품별로 가격, 재고, 원산지(있으면)를 간결하게 표시하세요."
-            ),
+            )
+
+        return {
+            "success": True,
+            "seller_count": len(sellers_with_products),
+            "sellers": sellers_with_products,
+            "query_mode": "single_seller" if is_single_seller_query else "category_search",
+            "_response_guide": response_guide,
         }
     except Exception as e:
         return {"success": False, "error": str(e), "sellers": [], "seller_count": 0}

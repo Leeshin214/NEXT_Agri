@@ -299,6 +299,19 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 #   - 본인이 제시한 PENDING 은 본인이 accept/reject 불가 (상대방만)
 #   - 신규 제시 시 같은 주문의 이전 PENDING 은 모두 SUPERSEDED 마킹
 #     + messages.metadata.status 도 동기화 (negotiation 패턴과 동일)
+
+# 대체 거래처 자동 추천 (alternatives) — 2026-05-06 신규
+# GET    /orders/{id}/alternatives
+#   - 판매자가 활성 주문을 취소하면 백엔드가 fire-and-forget 으로 자동 생성하는
+#     대체 판매자 + 자동 견적 결과 조회 (alternative_partner_recommendations 테이블).
+#   - 권한: 본인이 buyer 인 주문만. 다른 buyer → 403, 없는 주문 → 404.
+#   - 추천이 아직 없으면 data: null (404 가 아님) — 백그라운드 task 진행 중이거나
+#     SELLER 가 취소한 게 아니거나 첫 item 정보가 부족한 케이스.
+#   - 응답 구조: SuccessResponse<AlternativeRecommendationResponse | null>
+#     {data: {id, cancelled_order_id, buyer_id, candidates: [...], reason, found_count, created_at}}
+#   - candidates 의 각 원소: seller_id, seller_name, seller_company, product_id, product_name,
+#       stock_quantity, price_per_unit, unit, trade_count, last_trade_date,
+#       auto_order_id, auto_order_number, auto_order_error
 ```
 
 ### chat.py (채팅 API)
@@ -450,6 +463,21 @@ router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 ```python
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
+# 알림 type 화이트리스트 (notification_service.ALLOWED_NOTIFICATION_TYPES & DB CHECK):
+#   NEW_MESSAGE, COUNTER_OFFER, OFFER_ACCEPTED, OFFER_REJECTED,
+#   DELIVERY_DATE_CHANGE, DELIVERY_DATE_ACCEPTED, DELIVERY_DATE_REJECTED,
+#   ORDER_STATUS, ALTERNATIVE_PARTNERS (2026-05-06)
+#
+# 🚨 알림 type 추가 시 4곳 모두 동기화 (한 곳이라도 빠지면 GET /notifications 가
+#    ResponseValidationError 로 500 반환 — 종 아이콘 드롭다운이 통째로 안 뜸):
+#   1) DB CHECK 제약: supabase/migrations/<날짜>_*.sql 에서 ALTER TABLE notifications
+#      DROP/ADD CONSTRAINT notifications_type_check (DO $$ 블록 패턴).
+#   2) backend/app/services/notification_service.py 의 ALLOWED_NOTIFICATION_TYPES set.
+#   3) backend/app/schemas/notification.py 의 NotificationType Literal (응답 직렬화).
+#   4) frontend/types/notification.ts 의 NotificationType union (TS 타입체크용).
+#   추가로 frontend/components/layout/NotificationBell.tsx 의 NotificationIcon switch case
+#   도 신규 type 마다 아이콘 매핑 추가 권장 (default 폴백 가능하지만 UX 일관성 위해).
+#
 # GET  /notifications?limit=30&only_unread=false
 #   응답: SuccessResponse[list[NotificationResponse]] + meta {unread_count, total}
 #   limit: 1~100 (기본 30)

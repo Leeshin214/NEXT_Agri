@@ -8,6 +8,7 @@ import {
   CircleDollarSign,
   MessageCircle,
   Package,
+  Sparkles,
 } from 'lucide-react';
 import {
   useMarkAllNotificationsRead,
@@ -217,6 +218,7 @@ export default function NotificationBell() {
  * - COUNTER_OFFER / OFFER_ACCEPTED / OFFER_REJECTED: 가격 협상 아이콘
  * - DELIVERY_DATE_*: 캘린더 아이콘
  * - ORDER_STATUS: 패키지(상태) 아이콘
+ * - ALTERNATIVE_PARTNERS: 대체 거래처 자동 추천 (반짝이 아이콘)
  */
 function NotificationIcon({ type }: { type: NotificationType }) {
   const iconClass = 'h-4 w-4';
@@ -231,6 +233,8 @@ function NotificationIcon({ type }: { type: NotificationType }) {
     case 'DELIVERY_DATE_ACCEPTED':
     case 'DELIVERY_DATE_REJECTED':
       return <CalendarIcon className={iconClass} />;
+    case 'ALTERNATIVE_PARTNERS':
+      return <Sparkles className={iconClass} />;
     case 'ORDER_STATUS':
     default:
       return <Package className={iconClass} />;

@@ -249,7 +249,8 @@ CREATE TABLE notifications (
                 'NEW_MESSAGE',
                 'COUNTER_OFFER', 'OFFER_ACCEPTED', 'OFFER_REJECTED',
                 'DELIVERY_DATE_CHANGE', 'DELIVERY_DATE_ACCEPTED', 'DELIVERY_DATE_REJECTED',
-                'ORDER_STATUS')),
+                'ORDER_STATUS',
+                'ALTERNATIVE_PARTNERS')),  -- 2026-05-06 추가
   title      TEXT NOT NULL,
   body       TEXT NOT NULL,
   link_url   TEXT,
@@ -269,6 +270,38 @@ CREATE INDEX idx_notifications_user_recent
 - Supabase Realtime publication 등록 (`ALTER PUBLICATION supabase_realtime ADD TABLE notifications;`).
 - 마이그레이션: `supabase/migrations/20260429000002_create_notifications.sql`.
 - `deleted_at` 미보유 — 일반적으로 알림은 일시 보존 (TTL 정책 추가 시 별도 처리).
+- `ALTERNATIVE_PARTNERS` 타입 추가 마이그레이션: `supabase/migrations/20260506000002_create_alternative_partner_recommendations.sql`
+  (CHECK 제약 DROP/ADD + 같은 마이그레이션에서 신규 테이블 생성).
+
+### alternative_partner_recommendations 테이블 — 판매자 취소 시 자동 대체 거래처 추천 (2026-05-06)
+```sql
+CREATE TABLE alternative_partner_recommendations (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  cancelled_order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  buyer_id           UUID NOT NULL REFERENCES users(id)  ON DELETE CASCADE,
+  candidates         JSONB NOT NULL DEFAULT '[]'::jsonb,
+  reason             TEXT NOT NULL DEFAULT 'SELLER_CANCELLED',
+  found_count        INTEGER NOT NULL DEFAULT 0,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_alt_recs_order ON alternative_partner_recommendations(cancelled_order_id);
+CREATE INDEX idx_alt_recs_buyer_created ON alternative_partner_recommendations(buyer_id, created_at DESC);
+```
+- 트리거: `order_service.cancel_order` 가 `user.role == "SELLER"` 일 때 fire-and-forget 으로
+  `alternative_partner_service.find_and_notify(updated_order)` 호출.
+- 처리 흐름: 1차 후보 풀(`category eq` UNION `name ilike` — 같은 상품이 다른 카테고리에
+  등록된 경우도 포함, 2026-05-06 강화) → LLM 본질 동일성 판별 → 상위 3건 → 각 후보에 자동
+  QUOTE_REQUESTED 주문 생성 (`order_service.create_order`) → 이 테이블에 UPSERT
+  (cancelled_order_id UNIQUE) → `notifications.emit('ALTERNATIVE_PARTNERS', ...)`.
+- candidates JSONB 키 셋(정규화):
+  `seller_id, seller_name, seller_company, product_id, product_name, stock_quantity,
+  price_per_unit, unit, trade_count, last_trade_date, auto_order_id, auto_order_number, auto_order_error,
+  original_unit_price, effective_unit_price, price_strategy` (마지막 3개는 2026-05-07 추가, Optional).
+- price_strategy 값: `ORIGINAL_LOWER` (기존이 더 쌈 → 그 단가로 협상가 제시 → NEGOTIATING) /
+  `CANDIDATE_LOWER` (새 셀러가 더 쌈 → 그 단가로 주문 → QUOTE_REQUESTED) /
+  `EQUAL` / `FALLBACK_ORIGINAL` / `FALLBACK_CANDIDATE`.
+- RLS: SELECT 본인(buyer)만. INSERT/UPDATE 정책 없음 → service_role 만.
+- 마이그레이션: `supabase/migrations/20260506000002_create_alternative_partner_recommendations.sql`.
 
 ### ai_conversations 테이블 (AI 대화 히스토리)
 ```sql

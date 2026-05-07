@@ -242,6 +242,7 @@ POST /notifications/read-all            useMarkAllNotificationsRead()  ← Optim
 - 두 쿼리 모두 `['notifications', ...]` prefix 키 → Realtime 시 한 번의 invalidate 로 동기화됨
 - 백엔드 응답 형태: `SuccessResponse<Notification[]>` + `meta: { unread_count, total }` (페이지네이션 meta 와 같은 자리)
 - 행 클릭 → **`await markRead.mutateAsync(id)` 후** `router.push(link_url)`. `mutate()` fire-and-forget 으로 호출 직후 navigate 하면 fetch 가 abort 됨 — 항상 await. order 관련은 `/{role}/orders?id=...`, NEW_MESSAGE 는 `/{role}/chat?room_id=...`. orders/chat 페이지는 `?id=` / `?room_id=` 쿼리로 자동 모달/방 선택 처리 (각 page.tsx 의 `useEffect(() => searchParams.get(...))` 참조).
+- `ALTERNATIVE_PARTNERS` (2026-05-06): 판매자 취소 → 자동 대체 거래처 추천. 아이콘 `Sparkles`. link_url 은 취소된 주문 상세 (`/buyer/orders?id=...`) 로 이동. 주문 상세 패널의 "취소됨" 빨간 박스 아래에 `<AlternativePartnersSection orderId={selectedOrder.id} />` 가 자동 렌더되어 카드 형태로 자동 견적 결과 노출 (`useAlternativeRecommendations` 훅).
 
 ### Optimistic mark-read mutation 의 race 회피 정책 (검증됨)
 
