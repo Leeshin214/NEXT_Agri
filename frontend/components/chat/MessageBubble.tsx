@@ -361,8 +361,9 @@ function CounterOfferCard({
               <DollarSign className="h-4 w-4" />
             </span>
             <span className="text-xs font-semibold text-amber-900">
-              {fromRole ? ROLE_LABEL[fromRole] : '상대방'}이(가) 새 협상가
-              제시
+              {isMine
+                ? '내가 새 협상가 제시'
+                : `${fromRole ? ROLE_LABEL[fromRole] : '상대방'}이(가) 새 협상가 제시`}
             </span>
           </div>
           {statusBadge}

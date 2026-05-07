@@ -23,6 +23,72 @@ from .._registry import tool
 
 
 @tool(
+    name="get_pending_counter_offers",
+    description=(
+        "나에게 들어온 PENDING(미결) 협상가 제시 목록을 조회한다. "
+        "사용자가 '협상 들어온거 있어?', '협상가 왔어?', '상대방이 가격 제시했어?', "
+        "'받은 협상 목록', '미결 협상 있어?' 같이 상대방이 보낸 협상 카드를 확인하려 할 때 호출하라. "
+        "본인이 제시한 카운터오퍼는 포함되지 않는다 (상대방이 보낸 것만)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "user_id": {
+                "type": "string",
+                "description": "현재 로그인 사용자 UUID. 서버에서 강제 주입.",
+            },
+        },
+        "required": [],
+    },
+    groups=("inventory_order",),
+)
+def get_pending_counter_offers(user_id: str = "") -> dict:
+    """상대방이 보낸 PENDING 카운터오퍼 목록 조회. 본인 제시분 제외.
+
+    LLM 자연어 트리거 예: "협상 들어온거 있어?", "협상가 왔어?", "받은 협상 목록".
+    """
+    from .._shared import _UUID_PATTERN
+    from app.core.supabase import get_supabase_client
+
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+
+    try:
+        sb = get_supabase_client()
+        # 1) 내가 당사자인 주문 ID 목록 (buyer 또는 seller)
+        orders_res = sb.table("orders").select("id, order_number, buyer_id, seller_id").or_(
+            f"buyer_id.eq.{user_id},seller_id.eq.{user_id}"
+        ).in_("status", ["QUOTE_REQUESTED", "NEGOTIATING"]).execute()
+        order_rows = orders_res.data or []
+        if not order_rows:
+            return {"success": True, "offers": [], "count": 0}
+
+        order_map = {r["id"]: r for r in order_rows}
+        order_ids = list(order_map.keys())
+
+        # 2) 상대방이 보낸 PENDING 협상가
+        neg_res = sb.table("negotiation_history").select("*").in_(
+            "order_id", order_ids
+        ).eq("status", "PENDING").neq("from_user_id", user_id).order(
+            "created_at", desc=True
+        ).execute()
+        offers = neg_res.data or []
+
+        # 3) 주문 정보 붙이기
+        result = []
+        for offer in offers:
+            order = order_map.get(offer["order_id"], {})
+            result.append({
+                **offer,
+                "order_number": order.get("order_number"),
+            })
+
+        return {"success": True, "offers": result, "count": len(result)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@tool(
     name="submit_counter_offer",
     description=(
         "구매자 또는 판매자가 채팅방에서 가격 제시 카드를 발송한다. "

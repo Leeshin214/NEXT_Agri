@@ -12,14 +12,14 @@
 - subscription  (6): create_subscription_request, accept_subscription_request,
                      reject_subscription_request, create_subscription_from_order,
                      get_incoming_subscription_requests, get_subscriptions
-- negotiation   (6): submit/accept/reject_counter_offer, submit/accept/reject_delivery_date_change
+- negotiation   (7): get_pending_counter_offers, submit/accept/reject_counter_offer, submit/accept/reject_delivery_date_change
 - user          (4): get_user_profile, find_sellers_by_product, find_buyers_by_product, open_chat_room
 - calendar      (4): get_calendar_events, create_calendar_event, update_calendar_event, delete_calendar_event
 - chat          (3): get_chat_rooms, get_chat_messages, send_chat_message
 - chat (외부)    (1): analyze_chat_consensus — chat_ws.py 직접 호출, ToolRegistry 미등록
 
 그룹 분류:
-- "inventory_order" : product 6 + order 6 + partner 7 + subscription 6 + negotiation 6 + user 4 = 35
+- "inventory_order" : product 6 + order 6 + partner 7 + subscription 6 + negotiation 7 + user 4 = 36
 - "calendar"        : 4
 - "chat"            : 3
 """
