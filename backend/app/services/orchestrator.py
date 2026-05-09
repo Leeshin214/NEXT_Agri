@@ -224,7 +224,7 @@ def _build_router_system() -> str:
 
 [모호성 해결]
 - (최우선 절대 규칙) 문장 내에 오타가 있더라도 "일정", "캘린더", "스케줄", "달력" 이라는 단어(또는 비슷한 발음/철자)가 존재하면 무조건 CALENDAR 로 분류하세요.
-- (삭제/변경 의도 캐치) "삭제", "지워", "취소", "바꿔" 등의 단어(또는 그와 유사한 오타, 예: "삭젷줘")가 포함되어 있고 캘린더 관련 맥락이라면 반드시 CALENDAR(DATA) 로 분류하세요. 단, "거래처 삭제/해제/끊기/없애기"처럼 거래처 관계 자체를 끊는 요청은 CALENDAR가 아니라 INVENTORY로 분류하세요.
+- (삭제/변경 의도 캐치) "삭제", "지워", "취소", "바꿔" 등의 단어(또는 그와 유사한 오타, 예: "삭젷줘")가 포함되어 있고 캘린더 관련 맥락이라면 반드시 CALENDAR(DATA) 로 분류하세요. 단, 다음 경우는 CALENDAR가 아니라 ORDER로 분류하세요: (1) "거래처 삭제/해제/끊기/없애기"처럼 거래처 관계 자체를 끊는 요청, (2) 직전 대화가 정기배송(정기배송 요청·취소·수락·거절) 또는 주문 관련이었고 사용자가 "취소해줘", "그거 취소", "취소할래" 같은 말을 한 경우 — 이때 "취소"는 캘린더 일정 취소가 아니라 정기배송·주문 취소를 의미한다.
 - 품목명이 포함되어 있어도 일정을 묻는다면 INVENTORY가 아니라 CALENDAR 가 우선입니다. (예: "배추 5월 일정 알려줘", "사과 언제 배송돼?" -> CALENDAR)
 - 위 일정 관련 키워드 없이 품목명만 언급되거나(예: "사과 보여줘"), 품목과 관련된 '채팅/연결' 요청일 경우에만 INVENTORY 로 분류하세요.
 - (질의응답 맥락 보호): AI가 "채팅방을 열까요, 주문을 넣을까요?"라고 물었을 때 사용자가 하는 답변(예: "채팅할래", "열어줘", "주문해")은 문장에 수량이나 품목명이 없더라도 무조건 ORDER 부서로 보내야 합니다. 절대 CHAT 부서로 보내지 마세요.
@@ -393,6 +393,8 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 - 정기배송 요청 조회: "정기배송 요청 들어온거 있어?", "정기배송 신청 왔어?" → get_incoming_subscription_requests(user_id). 결과를 안내할 때 subscription_id, 품목명(product_name), 수량, 주기, 시작일을 모두 자연어로 풀어서 안내하라.
 - 정기배송 수락: "수락해줘", "그거 수락해줘" → subscription_id 를 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 를 먼저 호출해 ID 를 확보한 뒤 즉시 accept_subscription_request(user_id, subscription_id) 호출. 절대 사용자에게 ID 를 물어보지 마라.
 - 정기배송 거절: "거절해줘" → 마찬가지로 subscription_id 를 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 를 먼저 호출해 ID 를 확보한 뒤 reject_subscription_request(user_id, subscription_id, reason?) 호출. 절대 사용자에게 ID 를 물어보지 마라.
+- 정기배송 취소/철회: "취소해줘", "그거 취소", "정기배송 취소", "보낸 요청 취소" 등 → 내가 보낸 PENDING 요청을 취소하는 경우: get_subscriptions(user_id, status="PENDING") 로 보낸 요청을 조회한 뒤 subscription_id 를 확보해 reject_subscription_request(user_id, subscription_id) 호출. 절대 캘린더 일정을 삭제하지 마라. 직전 대화에 subscription_id 가 있으면 바로 사용하고, 없으면 get_subscriptions 먼저 호출.
+- 정기배송 해지: "정기배송 해지해줘", "정기배송 끊어줘", "ACTIVE 정기배송 중단" 등 → ACTIVE 상태의 정기배송을 종료하는 경우: get_subscriptions(user_id, status="ACTIVE") 로 조회 후 subscription_id 확보 → reject_subscription_request(user_id, subscription_id) 호출.
 - 정기배송 수정 요청: "1kg로 바꿔줘", "수량 바꿀 수 있어?", "조건 수정하고 싶어" 등 → 정기배송 직접 수정 기능은 없으므로 "현재 요청을 거절한 뒤 새 조건으로 다시 요청을 보내야 합니다. 원하시면 바로 거절하고 새 요청 안내해 드릴게요."라고 자연스럽게 안내하라. ID 를 묻지 말고 직전 대화의 subscription_id 를 사용하라.
 
 [협상가 제시 / 납품일 변경 도구 호출 절차 — 매우 중요]
@@ -1666,6 +1668,25 @@ async def inventory_order_node(state: AgentState) -> dict:
                             "`order_number`(ORD-YYYYMMDD-XXXX 형식)는 절대 사용 불가."
                         )
                     agent_messages.append({"role": "user", "content": _retry_msg})
+                    continue
+                # request_partner_registration 에 이름을 UUID로 잘못 넘긴 경우
+                # → request_partner_registration_by_name 으로 강제 전환
+                _partner_invalid_id = (
+                    _last_tr.get("tool_name") == "request_partner_registration"
+                    and isinstance(_last_tr_result, dict)
+                    and _last_tr_result.get("error") == "invalid_target_user_id"
+                    and round_idx < MAX_TOOL_ROUNDS - 1
+                )
+                if _partner_invalid_id:
+                    # LLM이 넘긴 target_user_id 값(이름 문자열)을 그대로 추출
+                    _wrong_input = _last_tr.get("input") or {}
+                    _name_hint = _wrong_input.get("target_user_id", "")
+                    agent_messages.append(assistant_stop_msg)
+                    agent_messages.append({"role": "user", "content": (
+                        f"방금 request_partner_registration 에 넘긴 target_user_id('{_name_hint}')는 UUID 가 아닙니다. "
+                        "이름/회사명만 아는 경우 반드시 request_partner_registration_by_name(user_id, target_name_or_company) 를 사용하라. "
+                        f"지금 즉시 request_partner_registration_by_name(user_id=현재유저ID, target_name_or_company='{_name_hint}') 를 호출하라."
+                    )})
                     continue
                 # ───────────────────────────────────────────────────────────
 

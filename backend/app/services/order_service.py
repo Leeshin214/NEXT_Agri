@@ -1111,6 +1111,40 @@ class OrderService:
                 "error": f"재고 차감 중 오류가 발생했습니다: {str(e)}",
             }
 
+    async def _ensure_active_partner(self, seller_id: str, buyer_id: str) -> None:
+        """주문 확정 시 판매자·구매자를 서로 ACTIVE 거래처로 자동 등록한다.
+
+        이미 ACTIVE 관계가 있으면 skip. PENDING 상태면 ACTIVE로 업데이트.
+        없으면 양방향 ACTIVE row 2개를 새로 insert한다.
+        """
+        supabase = get_supabase_client()
+
+        def _upsert_side(user_id: str, partner_user_id: str) -> None:
+            # 기존 row 조회 (deleted_at IS NULL)
+            existing = (
+                supabase.table("partners")
+                .select("id, status")
+                .eq("user_id", user_id)
+                .eq("partner_user_id", partner_user_id)
+                .is_("deleted_at", None)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                row = existing.data[0]
+                if row["status"] != "ACTIVE":
+                    supabase.table("partners").update({"status": "ACTIVE"}).eq("id", row["id"]).execute()
+                # 이미 ACTIVE면 skip
+            else:
+                supabase.table("partners").insert({
+                    "user_id": user_id,
+                    "partner_user_id": partner_user_id,
+                    "status": "ACTIVE",
+                }).execute()
+
+        await asyncio.to_thread(_upsert_side, seller_id, buyer_id)
+        await asyncio.to_thread(_upsert_side, buyer_id, seller_id)
+
     async def _add_buyer_inventory_for_order(self, order_id: UUID | str) -> None:
         """주문이 COMPLETED 로 진입할 때 buyer 재고를 누적한다.
 
@@ -1425,6 +1459,20 @@ class OrderService:
         updated_order = await self.get_order(order_id)
         if updated_order:
             await self._sync_calendar_events_for_order(updated_order)
+
+        # CONFIRMED 진입 시 판매자·구매자 자동 거래처 등록 (ACTIVE, 양방향)
+        # 이미 ACTIVE 관계가 있으면 skip, 없으면 즉시 ACTIVE row 2개 insert
+        if new_status == "CONFIRMED" and updated_order:
+            try:
+                await self._ensure_active_partner(
+                    seller_id=updated_order["seller_id"],
+                    buyer_id=updated_order["buyer_id"],
+                )
+            except Exception as e:
+                logger.error(
+                    "[order_service] 거래처 자동 등록 실패 (무시) order_id=%s err=%s",
+                    str(order_id), e,
+                )
 
         # COMPLETED 진입 시 buyer 재고 자동 누적 (옵션 A — buyer_inventories)
         # _deduct_seller_stock_for_order 와 달리 실패해도 raise 하지 않음 — 사용자 입장에선

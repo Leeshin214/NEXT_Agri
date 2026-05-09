@@ -288,13 +288,46 @@ def create_subscription_request(
 
     if not user_clean or not _UUID_PATTERN.match(user_clean):
         return {"success": False, "error": "invalid_user_id", "message": "현재 사용자 UUID 가 유효하지 않습니다."}
-    if not target_clean or not _UUID_PATTERN.match(target_clean):
+    if not target_clean:
         return {
             "success": False,
             "needs_clarification": True,
             "missing": ["target_user_id"],
-            "message": "정기배송을 누구에게 요청할지 알려주세요. (거래처 이름이나 회사명을 알려주시면 자동으로 찾아드립니다.)",
+            "message": "정기배송을 누구에게 요청할지 알려주세요.",
         }
+    # UUID가 아니면 users 테이블에서 이름/회사명으로 자동 resolve
+    if not _UUID_PATTERN.match(target_clean):
+        from app.core.supabase import get_supabase_client
+        supabase = get_supabase_client()
+        user_res = (
+            supabase.table("users")
+            .select("id, name, company_name, role")
+            .or_(f"name.ilike.%{target_clean}%,company_name.ilike.%{target_clean}%")
+            .eq("is_active", True)
+            .is_("deleted_at", None)
+            .neq("id", user_clean)
+            .limit(5)
+            .execute()
+        )
+        rows = user_res.data or []
+        if not rows:
+            return {
+                "success": False,
+                "needs_clarification": True,
+                "missing": ["target_user_id"],
+                "message": f"'{target_clean}'라는 사용자를 찾을 수 없습니다. 정확한 이름이나 회사명을 알려주세요.",
+            }
+        if len(rows) > 1:
+            candidates = [{"id": r["id"], "name": r.get("name"), "company_name": r.get("company_name"), "role": r.get("role")} for r in rows]
+            names = ", ".join(r.get("name") or r.get("company_name") or "" for r in rows)
+            return {
+                "success": False,
+                "needs_clarification": True,
+                "missing": ["target_user_id"],
+                "candidates": candidates,
+                "message": f"'{target_clean}'과 일치하는 사용자가 여러 명입니다: {names}. 어느 분에게 보낼까요?",
+            }
+        target_clean = rows[0]["id"]
     if user_clean == target_clean:
         return {
             "success": False,
