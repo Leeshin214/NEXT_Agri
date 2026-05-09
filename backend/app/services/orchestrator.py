@@ -200,8 +200,9 @@ def _build_router_system() -> str:
         "출고 준비 완료됐어", "배송 보냈어", "배송 시작했어",
         "출하 완료", "배송 중으로 바꿔줘", "주문 완료 처리해줘",
         "납품일 바꿔줘", "○월 ○일로 납품일 변경해줘", "가격 협상해줘", "○○만원에 어때요",
-        "정기배송 요청해줘", "매주 사과 보내줘", "정기배송으로 전환해줘", "이 주문 정기배송으로"
-  → "정기배송", "납품일 변경", "가격 협상", "카운터오퍼" 키워드가 있으면 무조건 ORDER로 분류한다.
+        "정기배송 요청해줘", "매주 사과 보내줘", "정기배송으로 전환해줘", "이 주문 정기배송으로",
+        "나 정기배송 뭐 있어?", "정기배송 목록", "정기배송 확인해줘", "지금 정기배송 뭐 하고 있지"
+  → "정기배송" 키워드가 포함된 모든 발화는 무조건 ORDER로 분류한다. "납품일 변경", "가격 협상", "카운터오퍼" 키워드도 마찬가지.
   → 주문의 상태를 바꾸는 말이면 CALENDAR가 아니라 반드시 ORDER로 분류한다.
   → "출고 준비", "배송 보냄", "배송 시작", "출하 완료", "납품 완료"는 일정 생성이 아니라 주문 상태 변경이다.
 - CALENDAR: 캘린더/일정 관련 요청. 두 가지 subtype 으로 세분.
@@ -379,7 +380,8 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
 - 가격 협상: "○○원으로 협상해줘", "○○만원에 어때요", "가격 조정해줘", "단가 깎아달라고 해줘" → submit_counter_offer(user_id, order_id, proposed_total_amount, notes?). order_id 를 특정하기 위해 반드시 아래 절차를 따른다. (1) get_orders(user_id, role, status_in=["QUOTE_REQUESTED","NEGOTIATING","CONFIRMED","PREPARING","SHIPPING"]) 로 진행 중 주문을 조회한다. (2) 사용자가 언급한 품목명이 포함된 주문만 후보로 추린다. (3) 후보 중 CONFIRMED/PREPARING/SHIPPING/COMPLETED/CANCELLED 상태는 협상 불가이므로 제외한다. (4) 남은 후보(QUOTE_REQUESTED 또는 NEGOTIATING)가 정확히 1건이면 즉시 submit_counter_offer 호출. (5) 2건 이상이면 각 주문번호·상태를 보여주며 "어느 주문의 협상가를 제시할까요?"라고 물어본 뒤 답을 받고 호출. (6) 0건이면 "해당 상품의 진행 중인 주문이 모두 확정 이후 단계라 협상 요청을 할 수 없습니다"라고 안내. "주문 ID를 알려주세요"라고 UUID 를 직접 묻지 마라.
 - 카운터오퍼 응답: 채팅방 PENDING 카운터오퍼 카드 보고 사용자가 "수락해줘"/"OK"/"좋아요" → accept_counter_offer(user_id, order_id, offer_id), "거절해줘"/"안 돼"/"이 가격은 못 받아" → reject_counter_offer(user_id, order_id, offer_id)
 - 납품일 변경: "5월 20일로 납품일 바꿔줘", "○월 ○일에 받고 싶어", "납품일 변경 요청 보내줘" → submit_delivery_date_change(user_id, order_id, proposed_delivery_date='YYYY-MM-DD', notes?). 허용 상태: QUOTE_REQUESTED, NEGOTIATING, CONFIRMED (PREPARING/SHIPPING/COMPLETED/CANCELLED 는 차단). order_id 모르면 get_orders(user_id, role) 로 먼저 조회해 품목명이 일치하는 주문의 id 를 찾아라. 이때 반드시 아래 절차를 따른다. (1) 조회 결과 중 PREPARING/SHIPPING/COMPLETED/CANCELLED 상태 주문은 후보에서 제외한다. (2) 허용 상태(QUOTE_REQUESTED/NEGOTIATING/CONFIRMED) 주문이 정확히 1건이면 그 order_id 로 즉시 호출한다. (3) 허용 상태 주문이 2건 이상이면 사용자에게 "어느 주문의 납품일을 변경할까요? (예: ○○ 상품 CONFIRMED 건 / △△ 상품 NEGOTIATING 건)" 처럼 후보 목록을 보여주고 선택을 기다려라 — 이 경우 submit_delivery_date_change 를 절대 호출하지 마라. (4) 허용 상태 주문이 0건이면 "출하 준비 이후 단계의 주문은 납품일 변경 요청을 보낼 수 없습니다"라고 안내하라. "주문 ID를 알려주세요"라고 사용자에게 UUID 를 직접 묻지 마라.
-- 납품일 응답: PENDING 납품일 변경 카드 보고 "수락해줘"/"OK" → accept_delivery_date_change(user_id, order_id, change_id), "거절해줘"/"그 날짜는 어려워" → reject_delivery_date_change(user_id, order_id, change_id)
+- 납품일 변경 요청 조회: "납품일 변경 요청 들어온거 있어?", "납품일 바꿔달라는 거 왔어?" → get_pending_delivery_date_changes(user_id). get_pending_counter_offers 를 호출하지 마라. 결과가 있으면 거래처명(partner_name)과 날짜(requested_date, original_date)로 "○○(거래처)가 납품일을 ○월 ○일로 바꿔달라는 요청이 왔습니다. 수락하시겠어요?"처럼 안내하라. 주문번호(ORD-...)는 절대 읊지 마라. "상대방이 답변하면" 같은 말은 절대 하지 마라 — 답변해야 하는 쪽은 현재 사용자(나)다.
+- 납품일 응답: 사용자가 "수락해줘"/"OK" → accept_delivery_date_change(user_id, order_id, change_id) 호출. change_id 는 반드시 get_pending_delivery_date_changes 결과의 `change_id` 필드(UUID)를 사용하라. order_number(ORD-...) 를 change_id 로 절대 사용 금지. "거절해줘" → reject_delivery_date_change(user_id, order_id, change_id)
 - 거래처 등록: "○○를 거래처로 등록해줘", "○○ 추가해줘", "거래처 신청 보내줘" → 이름/회사명만 알면 즉시 request_partner_registration_by_name(user_id, target_name_or_company, note?) 호출. UUID 를 사용자에게 묻는 행위 절대 금지 — 이름/회사명만으로 충분하다. UUID 를 정확히 알고 있을 때만 request_partner_registration(user_id, target_user_id, note?) 사용.
 - 거래처 요청 조회: "들어온 거래처 요청 있어?", "거래처 신청 왔어?" → get_incoming_partner_requests(user_id). 결과 안내 시 반드시 partner_id 값을 응답에 포함.
 - 거래처 요청 수락: "거래처 요청 수락해줘", "승인해줘", "그 요청 수락해줘", "응", "응 수락해줘", "진행해줘", "진행해", "수락해", "그래 해줘", "ㅇㅇ" →
@@ -388,14 +390,29 @@ AGENT_BASE_SYSTEM = """당신은 fresh link 농산물 B2B 유통 플랫폼의 �
   'from_user_id' 필드를 partner_id 에 절대 넣지 마라. 반드시 get_incoming_partner_requests 결과의 'partner_id' 필드를 사용한다.
   절대 UUID 를 임의로 생성하거나 추측하지 마라.
 - 거래처 요청 거절: "거절해줘" → 마찬가지로 ID 확보 후 reject_partner_request(user_id, partner_id).
-- 정기배송 신청: "정기배송으로 받고 싶어", "매주 ○요일 ○○ 보내줘", "정기배송 요청해줘" → 반드시 품목명·수량을 먼저 확인하라. 품목/수량이 명시되지 않으면 "어떤 품목을 몇 kg(또는 몇 박스) 보내드릴까요?"라고 되물어라. 품목·수량·주기·시작일이 모두 확보된 뒤에만 create_subscription_request(user_id, target_user_id, frequency, start_date, items=[{{product_name, quantity, unit}}]) 호출. items 는 절대 임의로 채우지 마라.
+- 정기배송 신청: "정기배송으로 받고 싶어", "매주 ○요일 ○○ 보내줘", "정기배송 요청해줘" 등 →
+  [필수 절차 — 이 순서를 절대 어기지 마라]
+  1. get_partners(user_id, status_in=["ACTIVE"]) 를 먼저 호출해 거래처 목록 확보.
+     - 결과 0건: "현재 활성 거래처가 없습니다. 먼저 거래처 등록이 필요합니다." 안내 후 종료.
+     - 결과 1건: "거래처 [이름]에 정기배송을 요청할까요?" 라고 확인을 구하라. 임의로 선택하거나 "하지만" 같은 역접 표현 금지.
+     - 결과 2건 이상: 거래처 목록을 번호로 나열하며 "어느 거래처에 정기배송을 요청할까요?" 라고 물어봐라. 임의로 선택 금지.
+  2. 사용자가 거래처를 선택하면 → 품목/수량, 주기, 시작일 순서로 누락 정보 확인.
+  3. 거래처·품목·수량·주기·시작일 모두 확보된 뒤에만 create_subscription_request(user_id, target_user_id, frequency, start_date, items=[{{product_name, quantity, unit}}]) 호출.
+  ⚠️ 사용자가 품목/수량/주기/시작일을 모두 한 번에 말했더라도, 거래처를 명시하지 않았다면 반드시 get_partners 를 호출하고 거래처를 먼저 물어봐라. items 는 절대 임의로 채우지 마라.
 - "이 주문 정기배송으로 전환" → create_subscription_from_order(user_id, order_id, frequency, start_date)
-- 정기배송 요청 조회: "정기배송 요청 들어온거 있어?", "정기배송 신청 왔어?" → get_incoming_subscription_requests(user_id). 결과를 안내할 때 subscription_id, 품목명(product_name), 수량, 주기, 시작일을 모두 자연어로 풀어서 안내하라.
+- 정기배송 요청 조회: "정기배송 요청 들어온거 있어?", "정기배송 신청 왔어?", "정기배송 대기 중인거 있어?" 등 → get_incoming_subscription_requests(user_id) 호출. 결과가 0건이면 추가로 get_subscriptions(user_id, status="PENDING") 도 호출해 내가 보낸 대기 중인 요청이 있는지 확인하라. 두 결과를 합쳐서 "받은 요청: ○건, 보낸 요청(수락 대기): ○건" 형태로 자연어로 안내하라. 결과를 안내할 때 subscription_id, 품목명(product_name), 수량, 주기, 시작일을 모두 자연어로 풀어서 안내하라.
 - 정기배송 수락: "수락해줘", "그거 수락해줘" → subscription_id 를 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 를 먼저 호출해 ID 를 확보한 뒤 즉시 accept_subscription_request(user_id, subscription_id) 호출. 절대 사용자에게 ID 를 물어보지 마라.
+  ⚠️ 반드시 get_incoming_subscription_requests 결과의 `subscription_id` 필드를 사용하라. `from_user_id` 필드는 요청자 UUID이므로 subscription_id로 절대 사용 금지. 두 필드를 혼동하지 마라.
 - 정기배송 거절: "거절해줘" → 마찬가지로 subscription_id 를 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 를 먼저 호출해 ID 를 확보한 뒤 reject_subscription_request(user_id, subscription_id, reason?) 호출. 절대 사용자에게 ID 를 물어보지 마라.
 - 정기배송 취소/철회: "취소해줘", "그거 취소", "정기배송 취소", "보낸 요청 취소" 등 → 내가 보낸 PENDING 요청을 취소하는 경우: get_subscriptions(user_id, status="PENDING") 로 보낸 요청을 조회한 뒤 subscription_id 를 확보해 reject_subscription_request(user_id, subscription_id) 호출. 절대 캘린더 일정을 삭제하지 마라. 직전 대화에 subscription_id 가 있으면 바로 사용하고, 없으면 get_subscriptions 먼저 호출.
-- 정기배송 해지: "정기배송 해지해줘", "정기배송 끊어줘", "ACTIVE 정기배송 중단" 등 → ACTIVE 상태의 정기배송을 종료하는 경우: get_subscriptions(user_id, status="ACTIVE") 로 조회 후 subscription_id 확보 → reject_subscription_request(user_id, subscription_id) 호출.
-- 정기배송 수정 요청: "1kg로 바꿔줘", "수량 바꿀 수 있어?", "조건 수정하고 싶어" 등 → 정기배송 직접 수정 기능은 없으므로 "현재 요청을 거절한 뒤 새 조건으로 다시 요청을 보내야 합니다. 원하시면 바로 거절하고 새 요청 안내해 드릴게요."라고 자연스럽게 안내하라. ID 를 묻지 말고 직전 대화의 subscription_id 를 사용하라.
+- 정기배송 해지: "정기배송 해지해줘", "정기배송 끊어줘", "ACTIVE 정기배송 중단" 등 → ACTIVE/PAUSED 상태의 정기배송을 종료하는 경우: get_subscriptions(user_id, status="ACTIVE") 로 조회 후 subscription_id 확보 → cancel_subscription(user_id, subscription_id) 호출. reject_subscription_request 는 PENDING 전용이므로 절대 ACTIVE 에 사용하지 마라.
+- 정기배송 수정 요청: "1kg로 바꿔줘", "수량 바꿔줘", "3판으로 바꿔줘", "조건 수정하고 싶어" 등 → 정기배송 직접 수정 기능은 없다. "정기배송은 수정이 안 되고, 취소 후 새 조건으로 다시 등록해야 합니다. 지금 바로 취소하고 새 조건으로 등록할까요?"라고 안내하라. 사용자가 "응", "네", "그렇게 해줘" 등 동의하면 반드시 아래 순서를 지켜라:
+  [1단계] cancel_subscription(user_id, subscription_id) 호출 → success: true 확인
+  [2단계] cancel 성공 후에만 create_subscription_request 호출 (새 조건으로)
+  ⚠️ cancel_subscription 을 호출하지 않고 create_subscription_request 를 먼저 호출하는 것은 절대 금지. cancel 이 실패하면 create 도 중단하고 사용자에게 실패를 알려라.
+  ⚠️ create_subscription_request 성공 후에는 get_subscriptions 를 다시 호출하지 마라. 흐름이 끝났으면 결과만 자연스럽게 안내하고 종료하라.
+  ⚠️ cancel + create 흐름이 모두 완료되면 각 도구 결과를 개별로 나열하지 마라. "달걀 4판으로 새 정기배송 요청을 ○○에게 보냈습니다. 상대방이 수락하면 자동으로 활성화됩니다." 처럼 최종 결과만 한 문장으로 안내하라. "취소되었습니다", "다시 등록하시겠어요?" 같은 중간 과정 문구는 출력하지 마라.
+  subscription_id 는 직전 대화에서 찾거나 get_subscriptions 로 조회한다.
 
 [협상가 제시 / 납품일 변경 도구 호출 절차 — 매우 중요]
 submit_counter_offer / submit_delivery_date_change / accept_counter_offer / reject_counter_offer / accept_delivery_date_change / reject_delivery_date_change 호출 시 order_id 가 필요하다. 다음 절차로 결정하라. 이 절차를 절대 어기지 마라.
@@ -583,6 +600,8 @@ get_orders 결과를 사용자에게 안내할 때 다음 원칙을 반드시 �
 - (중요) 너는 주문, 재고, 상품 관리뿐만 아니라 캘린더(일정)까지 모두 통합 관리하는 만능 비서입니다. 사용자가 대화 중 자연스럽게 캘린더 일정을 묻거나 수정을 요청하면 "할 수 없다"고 피하지 말고, 적극적으로 캘린더 도구를 호출하여 조회 및 등록(수정/삭제)을 처리하세요.
 - (핵심) "5월 일정" 등을 물어봤을 때 절대 어린이날, 어버이날 같은 일반 법정 공휴일을 지어내서 대답하지 마세요! 반드시 `get_calendar_events` 도구를 실행해서 DB에 등록된 실제 '출하/배송/미팅' 일정만 대답해야 합니다. DB에 일정이 없으면 "등록된 일정이 없습니다"라고만 하세요.
 - DB 조회 결과를 있는 그대로 전달하되, 사람이 읽기 좋게 풀어서 설명하세요. 지어내기(Hallucination)는 절대 금지입니다.
+- [UUID 노출 절대 금지] 사용자에게 보여주는 응답에 UUID(xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 형식)를 절대 포함하지 마라. UUID 대신 반드시 이름(name, from_name, partner_name), 회사명(company_name, from_company), 주문번호(order_number) 등 사람이 읽을 수 있는 값을 사용하라. 도구 결과에 from_name 필드가 있으면 반드시 그 값을 그대로 사용하라.
+- [마크다운 강조 금지] 응답 전체에서 `**굵게**`, `*기울임*`, `__밑줄__`, `` `코드` ``, `# 헤더`, `| 표 |` 사용 금지. 자연체 한국어 문장과 `-` 불릿 또는 `1.` 번호 목록만 사용하라.
 - [통화 기호 절대 규칙] 모든 금액은 반드시 ₩(원화) 기호를 사용한다. ¥(엔화), $(달러), €(유로) 등 다른 통화 기호는 절대 사용 금지. 예: ₩500,000 (O), ¥500,000 (X), $500,000 (X)
 - [🚨 주문 데이터 신뢰 원칙] 주문 목록/상태를 보여줄 때는 반드시 이번 턴에 get_orders를 호출한 결과만 사용한다. 대화 히스토리(history)에서 이전에 언급된 주문 정보는 stale 데이터이므로 절대 그대로 사용 금지. 이전 대화에 "삼겹살 CONFIRMED", "목살 NEGOTIATING" 등이 있어도 현재 상태가 아닐 수 있으므로 반드시 get_orders로 재조회한다.
 - [🚨 주문 취소 재확인 절대 규칙 — 판매자/구매자 공통]
@@ -1354,6 +1373,7 @@ async def inventory_order_node(state: AgentState) -> dict:
     all_tool_results: list[dict[str, Any]] = []
     new_messages: list[dict[str, Any]] = []
     _cancel_gate_blocked: bool = False  # 취소 게이트 차단 여부 추적
+    _cancelled_subscription_ids: set[str] = set()  # 이번 라운드에서 취소 성공한 subscription id
 
     try:
         for round_idx in range(MAX_TOOL_ROUNDS):
@@ -1762,6 +1782,48 @@ async def inventory_order_node(state: AgentState) -> dict:
                     if tool_name not in tools_used:
                         tools_used.append(tool_name)
 
+                    # 🚨 Hard guard — 정기배송 수정 흐름: cancel 없이 create 차단
+                    # 사용자가 수정 의도("바꿔줘", "수정", "변경")를 밝혔는데
+                    # cancel_subscription 없이 create_subscription_request 를 호출하면 차단.
+                    _modify_kw = ["바꿔줘", "바꿔", "수정", "변경", "고쳐줘", "고쳐", "바꿀", "수정해줘"]
+                    _user_msg_lower = state.get("message", "")
+                    _is_modify_intent = any(kw in _user_msg_lower for kw in _modify_kw)
+                    if (
+                        tool_name == "create_subscription_request"
+                        and _is_modify_intent
+                        and len(_cancelled_subscription_ids) == 0
+                    ):
+                        result_content = json.dumps({
+                            "success": False,
+                            "error": "cancel_required_before_create",
+                            "message": "정기배송 수정 흐름에서는 기존 정기배송을 먼저 cancel_subscription 으로 취소한 뒤 create_subscription_request 를 호출해야 합니다. 지금 당장 cancel_subscription 을 호출하세요.",
+                        }, ensure_ascii=False)
+                        print(f"\n🚫 [정기배송 수정 게이트] cancel 없이 create 시도 — 차단됨")
+                        agent_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result_content,
+                        })
+                        continue
+
+                    # 🚨 Hard guard — accept/reject_delivery_date_change: change_id == order_id 오류 자동 수정
+                    if tool_name in ("accept_delivery_date_change", "reject_delivery_date_change"):
+                        _oid = tool_input.get("order_id", "")
+                        _cid = tool_input.get("change_id", "")
+                        if _cid == _oid or not _cid:
+                            # LLM이 change_id 에 order_id 를 그대로 넣은 경우 — DB 에서 실제 change_id 조회
+                            try:
+                                from app.core.supabase import get_supabase_client as _get_sb
+                                _sb = _get_sb()
+                                _ch_res = _sb.table("delivery_date_change_history").select("id").eq(
+                                    "order_id", _oid
+                                ).eq("status", "PENDING").order("created_at", desc=True).limit(1).execute()
+                                if _ch_res.data:
+                                    tool_input = {**tool_input, "change_id": _ch_res.data[0]["id"]}
+                                    print(f"\n🔧 [change_id 자동 수정] {_cid} → {tool_input['change_id']}")
+                            except Exception as _e:
+                                print(f"\n⚠️ [change_id 조회 실패] {_e}")
+
                     # 🚨 Hard guard — create_order 의 사용자 발화 ↔ 인자 일관성 검증
                     # (LLM 의 임의 날짜·가격 추정 / 셀러 cross-contamination 차단).
                     # guard 가 위반을 감지하면 _execute_tool 을 호출하지 않고 거부 응답으로 대체.
@@ -1771,9 +1833,29 @@ async def inventory_order_node(state: AgentState) -> dict:
                     if _guard_error is not None:
                         result_content = _guard_error
                     else:
-                        # tool 실행
-                        result_content = _execute_tool(tool_name, tool_input)
-                    
+                        # cancel_subscription 재시도 방지: 이미 이번 라운드에서 취소 성공한 ID면 건너뜀
+                        if (
+                            tool_name == "cancel_subscription"
+                            and tool_input.get("subscription_id") in _cancelled_subscription_ids
+                        ):
+                            result_content = json.dumps({
+                                "success": True,
+                                "already_cancelled": True,
+                                "subscription_id": tool_input.get("subscription_id"),
+                                "message": "이미 이번 요청에서 취소 완료됐습니다. create_subscription_request 를 즉시 호출해 새 조건으로 등록하세요.",
+                            }, ensure_ascii=False)
+                        else:
+                            # tool 실행
+                            result_content = _execute_tool(tool_name, tool_input)
+                            # cancel_subscription 성공 시 ID 기록
+                            if tool_name == "cancel_subscription":
+                                try:
+                                    _res = json.loads(result_content)
+                                    if _res.get("success") and _res.get("subscription_id"):
+                                        _cancelled_subscription_ids.add(_res["subscription_id"])
+                                except Exception:
+                                    pass
+
                     print(f"\n🕵️‍♂️ [ORDER/INVENTORY TOOL]")
                     print(f"🛠️ tool_name = {tool_name}")
                     print(f"📥 tool_input = {tool_input}")
@@ -2292,7 +2374,8 @@ async def chat_node(state: AgentState) -> dict:
         "  - 모두 갖춰지면 create_subscription_request(user_id, target_user_id, frequency, start_date, items, ...) 호출.\n"
         "  - '이 주문을 정기배송으로 전환'처럼 기존 주문 기반이면 create_subscription_from_order(user_id, order_id, frequency, start_date) 사용.\n"
         "- 정기배송 수락/거절: subscription_id 는 직전 대화에서 찾고, 없으면 get_incoming_subscription_requests 호출해 확보. 절대 사용자에게 ID 물어보지 말 것.\n"
-        "- 정기배송 수정 요청('수량 바꿔줘', '조건 바꾸고 싶어' 등): 직접 수정 불가. '현재 요청을 거절하고 새 조건으로 다시 요청을 보내야 합니다. 원하시면 바로 진행해 드릴게요.'라고 자연스럽게 안내하라.\n"
+        "- 정기배송 수정 요청('수량 바꿔줘', '조건 바꾸고 싶어' 등): 직접 수정 불가. '취소 후 새 조건으로 재등록이 필요합니다. 지금 바로 진행할까요?'라고 안내. 동의하면 ① cancel_subscription → ② create_subscription_request 순서로 진행.\n"
+        "- ACTIVE 정기배송 취소/해지: cancel_subscription(user_id, subscription_id) 사용. reject_subscription_request 는 PENDING 전용이므로 ACTIVE 에 절대 사용 금지.\n"
         "- 거래처 삭제 발화: '○○ 거래처 삭제해줘', '거래처 끊어줘', '○○ 거래처 해제해줘' 등.\n"
         "  - [1단계 — 대상 확인] 이름/회사명이 언급되면 get_partners(user_id, status_in=['ACTIVE']) 를 호출해 목록을 가져온 뒤 발화와 매칭되는 거래처를 찾는다.\n"
         "  - [2단계 — 재확인 요청] delete_partner 를 즉시 호출하지 말고 반드시 먼저 '○○(회사명) 거래처를 삭제할까요? 삭제하면 복구할 수 없습니다.' 라고 재확인을 요청하라.\n"

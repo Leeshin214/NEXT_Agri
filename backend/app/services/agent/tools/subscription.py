@@ -297,7 +297,6 @@ def create_subscription_request(
         }
     # UUID가 아니면 users 테이블에서 이름/회사명으로 자동 resolve
     if not _UUID_PATTERN.match(target_clean):
-        from app.core.supabase import get_supabase_client
         supabase = get_supabase_client()
         user_res = (
             supabase.table("users")
@@ -621,6 +620,73 @@ def reject_subscription_request(
         "status": "REJECTED",
         "reason": reason,
         "message": msg,
+    }
+
+
+@tool(
+    name="cancel_subscription",
+    description=(
+        "활성 정기배송을 취소한다 (ACTIVE/PAUSED → CANCELLED). "
+        "사용자가 '정기배송 취소해줘', '그 정기배송 끊어줘', '수정은 안 되니 취소하고 새로 등록' 등 "
+        "이미 활성화된 정기배송을 종료하려 할 때 호출. "
+        "PENDING 상태는 reject_subscription_request 를 사용할 것."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "user_id": {
+                "type": "string",
+                "description": "현재 로그인 사용자 UUID. 서버에서 강제 주입.",
+            },
+            "subscription_id": {
+                "type": "string",
+                "description": "취소할 정기배송 UUID. get_subscriptions 로 먼저 조회 후 사용.",
+            },
+        },
+        "required": ["subscription_id"],
+    },
+    groups=("inventory_order",),
+)
+def cancel_subscription(user_id: str = "", subscription_id: str = "") -> dict:
+    """활성 정기배송을 취소한다 (ACTIVE/PAUSED → CANCELLED)."""
+    from .._shared import (
+        _UUID_PATTERN,
+        _run_async_in_thread,
+        _service_error_payload,
+    )
+
+    user_clean = (user_id or "").strip()
+    sub_clean = (subscription_id or "").strip()
+
+    if not user_clean or not _UUID_PATTERN.match(user_clean):
+        return {"success": False, "error": "invalid_user_id", "message": "현재 사용자 UUID 가 유효하지 않습니다."}
+    if not sub_clean or not _UUID_PATTERN.match(sub_clean):
+        return {
+            "success": False,
+            "needs_clarification": True,
+            "missing": ["subscription_id"],
+            "message": "취소할 정기배송 ID 를 알려주세요. (get_subscriptions 로 먼저 조회)",
+        }
+
+    from app.services.subscription_service import subscription_service
+    from uuid import UUID as _UUID
+
+    try:
+        _run_async_in_thread(
+            lambda: subscription_service.update_subscription(
+                subscription_id=_UUID(sub_clean),
+                user_id=_UUID(user_clean),
+                payload={"status": "CANCELLED"},
+            )
+        )
+    except Exception as e:
+        return _service_error_payload(e)
+
+    return {
+        "success": True,
+        "subscription_id": sub_clean,
+        "status": "CANCELLED",
+        "message": "정기배송이 취소되었습니다. 새 조건으로 다시 등록하시겠어요?",
     }
 
 
@@ -1152,6 +1218,17 @@ def get_incoming_subscription_requests(user_id: str) -> dict:
         requests = []
         for row in (result.data or []):
             counterpart_id = row["buyer_id"] if row["seller_id"] == user_clean else row["seller_id"]
+
+            # 요청자 이름 조회
+            from_name = None
+            from_company = None
+            try:
+                ur = supabase.table("users").select("name, company_name").eq("id", counterpart_id).single().execute()
+                from_name = (ur.data or {}).get("name")
+                from_company = (ur.data or {}).get("company_name")
+            except Exception:
+                pass
+
             raw_items = row.get("subscription_items", []) or []
             enriched_items = []
             for item in raw_items:
@@ -1173,6 +1250,8 @@ def get_incoming_subscription_requests(user_id: str) -> dict:
             requests.append({
                 "subscription_id": row["id"],
                 "from_user_id": counterpart_id,
+                "from_name": from_name or from_company or "이름 없음",
+                "from_company": from_company,
                 "frequency": row.get("frequency", ""),
                 "start_date": row.get("start_date", ""),
                 "notes": row.get("notes", ""),
