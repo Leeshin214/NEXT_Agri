@@ -89,6 +89,71 @@ def get_pending_counter_offers(user_id: str = "") -> dict:
 
 
 @tool(
+    name="get_pending_delivery_date_changes",
+    description=(
+        "나에게 들어온 PENDING(미결) 납품일 변경 요청 목록을 조회한다. "
+        "'납품일 변경 요청 들어온거 있어?', '납품일 바꿔달라는 거 왔어?', "
+        "'납품일 변경 요청 확인해줘' 같은 요청 시 호출."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string", "description": "현재 로그인 사용자 UUID. 서버에서 강제 주입."},
+        },
+        "required": [],
+    },
+    groups=("inventory_order",),
+)
+def get_pending_delivery_date_changes(user_id: str = "") -> dict:
+    """상대방이 보낸 PENDING 납품일 변경 요청 목록 조회. 본인 제시분 제외."""
+    from .._shared import _UUID_PATTERN
+    from app.core.supabase import get_supabase_client
+
+    if not user_id or not _UUID_PATTERN.match(str(user_id)):
+        return {"success": False, "error": "invalid_user_id"}
+
+    try:
+        sb = get_supabase_client()
+        orders_res = sb.table("orders").select("id, buyer_id, seller_id").or_(
+            f"buyer_id.eq.{user_id},seller_id.eq.{user_id}"
+        ).is_("deleted_at", None).execute()
+        order_rows = orders_res.data or []
+        if not order_rows:
+            return {"success": True, "changes": [], "count": 0}
+
+        order_map = {r["id"]: r for r in order_rows}
+        order_ids = list(order_map.keys())
+
+        changes_res = sb.table("delivery_date_change_history").select("*").in_(
+            "order_id", order_ids
+        ).eq("status", "PENDING").neq("from_user_id", user_id).order(
+            "created_at", desc=True
+        ).execute()
+        changes = changes_res.data or []
+
+        result = []
+        for ch in changes:
+            order = order_map.get(ch["order_id"], {})
+            counterpart_id = order.get("seller_id") if order.get("buyer_id") == user_id else order.get("buyer_id")
+            partner_name = None
+            if counterpart_id:
+                ur = sb.table("users").select("name, company_name").eq("id", counterpart_id).single().execute()
+                d = ur.data or {}
+                partner_name = d.get("name") or d.get("company_name")
+            result.append({
+                "change_id": ch.get("id"),
+                "order_id": ch.get("order_id"),
+                "status": ch.get("status"),
+                "proposed_delivery_date": ch.get("proposed_delivery_date"),
+                "partner_name": partner_name,
+            })
+
+        return {"success": True, "changes": result, "count": len(result)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@tool(
     name="submit_counter_offer",
     description=(
         "구매자 또는 판매자가 채팅방에서 가격 제시 카드를 발송한다. "
