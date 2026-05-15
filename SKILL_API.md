@@ -300,6 +300,21 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 #   - 신규 제시 시 같은 주문의 이전 PENDING 은 모두 SUPERSEDED 마킹
 #     + messages.metadata.status 도 동기화 (negotiation 패턴과 동일)
 
+# 주문 취소 (PATCH /orders/{order_id}/cancel) — 2026-05-15 응답 지연 hotfix
+#   - 가드: BUYER 는 QUOTE_REQUESTED/NEGOTIATING 만 직접 취소.
+#           BUYER + CONFIRMED → cancel-request 사용 (403).
+#           BUYER + PREPARING/SHIPPING → 403.
+#           SELLER 는 모든 활성 상태 직접 취소.
+#   - DB 업데이트 + calendar/chat soft-delete 후, BUYER 대체 거래처 탐색·AI 대화
+#     히스토리 인서트·알림 emit 은 모두 fire-and-forget (asyncio.create_task) 로
+#     `_trigger_alternative_partner_for_cancel` 한 번에 위임. 이전엔 인라인으로 await
+#     직렬 처리되어 응답이 지연되고 클라이언트가 "Failed to fetch" (TypeError) 로
+#     떨어졌다 — DB 는 이미 CANCELLED 였으므로 "취소는 되는데 에러는 떠 보이는" 증상.
+#   - 함수 끝에 잘못 남아 있던 `if new_status == "CANCELLED":` 블록 (update_status
+#     코드에서 복붙된 dead code) 제거 — NameError 로 500 응답되면 FastAPI 의
+#     unhandled exception 핸들러가 CORS 헤더 없이 응답해 브라우저가 fetch 자체를
+#     실패로 보고했다.
+#
 # 대체 거래처 자동 추천 (alternatives) — 2026-05-06 신규
 # GET    /orders/{id}/alternatives
 #   - 판매자가 활성 주문을 취소하면 백엔드가 fire-and-forget 으로 자동 생성하는
