@@ -1,13 +1,11 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Bot, Send, Sparkles, ChevronLeft, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
+import { Bot, Send, ChevronLeft, ChevronRight, ChevronDown, AlertTriangle } from 'lucide-react';
 import { useAIStream } from '@/hooks/useAIStream';
-import { useAuthStore } from '@/store/authStore';
 import { useUIStore } from '@/store/uiStore';
 import { useAIChatStore } from '@/store/aiChatStore';
 import { useAIHistory } from '@/hooks/useAIHistory';
-import { sellerQuickPrompts, buyerQuickPrompts } from '@/constants/aiPrompts';
 
 // 사용자가 의도적으로 위로 스크롤한 것으로 간주할 임계값(px).
 // 이 값보다 멀면 자동 스크롤을 멈추고 "맨 밑으로" 버튼을 노출한다.
@@ -17,7 +15,6 @@ export default function AIChatPanel() {
   const [input, setInput] = useState('');
   const [isMobile, setIsMobile] = useState(false);
   const { isStreaming, manualReview, stream } = useAIStream();
-  const { user } = useAuthStore();
   const { aiPanelOpen, toggleAIPanel, setAIPanelOpen } = useUIStore();
   // 채팅 페이지에서 publish 한 현재 채팅방 컨텍스트 — stream 호출 시 백엔드에 함께 전달
   const aiChatContext = useUIStore((s) => s.aiChatContext);
@@ -29,8 +26,6 @@ export default function AIChatPanel() {
   const [isAtBottom, setIsAtBottom] = useState(true);
   const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
   const showManualReviewBanner = manualReview && !!lastTurn && !lastTurn.pending;
-
-  const quickPrompts = user?.role === 'SELLER' ? sellerQuickPrompts : buyerQuickPrompts;
 
   // xl 이상에서는 항상 열린 상태, 모바일 여부 감지
   useEffect(() => {
@@ -114,25 +109,6 @@ export default function AIChatPanel() {
         >
           <ChevronRight className="h-4 w-4" />
         </button>
-      </div>
-
-      {/* 빠른 프롬프트 */}
-      <div className="border-b border-gray-100 px-3 py-2 flex-shrink-0">
-        <div className="flex flex-wrap gap-1.5">
-          {quickPrompts.map((qp) => (
-            <button
-              key={qp.type}
-              onClick={() =>
-                stream(qp.prompt, qp.type, aiChatContext.orderId, aiChatContext.roomId)
-              }
-              disabled={isStreaming}
-              className="flex items-center gap-1 rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-600 hover:border-primary-300 hover:bg-primary-50 hover:text-primary-700 disabled:opacity-50"
-            >
-              <Sparkles className="h-3 w-3 flex-shrink-0" />
-              {qp.label}
-            </button>
-          ))}
-        </div>
       </div>
 
       {/* 응답 영역 */}

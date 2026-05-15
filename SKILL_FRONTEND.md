@@ -267,7 +267,8 @@ POST /notifications/read-all            useMarkAllNotificationsRead()  ← Optim
 
 ```typescript
 // frontend/components/layout/AIChatPanel.tsx
-// - useAuthStore로 role 감지 → sellerQuickPrompts / buyerQuickPrompts 자동 선택
+// - 빠른 프롬프트 chip 행 없음 (2026-05-15 제거) — 좁은 패널 화면 점유 최소화
+//   sellerQuickPrompts / buyerQuickPrompts 는 /{seller|buyer}/ai-assistant 페이지에서만 사용
 // - useAIStream 훅 사용 → { isStreaming, manualReview, stream } 만 destructure
 //   (response 는 더 이상 직접 안 씀 — store 의 turns 가 SSOT)
 // - useAIHistory(100) 호출로 store hydrate 트리거

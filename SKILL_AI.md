@@ -328,6 +328,9 @@ export function useAIStream() {
 ```
 
 ### 빠른 프롬프트 설정
+
+> **적용 범위 (2026-05-15 갱신)**: 빠른 프롬프트는 `/seller/ai-assistant`, `/buyer/ai-assistant` 전용 페이지에서만 노출된다. 우측 고정 패널(`AIChatPanel`)에서는 제거됨 — 좁은 패널 내 화면 점유 최소화 목적.
+
 ```typescript
 // src/constants/aiPrompts.ts
 export const sellerQuickPrompts = [
@@ -389,17 +392,14 @@ export const buyerQuickPrompts = [
 ```tsx
 // frontend/components/layout/AIChatPanel.tsx
 // AppLayout에 우측 고정으로 삽입됨 — 별도 라우트/페이지 없음
-// w-1/2 고정, border-l로 main 영역과 구분
 // react-markdown 미사용 — whitespace-pre-wrap으로 텍스트 직접 렌더링
+// 빠른 프롬프트 chip 행 없음(2026-05-15 제거) — 헤더 직후 바로 응답 영역
+// 빠른 프롬프트가 필요하면 /seller/ai-assistant, /buyer/ai-assistant 페이지로 이동
 
 export default function AIChatPanel() {
   const [input, setInput] = useState('');
-  const { response, isStreaming, stream } = useAIStream();
-  const { user } = useAuthStore();
+  const { isStreaming, manualReview, stream } = useAIStream();
 
-  const quickPrompts = user?.role === 'SELLER' ? sellerQuickPrompts : buyerQuickPrompts;
-
-  // 빠른 프롬프트: Sparkles 아이콘 + label 텍스트, rounded-full pill 스타일
   // 응답 영역: whitespace-pre-wrap, 스트리밍 중 커서 블링크 (animate-pulse)
   // 입력창: Enter 전송, Shift+Enter 줄바꿈, isStreaming 중 disabled
   // 전송 버튼: Send 아이콘 (w-9 h-9 정사각형)
